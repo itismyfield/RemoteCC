@@ -1,23 +1,28 @@
-use std::sync::Arc;
 use chrono::{DateTime, Local, TimeZone};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tokio::runtime::Runtime;
 
-use russh::*;
 use russh::keys::*;
+use russh::*;
 use russh_sftp::client::SftpSession as RusshSftpSession;
 
 // Obfuscation key for password storage (NOT real encryption — prevents casual viewing only)
-const OBFUSCATION_KEY: &[u8] = b"cokacdir_remote_v1_key";
+const OBFUSCATION_KEY: &[u8] = b"remotecc_remote_v1_key";
 
 /// Obfuscate a string for storage (XOR + base64, prefixed with "enc:")
 pub fn obfuscate(plaintext: &str) -> String {
-    let xored: Vec<u8> = plaintext.as_bytes().iter()
+    let xored: Vec<u8> = plaintext
+        .as_bytes()
+        .iter()
         .enumerate()
         .map(|(i, b)| b ^ OBFUSCATION_KEY[i % OBFUSCATION_KEY.len()])
         .collect();
     use base64::Engine;
-    format!("enc:{}", base64::engine::general_purpose::STANDARD.encode(&xored))
+    format!(
+        "enc:{}",
+        base64::engine::general_purpose::STANDARD.encode(&xored)
+    )
 }
 
 /// Deobfuscate a stored string (reverse of obfuscate, with plaintext fallback)
@@ -25,7 +30,8 @@ pub fn deobfuscate(stored: &str) -> String {
     if let Some(encoded) = stored.strip_prefix("enc:") {
         use base64::Engine;
         if let Ok(xored) = base64::engine::general_purpose::STANDARD.decode(encoded) {
-            let plain: Vec<u8> = xored.iter()
+            let plain: Vec<u8> = xored
+                .iter()
                 .enumerate()
                 .map(|(i, b)| b ^ OBFUSCATION_KEY[i % OBFUSCATION_KEY.len()])
                 .collect();
@@ -37,27 +43,33 @@ pub fn deobfuscate(stored: &str) -> String {
 }
 
 mod obfuscated_string {
+    use super::{deobfuscate, obfuscate};
     use serde::{self, Deserialize, Deserializer, Serializer};
-    use super::{obfuscate, deobfuscate};
 
     pub fn serialize<S>(value: &str, serializer: S) -> Result<S::Ok, S::Error>
-    where S: Serializer {
+    where
+        S: Serializer,
+    {
         serializer.serialize_str(&obfuscate(value))
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<String, D::Error>
-    where D: Deserializer<'de> {
+    where
+        D: Deserializer<'de>,
+    {
         let s = String::deserialize(deserializer)?;
         Ok(deobfuscate(&s))
     }
 }
 
 mod obfuscated_option_string {
+    use super::{deobfuscate, obfuscate};
     use serde::{self, Deserialize, Deserializer, Serializer};
-    use super::{obfuscate, deobfuscate};
 
     pub fn serialize<S>(value: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
-    where S: Serializer {
+    where
+        S: Serializer,
+    {
         match value {
             Some(v) => serializer.serialize_some(&obfuscate(v)),
             None => serializer.serialize_none(),
@@ -65,7 +77,9 @@ mod obfuscated_option_string {
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-    where D: Deserializer<'de> {
+    where
+        D: Deserializer<'de>,
+    {
         let opt = Option::<String>::deserialize(deserializer)?;
         Ok(opt.map(|s| deobfuscate(&s)))
     }
@@ -83,7 +97,11 @@ pub enum RemoteAuth {
     #[serde(rename = "key_file")]
     KeyFile {
         path: String,
-        #[serde(default, skip_serializing_if = "Option::is_none", with = "obfuscated_option_string")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "obfuscated_option_string"
+        )]
         passphrase: Option<String>,
     },
 }
@@ -99,6 +117,9 @@ pub struct RemoteProfile {
     pub auth: RemoteAuth,
     #[serde(default)]
     pub default_path: String,
+    /// Path to claude binary on the remote host (default: "claude")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_path: Option<String>,
 }
 
 fn default_port() -> u16 {
@@ -177,9 +198,7 @@ impl SftpSession {
         let runtime = Runtime::new().map_err(|e| format!("Failed to create runtime: {}", e))?;
 
         let profile = profile.clone();
-        let (ssh_handle, sftp) = runtime.block_on(async {
-            Self::connect_async(&profile).await
-        })?;
+        let (ssh_handle, sftp) = runtime.block_on(async { Self::connect_async(&profile).await })?;
 
         Ok(Self {
             runtime,
@@ -198,17 +217,20 @@ impl SftpSession {
             ..Default::default()
         };
 
-        let mut ssh = client::connect(Arc::new(config), (profile.host.as_str(), profile.port), SshHandler)
-            .await
-            .map_err(|e| format!("SSH connection failed: {}", e))?;
+        let mut ssh = client::connect(
+            Arc::new(config),
+            (profile.host.as_str(), profile.port),
+            SshHandler,
+        )
+        .await
+        .map_err(|e| format!("SSH connection failed: {}", e))?;
 
         // Authenticate
         let auth_result = match &profile.auth {
-            RemoteAuth::Password { password } => {
-                ssh.authenticate_password(&profile.user, password)
-                    .await
-                    .map_err(|e| format!("Password auth failed: {}", e))?
-            }
+            RemoteAuth::Password { password } => ssh
+                .authenticate_password(&profile.user, password)
+                .await
+                .map_err(|e| format!("Password auth failed: {}", e))?,
             RemoteAuth::KeyFile { path, passphrase } => {
                 let key_path = if path.starts_with('~') {
                     if let Some(home) = dirs::home_dir() {
@@ -284,7 +306,8 @@ impl SftpSession {
                 let is_directory = attrs.is_dir();
                 let is_symlink = attrs.is_symlink();
                 let size = attrs.size.unwrap_or(0);
-                let modified = attrs.mtime
+                let modified = attrs
+                    .mtime
                     .and_then(|t| Local.timestamp_opt(t as i64, 0).single())
                     .unwrap_or_else(Local::now);
 
@@ -384,7 +407,8 @@ impl SftpSession {
 
         self.runtime.block_on(async {
             // Open file with write+create+truncate flags, drop to close
-            let _file = sftp.create(&path)
+            let _file = sftp
+                .create(&path)
                 .await
                 .map_err(|e| format!("Failed to create file '{}': {}", path, e))?;
             Ok(())
@@ -400,7 +424,8 @@ impl SftpSession {
         self.runtime.block_on(async {
             use tokio::io::AsyncReadExt;
 
-            let mut remote_file = sftp.open(&remote_path)
+            let mut remote_file = sftp
+                .open(&remote_path)
                 .await
                 .map_err(|e| format!("Failed to open '{}': {}", remote_path, e))?;
 
@@ -410,10 +435,13 @@ impl SftpSession {
             let mut buf = vec![0u8; 64 * 1024];
             let mut total = 0u64;
             loop {
-                let n = remote_file.read(&mut buf)
+                let n = remote_file
+                    .read(&mut buf)
                     .await
                     .map_err(|e| format!("Failed to read '{}': {}", remote_path, e))?;
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 std::io::Write::write_all(&mut local_file, &buf[..n])
                     .map_err(|e| format!("Failed to write '{}': {}", local_path, e))?;
                 total += n as u64;
@@ -441,7 +469,8 @@ impl SftpSession {
         self.runtime.block_on(async {
             use tokio::io::AsyncReadExt;
 
-            let mut remote_file = sftp.open(&remote_path)
+            let mut remote_file = sftp
+                .open(&remote_path)
                 .await
                 .map_err(|e| format!("Failed to open '{}': {}", remote_path, e))?;
 
@@ -457,10 +486,13 @@ impl SftpSession {
                     let _ = std::fs::remove_file(&local_path);
                     return Err("Cancelled".to_string());
                 }
-                let n = remote_file.read(&mut buf)
+                let n = remote_file
+                    .read(&mut buf)
                     .await
                     .map_err(|e| format!("Failed to read '{}': {}", remote_path, e))?;
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 std::io::Write::write_all(&mut local_file, &buf[..n])
                     .map_err(|e| format!("Failed to write '{}': {}", local_path, e))?;
                 total += n as u64;
@@ -482,7 +514,8 @@ impl SftpSession {
             let mut local_file = std::fs::File::open(&local_path)
                 .map_err(|e| format!("Failed to open '{}': {}", local_path, e))?;
 
-            let mut remote_file = sftp.create(&remote_path)
+            let mut remote_file = sftp
+                .create(&remote_path)
                 .await
                 .map_err(|e| format!("Failed to create '{}': {}", remote_path, e))?;
 
@@ -491,13 +524,17 @@ impl SftpSession {
             loop {
                 let n = std::io::Read::read(&mut local_file, &mut buf)
                     .map_err(|e| format!("Failed to read '{}': {}", local_path, e))?;
-                if n == 0 { break; }
-                remote_file.write_all(&buf[..n])
+                if n == 0 {
+                    break;
+                }
+                remote_file
+                    .write_all(&buf[..n])
                     .await
                     .map_err(|e| format!("Failed to write '{}': {}", remote_path, e))?;
                 total += n as u64;
             }
-            remote_file.shutdown()
+            remote_file
+                .shutdown()
                 .await
                 .map_err(|e| format!("Failed to close '{}': {}", remote_path, e))?;
             Ok(total)
@@ -509,10 +546,9 @@ impl SftpSession {
         // Drop SFTP first, then SSH
         self.sftp = None;
         if let Some(ssh) = self.ssh_handle.take() {
-            let _ = self.runtime.block_on(async {
-                ssh.disconnect(Disconnect::ByApplication, "", "en")
-                    .await
-            });
+            let _ = self
+                .runtime
+                .block_on(async { ssh.disconnect(Disconnect::ByApplication, "", "en").await });
         }
     }
 
@@ -548,13 +584,37 @@ pub fn parse_remote_path(input: &str) -> Option<(String, String, u16, String)> {
         let port_str = &after_first_colon[..second_colon];
         if let Ok(port) = port_str.parse::<u16>() {
             let path = &after_first_colon[second_colon + 1..];
-            (host_part.to_string(), port, if path.is_empty() { "/".to_string() } else { path.to_string() })
+            (
+                host_part.to_string(),
+                port,
+                if path.is_empty() {
+                    "/".to_string()
+                } else {
+                    path.to_string()
+                },
+            )
         } else {
             // Not a port number, treat entire after_first_colon as path
-            (host_part.to_string(), 22, if after_first_colon.is_empty() { "/".to_string() } else { after_first_colon.to_string() })
+            (
+                host_part.to_string(),
+                22,
+                if after_first_colon.is_empty() {
+                    "/".to_string()
+                } else {
+                    after_first_colon.to_string()
+                },
+            )
         }
     } else {
-        (host_part.to_string(), 22, if after_first_colon.is_empty() { "/".to_string() } else { after_first_colon.to_string() })
+        (
+            host_part.to_string(),
+            22,
+            if after_first_colon.is_empty() {
+                "/".to_string()
+            } else {
+                after_first_colon.to_string()
+            },
+        )
     };
 
     if host.is_empty() {
@@ -562,7 +622,11 @@ pub fn parse_remote_path(input: &str) -> Option<(String, String, u16, String)> {
     }
 
     // Ensure path starts with /
-    let path = if path.starts_with('/') { path } else { format!("/{}", path) };
+    let path = if path.starts_with('/') {
+        path
+    } else {
+        format!("/{}", path)
+    };
 
     Some((user, host, port, path))
 }
@@ -571,9 +635,15 @@ pub fn parse_remote_path(input: &str) -> Option<(String, String, u16, String)> {
 fn format_remote_permissions(mode: u32) -> String {
     let mut perms = String::with_capacity(9);
     let flags = [
-        (0o400, 'r'), (0o200, 'w'), (0o100, 'x'),
-        (0o040, 'r'), (0o020, 'w'), (0o010, 'x'),
-        (0o004, 'r'), (0o002, 'w'), (0o001, 'x'),
+        (0o400, 'r'),
+        (0o200, 'w'),
+        (0o100, 'x'),
+        (0o040, 'r'),
+        (0o020, 'w'),
+        (0o010, 'x'),
+        (0o004, 'r'),
+        (0o002, 'w'),
+        (0o001, 'x'),
     ];
     for (bit, ch) in &flags {
         perms.push(if mode & bit != 0 { *ch } else { '-' });
@@ -584,7 +654,10 @@ fn format_remote_permissions(mode: u32) -> String {
 /// Build remote display path string (e.g., "user@host:/path")
 pub fn format_remote_display(profile: &RemoteProfile, path: &str) -> String {
     if profile.port != 22 {
-        format!("{}@{}:{}:{}", profile.user, profile.host, profile.port, path)
+        format!(
+            "{}@{}:{}:{}",
+            profile.user, profile.host, profile.port, path
+        )
     } else {
         format!("{}@{}:{}", profile.user, profile.host, path)
     }
@@ -597,7 +670,9 @@ pub fn find_matching_profile<'a>(
     host: &str,
     port: u16,
 ) -> Option<&'a RemoteProfile> {
-    profiles.iter().find(|p| p.user == user && p.host == host && p.port == port)
+    profiles
+        .iter()
+        .find(|p| p.user == user && p.host == host && p.port == port)
 }
 
 #[cfg(test)]
@@ -607,19 +682,38 @@ mod tests {
     #[test]
     fn test_parse_remote_path_basic() {
         let result = parse_remote_path("user@host:/home/user");
-        assert_eq!(result, Some(("user".to_string(), "host".to_string(), 22, "/home/user".to_string())));
+        assert_eq!(
+            result,
+            Some((
+                "user".to_string(),
+                "host".to_string(),
+                22,
+                "/home/user".to_string()
+            ))
+        );
     }
 
     #[test]
     fn test_parse_remote_path_with_port() {
         let result = parse_remote_path("admin@server:2222:/var/log");
-        assert_eq!(result, Some(("admin".to_string(), "server".to_string(), 2222, "/var/log".to_string())));
+        assert_eq!(
+            result,
+            Some((
+                "admin".to_string(),
+                "server".to_string(),
+                2222,
+                "/var/log".to_string()
+            ))
+        );
     }
 
     #[test]
     fn test_parse_remote_path_no_path() {
         let result = parse_remote_path("user@host:");
-        assert_eq!(result, Some(("user".to_string(), "host".to_string(), 22, "/".to_string())));
+        assert_eq!(
+            result,
+            Some(("user".to_string(), "host".to_string(), 22, "/".to_string()))
+        );
     }
 
     #[test]

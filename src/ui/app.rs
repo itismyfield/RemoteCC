@@ -1,3 +1,4 @@
+use chrono::{DateTime, Local};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -6,21 +7,22 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Instant, SystemTime};
-use chrono::{DateTime, Local};
 
 use crate::config::Settings;
 use crate::keybindings::Keybindings;
-use crate::services::file_ops::{self, FileOperationType, ProgressMessage, FileOperationResult};
-use crate::services::remote::{self, RemoteContext, RemoteProfile, ConnectionStatus, SftpFileEntry};
+use crate::services::file_ops::{self, FileOperationResult, FileOperationType, ProgressMessage};
+use crate::services::remote::{
+    self, ConnectionStatus, RemoteContext, RemoteProfile, SftpFileEntry,
+};
 use crate::services::remote_transfer;
-use crate::ui::file_viewer::ViewerState;
 use crate::ui::file_editor::EditorState;
 use crate::ui::file_info::FileInfoState;
+use crate::ui::file_viewer::ViewerState;
 use crate::ui::theme::DEFAULT_THEME_NAME;
 
 /// Encode a command as base64 for safe shell execution
 /// This avoids all shell escaping issues by encoding the entire command
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
 fn encode_command_base64(command: &str) -> String {
     BASE64.encode(command.as_bytes())
@@ -40,9 +42,9 @@ impl ThemeWatchState {
     /// Create a new watch state for the given theme name
     pub fn watch_theme(theme_name: &str) -> Self {
         let theme_path = crate::ui::theme_loader::theme_path(theme_name);
-        let last_modified = theme_path.as_ref().and_then(|p| {
-            std::fs::metadata(p).ok().and_then(|m| m.modified().ok())
-        });
+        let last_modified = theme_path
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok().and_then(|m| m.modified().ok()));
 
         Self {
             theme_path,
@@ -80,9 +82,10 @@ impl ThemeWatchState {
     /// Update the watch state for a new theme
     pub fn update_theme(&mut self, theme_name: &str) {
         self.theme_path = crate::ui::theme_loader::theme_path(theme_name);
-        self.last_modified = self.theme_path.as_ref().and_then(|p| {
-            std::fs::metadata(p).ok().and_then(|m| m.modified().ok())
-        });
+        self.last_modified = self
+            .theme_path
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok().and_then(|m| m.modified().ok()));
         self.check_counter = 0;
     }
 }
@@ -201,7 +204,7 @@ pub enum DialogType {
 /// Settings dialog state
 #[derive(Debug, Clone)]
 pub struct SettingsState {
-    /// Available theme names (from ~/.cokacdir/themes/)
+    /// Available theme names (from ~/.remotecc/themes/)
     pub themes: Vec<String>,
     /// Currently selected theme index
     pub theme_index: usize,
@@ -238,7 +241,8 @@ impl SettingsState {
         themes.sort();
 
         // Find current theme index
-        let theme_index = themes.iter()
+        let theme_index = themes
+            .iter()
             .position(|t| t == &settings.theme.name)
             .unwrap_or(0);
 
@@ -247,7 +251,8 @@ impl SettingsState {
             "modified_time".to_string(),
             "content_and_time".to_string(),
         ];
-        let diff_method_index = diff_methods.iter()
+        let diff_method_index = diff_methods
+            .iter()
             .position(|m| m == &settings.diff_compare_method)
             .unwrap_or(0);
 
@@ -261,7 +266,10 @@ impl SettingsState {
     }
 
     pub fn current_theme(&self) -> &str {
-        self.themes.get(self.theme_index).map(|s| s.as_str()).unwrap_or(DEFAULT_THEME_NAME)
+        self.themes
+            .get(self.theme_index)
+            .map(|s| s.as_str())
+            .unwrap_or(DEFAULT_THEME_NAME)
     }
 
     pub fn next_theme(&mut self) {
@@ -281,7 +289,10 @@ impl SettingsState {
     }
 
     pub fn current_diff_method(&self) -> &str {
-        self.diff_methods.get(self.diff_method_index).map(|s| s.as_str()).unwrap_or("content")
+        self.diff_methods
+            .get(self.diff_method_index)
+            .map(|s| s.as_str())
+            .unwrap_or("content")
     }
 
     pub fn next_diff_method(&mut self) {
@@ -308,7 +319,7 @@ pub enum RemoteField {
     Port,
     User,
     AuthType,
-    Credential,  // password or key_path depending on auth_type
+    Credential, // password or key_path depending on auth_type
     Passphrase,
 }
 
@@ -357,12 +368,18 @@ impl RemoteConnectState {
 
     pub fn from_profile(profile: &remote::RemoteProfile, profile_index: usize) -> Self {
         let (auth_type, password, key_path, passphrase) = match &profile.auth {
-            remote::RemoteAuth::Password { password } => {
-                (RemoteAuthType::Password, password.clone(), "~/.ssh/id_rsa".to_string(), String::new())
-            }
-            remote::RemoteAuth::KeyFile { path, passphrase } => {
-                (RemoteAuthType::KeyFile, String::new(), path.clone(), passphrase.clone().unwrap_or_default())
-            }
+            remote::RemoteAuth::Password { password } => (
+                RemoteAuthType::Password,
+                password.clone(),
+                "~/.ssh/id_rsa".to_string(),
+                String::new(),
+            ),
+            remote::RemoteAuth::KeyFile { path, passphrase } => (
+                RemoteAuthType::KeyFile,
+                String::new(),
+                path.clone(),
+                passphrase.clone().unwrap_or_default(),
+            ),
         };
         Self {
             selected_field: RemoteField::Host,
@@ -383,7 +400,11 @@ impl RemoteConnectState {
 
     pub fn from_parsed(user: &str, host: &str, port: u16, path: &str) -> Self {
         Self {
-            selected_field: if user.is_empty() { RemoteField::User } else { RemoteField::AuthType },
+            selected_field: if user.is_empty() {
+                RemoteField::User
+            } else {
+                RemoteField::AuthType
+            },
             host: host.to_string(),
             port: port.to_string(),
             user: user.to_string(),
@@ -417,17 +438,17 @@ impl RemoteConnectState {
             RemoteField::User => RemoteField::AuthType,
             RemoteField::AuthType => RemoteField::Credential,
             RemoteField::Credential => match self.auth_type {
-                RemoteAuthType::Password => RemoteField::Host,  // wrap around
+                RemoteAuthType::Password => RemoteField::Host, // wrap around
                 RemoteAuthType::KeyFile => RemoteField::Passphrase,
             },
-            RemoteField::Passphrase => RemoteField::Host,  // wrap around
+            RemoteField::Passphrase => RemoteField::Host, // wrap around
         }
     }
 
     pub fn prev_field(&self) -> RemoteField {
         match self.selected_field {
             RemoteField::Host => match self.auth_type {
-                RemoteAuthType::Password => RemoteField::Credential,  // wrap around
+                RemoteAuthType::Password => RemoteField::Credential, // wrap around
                 RemoteAuthType::KeyFile => RemoteField::Passphrase,
             },
             RemoteField::Port => RemoteField::Host,
@@ -498,6 +519,7 @@ impl RemoteConnectState {
             user: self.user.clone(),
             auth,
             default_path: self.remote_path.clone(),
+            claude_path: None,
         }
     }
 }
@@ -601,7 +623,7 @@ pub struct FileOperationProgress {
 
     // Progress state
     pub current_file: String,
-    pub current_file_progress: f64,  // 0.0 ~ 1.0
+    pub current_file_progress: f64, // 0.0 ~ 1.0
     pub total_files: usize,
     pub completed_files: usize,
     pub total_bytes: u64,
@@ -674,7 +696,12 @@ impl FileOperationProgress {
                             ProgressMessage::FileCompleted(_) => {
                                 self.current_file_progress = 1.0;
                             }
-                            ProgressMessage::TotalProgress(completed_files, total_files, completed_bytes, total_bytes) => {
+                            ProgressMessage::TotalProgress(
+                                completed_files,
+                                total_files,
+                                completed_bytes,
+                                total_bytes,
+                            ) => {
                                 self.completed_files = completed_files;
                                 self.total_files = total_files;
                                 self.completed_bytes = completed_bytes;
@@ -731,28 +758,26 @@ pub enum PendingRemoteOpen {
         remote_path: String,
     },
     /// Open in image viewer
-    ImageViewer {
-        tmp_path: PathBuf,
-    },
+    ImageViewer { tmp_path: PathBuf },
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct PathCompletion {
-    pub suggestions: Vec<String>,  // 자동완성 후보 목록
-    pub selected_index: usize,     // 선택된 후보 인덱스
-    pub visible: bool,             // 목록 표시 여부
+    pub suggestions: Vec<String>, // 자동완성 후보 목록
+    pub selected_index: usize,    // 선택된 후보 인덱스
+    pub visible: bool,            // 목록 표시 여부
 }
 
 #[derive(Debug, Clone)]
 pub struct Dialog {
     pub dialog_type: DialogType,
     pub input: String,
-    pub cursor_pos: usize,  // 커서 위치 (문자 인덱스)
+    pub cursor_pos: usize, // 커서 위치 (문자 인덱스)
     pub message: String,
-    pub completion: Option<PathCompletion>,  // 경로 자동완성용
-    pub selected_button: usize,  // 버튼 선택 인덱스 (0: Yes, 1: No)
+    pub completion: Option<PathCompletion>, // 경로 자동완성용
+    pub selected_button: usize,             // 버튼 선택 인덱스 (0: Yes, 1: No)
     pub selection: Option<(usize, usize)>,  // 선택 범위 (start, end) - None이면 선택 없음
-    pub use_md5: bool,  // MD5 검증 옵션 (EncryptConfirm에서 사용)
+    pub use_md5: bool,                      // MD5 검증 옵션 (EncryptConfirm에서 사용)
 }
 
 #[derive(Debug, Clone)]
@@ -857,10 +882,7 @@ pub enum PanelOpOutcome {
         old_path: Option<PathBuf>,
     },
     /// dir_exists result
-    DirExists {
-        exists: bool,
-        target_entry: String,
-    },
+    DirExists { exists: bool, target_entry: String },
 }
 
 /// Successful connection data
@@ -992,56 +1014,59 @@ impl PanelState {
             let mut items: Vec<FileItem> = Vec::with_capacity(entries.len());
 
             items.extend(entries.into_iter().filter_map(|entry| {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                let path = entry.path();
 
-                    // Check if it's a symlink first
-                    let symlink_meta = fs::symlink_metadata(&path).ok()?;
-                    let is_symlink = symlink_meta.is_symlink();
+                // Check if it's a symlink first
+                let symlink_meta = fs::symlink_metadata(&path).ok()?;
+                let is_symlink = symlink_meta.is_symlink();
 
-                    // For symlinks, follow to get target type; for others, use direct metadata
-                    let metadata = if is_symlink {
-                        fs::metadata(&path).ok().unwrap_or(symlink_meta.clone())
-                    } else {
-                        symlink_meta.clone()
-                    };
+                // For symlinks, follow to get target type; for others, use direct metadata
+                let metadata = if is_symlink {
+                    fs::metadata(&path).ok().unwrap_or(symlink_meta.clone())
+                } else {
+                    symlink_meta.clone()
+                };
 
-                    let is_directory = metadata.is_dir();
-                    let size = if is_directory { 0 } else { metadata.len() };
-                    let modified = metadata.modified().ok()
-                        .map(DateTime::<Local>::from)
-                        .unwrap_or_else(Local::now);
+                let is_directory = metadata.is_dir();
+                let size = if is_directory { 0 } else { metadata.len() };
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .map(DateTime::<Local>::from)
+                    .unwrap_or_else(Local::now);
 
-                    #[cfg(unix)]
-                    let permissions = {
-                        use std::os::unix::fs::PermissionsExt;
-                        let mode = symlink_meta.permissions().mode();
-                        crate::utils::format::format_permissions_short(mode)
-                    };
-                    #[cfg(not(unix))]
-                    let permissions = String::new();
+                #[cfg(unix)]
+                let permissions = {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = symlink_meta.permissions().mode();
+                    crate::utils::format::format_permissions_short(mode)
+                };
+                #[cfg(not(unix))]
+                let permissions = String::new();
 
-                    let display_name = if !is_directory && name.ends_with(crate::enc::naming::EXT) {
-                        std::fs::File::open(&path).ok()
-                            .and_then(|f| {
-                                let mut reader = std::io::BufReader::new(f);
-                                crate::enc::crypto::read_header(&mut reader).ok()
-                            })
-                            .map(|(_, _, hdr_name)| hdr_name)
-                    } else {
-                        None
-                    };
+                let display_name = if !is_directory && name.ends_with(crate::enc::naming::EXT) {
+                    std::fs::File::open(&path)
+                        .ok()
+                        .and_then(|f| {
+                            let mut reader = std::io::BufReader::new(f);
+                            crate::enc::crypto::read_header(&mut reader).ok()
+                        })
+                        .map(|(_, _, hdr_name)| hdr_name)
+                } else {
+                    None
+                };
 
-                    Some(FileItem {
-                        name,
-                        display_name,
-                        is_directory,
-                        is_symlink,
-                        size,
-                        modified,
-                        permissions,
-                    })
-                }));
+                Some(FileItem {
+                    name,
+                    display_name,
+                    is_directory,
+                    is_symlink,
+                    size,
+                    modified,
+                    permissions,
+                })
+            }));
 
             self.sort_items(&mut items);
             self.files.reserve(items.len());
@@ -1254,9 +1279,8 @@ impl PanelState {
         self.selected_index = 0;
         if self.is_remote() {
             // Re-sort existing items locally (no network call)
-            let mut items: Vec<FileItem> = self.files.drain(..)
-                .filter(|f| f.name != "..")
-                .collect();
+            let mut items: Vec<FileItem> =
+                self.files.drain(..).filter(|f| f.name != "..").collect();
             // Re-add ".." entry
             let remote_path = self.path.display().to_string();
             if remote_path != "/" {
@@ -1356,8 +1380,8 @@ pub struct App {
 
     // AI screen state
     pub ai_state: Option<crate::ui::ai_screen::AIScreenState>,
-    pub ai_panel_index: Option<usize>,  // AI가 표시될 패널 인덱스
-    pub ai_previous_panel: Option<usize>,  // AI 화면 띄우기 전 포커스 인덱스
+    pub ai_panel_index: Option<usize>,    // AI가 표시될 패널 인덱스
+    pub ai_previous_panel: Option<usize>, // AI 화면 띄우기 전 포커스 인덱스
 
     // System info state
     pub system_info_state: crate::ui::system_info::SystemInfoState,
@@ -1525,14 +1549,20 @@ impl App {
             let second = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
             vec![PanelState::new(first), PanelState::new(second)]
         } else {
-            settings.panels.iter().map(|ps| {
-                let path = settings.resolve_path(&ps.start_path, || {
-                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
-                });
-                PanelState::with_settings(path, ps)
-            }).collect()
+            settings
+                .panels
+                .iter()
+                .map(|ps| {
+                    let path = settings.resolve_path(&ps.start_path, || {
+                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
+                    });
+                    PanelState::with_settings(path, ps)
+                })
+                .collect()
         };
-        let active_panel_index = settings.active_panel_index.min(panels.len().saturating_sub(1));
+        let active_panel_index = settings
+            .active_panel_index
+            .min(panels.len().saturating_sub(1));
 
         // Load theme from settings
         let theme = crate::ui::theme::Theme::load(&settings.theme.name);
@@ -1630,19 +1660,23 @@ impl App {
 
         // Update settings from current state - save panels array
         let home_path = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-        self.settings.panels = self.panels.iter().map(|p| {
-            // Remote panel paths should not be saved — use home directory instead
-            let path = if p.is_remote() {
-                home_path.display().to_string()
-            } else {
-                p.path.display().to_string()
-            };
-            PanelSettings {
-                start_path: Some(path),
-                sort_by: sort_by_to_string(p.sort_by),
-                sort_order: sort_order_to_string(p.sort_order),
-            }
-        }).collect();
+        self.settings.panels = self
+            .panels
+            .iter()
+            .map(|p| {
+                // Remote panel paths should not be saved — use home directory instead
+                let path = if p.is_remote() {
+                    home_path.display().to_string()
+                } else {
+                    p.path.display().to_string()
+                };
+                PanelSettings {
+                    start_path: Some(path),
+                    sort_by: sort_by_to_string(p.sort_by),
+                    sort_order: sort_order_to_string(p.sort_order),
+                }
+            })
+            .collect();
         self.settings.active_panel_index = self.active_panel_index;
 
         // Save to file (ignore errors silently)
@@ -1664,7 +1698,8 @@ impl App {
         // Reload theme if name changed
         if new_settings.theme.name != self.settings.theme.name {
             self.theme = crate::ui::theme::Theme::load(&new_settings.theme.name);
-            self.theme_watch_state.update_theme(&new_settings.theme.name);
+            self.theme_watch_state
+                .update_theme(&new_settings.theme.name);
         }
 
         // Apply panel sort settings from new settings (keep current paths and selection)
@@ -1784,13 +1819,17 @@ impl App {
 
     /// 왼쪽 패널로 전환 (화면 위치 유지)
     pub fn switch_panel_left(&mut self) {
-        if self.active_panel_index == 0 { return; }
+        if self.active_panel_index == 0 {
+            return;
+        }
         self.switch_panel_keep_index_to(self.active_panel_index - 1);
     }
 
     /// 오른쪽 패널로 전환 (화면 위치 유지)
     pub fn switch_panel_right(&mut self) {
-        if self.active_panel_index >= self.panels.len() - 1 { return; }
+        if self.active_panel_index >= self.panels.len() - 1 {
+            return;
+        }
         self.switch_panel_keep_index_to(self.active_panel_index + 1);
     }
 
@@ -1823,9 +1862,7 @@ impl App {
     /// Replace all panels with ones created from the given paths (CLI args)
     pub fn set_panels_from_paths(&mut self, paths: Vec<PathBuf>) {
         let paths: Vec<PathBuf> = paths.into_iter().take(10).collect();
-        let panels: Vec<PanelState> = paths.into_iter()
-            .map(|p| PanelState::new(p))
-            .collect();
+        let panels: Vec<PanelState> = paths.into_iter().map(|p| PanelState::new(p)).collect();
         if !panels.is_empty() {
             self.panels = panels;
             self.active_panel_index = 0;
@@ -1833,7 +1870,9 @@ impl App {
     }
 
     pub fn add_panel(&mut self) {
-        if self.panels.len() >= 10 { return; }
+        if self.panels.len() >= 10 {
+            return;
+        }
         let path = self.active_panel().path.clone();
         let new_panel = PanelState::new(path);
         self.panels.insert(self.active_panel_index + 1, new_panel);
@@ -1853,7 +1892,9 @@ impl App {
 
     /// 현재 패널 닫기
     pub fn close_panel(&mut self) {
-        if self.panels.len() <= 1 { return; }
+        if self.panels.len() <= 1 {
+            return;
+        }
         let removed_idx = self.active_panel_index;
         // AI가 이 패널에 있으면 AI 상태만 직접 정리 (close_ai_screen은 active_panel_index를 변경하므로 사용하지 않음)
         if self.ai_panel_index == Some(removed_idx) {
@@ -1867,11 +1908,16 @@ impl App {
         self.panels.remove(removed_idx);
         // AI 인덱스 보정
         if let Some(ai_idx) = self.ai_panel_index {
-            if ai_idx > removed_idx { self.ai_panel_index = Some(ai_idx - 1); }
+            if ai_idx > removed_idx {
+                self.ai_panel_index = Some(ai_idx - 1);
+            }
         }
         if let Some(prev_idx) = self.ai_previous_panel {
-            if prev_idx > removed_idx { self.ai_previous_panel = Some(prev_idx - 1); }
-            else if prev_idx == removed_idx { self.ai_previous_panel = None; }
+            if prev_idx > removed_idx {
+                self.ai_previous_panel = Some(prev_idx - 1);
+            } else if prev_idx == removed_idx {
+                self.ai_previous_panel = None;
+            }
         }
         if self.active_panel_index >= self.panels.len() {
             self.active_panel_index = self.panels.len() - 1;
@@ -1904,8 +1950,7 @@ impl App {
         // 이동할 새 인덱스 계산
         let new_index = (panel.selected_index as i32 + delta)
             .max(0)
-            .min(panel.files.len().saturating_sub(1) as i32)
-            as usize;
+            .min(panel.files.len().saturating_sub(1) as i32) as usize;
 
         // 이동하지 않는 경우 (이미 맨 위나 맨 아래)
         if new_index == panel.selected_index {
@@ -1935,9 +1980,13 @@ impl App {
             if let Some(file) = panel.current_file().cloned() {
                 if file.is_directory && panel.is_remote() {
                     let (new_path, focus) = if file.name == ".." {
-                        let focus = panel.path.file_name()
+                        let focus = panel
+                            .path
+                            .file_name()
                             .map(|n| n.to_string_lossy().to_string());
-                        let parent = panel.path.parent()
+                        let parent = panel
+                            .path
+                            .parent()
                             .map(|p| p.display().to_string())
                             .unwrap_or_else(|| "/".to_string());
                         (parent, focus)
@@ -1994,9 +2043,11 @@ impl App {
                             Some(p) => p,
                             None => return,
                         };
-                        self.download_for_remote_open(&file.name, file.size, PendingRemoteOpen::ImageViewer {
-                            tmp_path,
-                        });
+                        self.download_for_remote_open(
+                            &file.name,
+                            file.size,
+                            PendingRemoteOpen::ImageViewer { tmp_path },
+                        );
                     } else {
                         self.edit_file();
                     }
@@ -2031,9 +2082,7 @@ impl App {
 
                 // Check file size for large file warning
                 const LARGE_FILE_THRESHOLD: u64 = 50 * 1024 * 1024; // 50MB
-                let file_size = std::fs::metadata(&path)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+                let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
                 let is_image = crate::ui::image_viewer::is_image_file(&path);
 
@@ -2067,7 +2116,8 @@ impl App {
                     }
                 } else if is_image {
                     // Skip true color check if inline image protocol is available
-                    let has_inline = self.image_picker
+                    let has_inline = self
+                        .image_picker
                         .as_ref()
                         .map(|p| p.protocol_type != ratatui_image::picker::ProtocolType::Halfblocks)
                         .unwrap_or(false);
@@ -2077,23 +2127,24 @@ impl App {
                             dialog_type: DialogType::TrueColorWarning,
                             input: String::new(),
                             cursor_pos: 0,
-                            message: "Terminal doesn't support true color. Open anyway?".to_string(),
+                            message: "Terminal doesn't support true color. Open anyway?"
+                                .to_string(),
                             completion: None,
                             selected_button: 1, // Default to "No"
                             selection: None,
                             use_md5: false,
                         });
                     } else {
-                        self.image_viewer_state = Some(
-                            crate::ui::image_viewer::ImageViewerState::new(&path)
-                        );
+                        self.image_viewer_state =
+                            Some(crate::ui::image_viewer::ImageViewerState::new(&path));
                         self.current_screen = Screen::ImageViewer;
                     }
                 } else {
                     // Regular file - check if binary
                     if Self::is_binary_file(&path) {
                         // Binary file without handler - show handler setup dialog
-                        let extension = path.extension()
+                        let extension = path
+                            .extension()
                             .map(|e| e.to_string_lossy().to_string())
                             .unwrap_or_default();
                         self.pending_binary_file = Some((path, extension.clone()));
@@ -2178,7 +2229,7 @@ impl App {
     /// Handler prefix:
     /// - No prefix: Foreground execution (suspends TUI, runs command, waits for exit, restores TUI)
     ///   Example: "vim {{FILEPATH}}" - hands over terminal, blocks until program exits
-    /// - @ prefix: Background execution (spawns detached, returns to cokacdir immediately)
+    /// - @ prefix: Background execution (spawns detached, returns to RemoteCC immediately)
     ///   Example: "@evince {{FILEPATH}}" - does not wait for program to finish
     pub fn try_extension_handler(&mut self, path: &std::path::Path) -> Result<bool, String> {
         // Get file extension
@@ -2256,10 +2307,14 @@ impl App {
 
     /// Execute a command in terminal mode (blocking, inherits stdio)
     /// Suspends the TUI, runs the command, then restores the TUI
-    fn execute_terminal_command(&mut self, command: &str, cwd: &std::path::Path) -> Result<bool, String> {
-        use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+    fn execute_terminal_command(
+        &mut self,
+        command: &str,
+        cwd: &std::path::Path,
+    ) -> Result<bool, String> {
         use crossterm::cursor::{Hide, Show};
         use crossterm::execute;
+        use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
         use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
         use std::io::{stdout, Write};
 
@@ -2276,7 +2331,7 @@ impl App {
         let encoded = encode_command_base64(command);
         let exe_path = std::env::current_exe()
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "cokacdir".to_string());
+            .unwrap_or_else(|_| "remotecc".to_string());
         let wrapped_command = format!("eval \"$('{}' --base64 '{}')\"", exe_path, encoded);
 
         let result = std::process::Command::new("bash")
@@ -2302,12 +2357,17 @@ impl App {
     }
 
     /// Execute a command in background mode (non-blocking, detached)
-    fn execute_background_command(&self, command: &str, template: &str, cwd: &std::path::Path) -> Result<bool, String> {
+    fn execute_background_command(
+        &self,
+        command: &str,
+        template: &str,
+        cwd: &std::path::Path,
+    ) -> Result<bool, String> {
         // Use base64 encoding to avoid shell escaping issues
         let encoded = encode_command_base64(command);
         let exe_path = std::env::current_exe()
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "cokacdir".to_string());
+            .unwrap_or_else(|_| "remotecc".to_string());
         let wrapped_command = format!("eval \"$('{}' --base64 '{}')\"", exe_path, encoded);
 
         let result = std::process::Command::new("bash")
@@ -2385,7 +2445,8 @@ impl App {
         }
 
         let path = panel.path.join(&file.name);
-        let extension = path.extension()
+        let extension = path
+            .extension()
             .map(|e| e.to_string_lossy().to_string())
             .unwrap_or_default();
 
@@ -2396,7 +2457,9 @@ impl App {
         }
 
         // Check if handler already exists
-        let existing_handler = self.settings.get_extension_handler(&extension)
+        let existing_handler = self
+            .settings
+            .get_extension_handler(&extension)
             .and_then(|handlers| handlers.first().cloned())
             .unwrap_or_default();
 
@@ -2426,9 +2489,15 @@ impl App {
     pub fn go_to_parent(&mut self) {
         if self.active_panel().is_remote() {
             // Remote parent navigation — use spinner
-            let focus = self.active_panel().path.file_name()
+            let focus = self
+                .active_panel()
+                .path
+                .file_name()
                 .map(|n| n.to_string_lossy().to_string());
-            let parent = self.active_panel().path.parent()
+            let parent = self
+                .active_panel()
+                .path
+                .parent()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "/".to_string());
             if let Some(focus_name) = focus {
@@ -2454,7 +2523,9 @@ impl App {
         if let Some(home) = dirs::home_dir() {
             // Disconnect remote if active panel is remote
             if self.active_panel().is_remote() {
-                if self.remote_spinner.is_some() { return; }
+                if self.remote_spinner.is_some() {
+                    return;
+                }
                 self.disconnect_remote_panel();
             }
             let panel = self.active_panel_mut();
@@ -2469,10 +2540,7 @@ impl App {
     #[cfg(target_os = "macos")]
     pub fn open_in_finder(&mut self) {
         let path = self.active_panel().path.clone();
-        match std::process::Command::new("open")
-            .arg(&path)
-            .spawn()
-        {
+        match std::process::Command::new("open").arg(&path).spawn() {
             Ok(_) => self.show_message(&format!("Opened in Finder: {}", path.display())),
             Err(e) => self.show_message(&format!("Failed to open: {}", e)),
         }
@@ -2555,20 +2623,24 @@ impl App {
 
             if let Some(ext) = target_ext {
                 // Collect files with same extension
-                let matching_files: Vec<String> = panel.files.iter()
+                let matching_files: Vec<String> = panel
+                    .files
+                    .iter()
                     .filter(|f| f.name != ".." && !f.is_directory)
                     .filter(|f| {
                         std::path::Path::new(&f.name)
                             .extension()
                             .and_then(|e| e.to_str())
                             .map(|e| e.to_lowercase())
-                            .as_ref() == Some(&ext)
+                            .as_ref()
+                            == Some(&ext)
                     })
                     .map(|f| f.name.clone())
                     .collect();
 
                 // Check if all matching files are already selected
-                let all_selected = matching_files.iter()
+                let all_selected = matching_files
+                    .iter()
                     .all(|name| panel.selected_files.contains(name));
 
                 let count = matching_files.len();
@@ -2629,7 +2701,12 @@ impl App {
             self.active_panel().path.display().to_string()
         };
 
-        if let Some(pos) = self.settings.bookmarked_path.iter().position(|p| p == &current_path) {
+        if let Some(pos) = self
+            .settings
+            .bookmarked_path
+            .iter()
+            .position(|p| p == &current_path)
+        {
             self.settings.bookmarked_path.remove(pos);
             self.show_message(&format!("Bookmark removed: {}", current_path));
         } else {
@@ -2674,7 +2751,9 @@ impl App {
 
         // Priority: if exactly 2 directories are selected in active panel, diff them
         let panel = &self.panels[self.active_panel_index];
-        let selected_dirs: Vec<PathBuf> = panel.files.iter()
+        let selected_dirs: Vec<PathBuf> = panel
+            .files
+            .iter()
             .filter(|f| f.is_directory && panel.selected_files.contains(&f.name))
             .map(|f| panel.path.join(&f.name))
             .collect();
@@ -2712,9 +2791,16 @@ impl App {
             } else {
                 // First selection
                 self.diff_first_panel = Some(self.active_panel_index);
-                let diff_key = self.keybindings.panel_first_key(crate::keybindings::PanelAction::StartDiff);
-                let cancel_key = self.keybindings.panel_first_key(crate::keybindings::PanelAction::ParentDir);
-                self.show_message(&format!("Select second panel for diff ({}) or {} to cancel", diff_key, cancel_key));
+                let diff_key = self
+                    .keybindings
+                    .panel_first_key(crate::keybindings::PanelAction::StartDiff);
+                let cancel_key = self
+                    .keybindings
+                    .panel_first_key(crate::keybindings::PanelAction::ParentDir);
+                self.show_message(&format!(
+                    "Select second panel for diff ({}) or {} to cancel",
+                    diff_key, cancel_key
+                ));
             }
         }
     }
@@ -2725,11 +2811,16 @@ impl App {
             self.show_message("Both paths are the same");
             return;
         }
-        let compare_method = crate::ui::diff_screen::parse_compare_method(&self.settings.diff_compare_method);
+        let compare_method =
+            crate::ui::diff_screen::parse_compare_method(&self.settings.diff_compare_method);
         let sort_by = self.active_panel().sort_by;
         let sort_order = self.active_panel().sort_order;
         let mut state = crate::ui::diff_screen::DiffState::new(
-            left, right, compare_method, sort_by, sort_order,
+            left,
+            right,
+            compare_method,
+            sort_by,
+            sort_order,
         );
         state.start_comparison();
         self.diff_state = Some(state);
@@ -2737,10 +2828,15 @@ impl App {
     }
 
     /// Enter file content diff view from the diff screen
-    pub fn enter_diff_file_view(&mut self, left_path: PathBuf, right_path: PathBuf, file_name: String) {
-        self.diff_file_view_state = Some(
-            crate::ui::diff_file_view::DiffFileViewState::new(left_path, right_path, file_name)
-        );
+    pub fn enter_diff_file_view(
+        &mut self,
+        left_path: PathBuf,
+        right_path: PathBuf,
+        file_name: String,
+    ) {
+        self.diff_file_view_state = Some(crate::ui::diff_file_view::DiffFileViewState::new(
+            left_path, right_path, file_name,
+        ));
         self.current_screen = Screen::DiffFileView;
     }
 
@@ -2760,14 +2856,22 @@ impl App {
     }
 
     /// Calculate total size and build file size map for tar progress
-    fn calculate_tar_sizes(base_dir: &Path, files: &[String]) -> (u64, std::collections::HashMap<String, u64>) {
+    fn calculate_tar_sizes(
+        base_dir: &Path,
+        files: &[String],
+    ) -> (u64, std::collections::HashMap<String, u64>) {
         use std::collections::HashMap;
         let mut total_size = 0u64;
         let mut size_map = HashMap::new();
 
         for file in files {
             let path = base_dir.join(file);
-            Self::collect_file_sizes(&path, &format!("./{}", file), &mut size_map, &mut total_size);
+            Self::collect_file_sizes(
+                &path,
+                &format!("./{}", file),
+                &mut size_map,
+                &mut total_size,
+            );
         }
 
         (total_size, size_map)
@@ -2789,7 +2893,12 @@ impl App {
                     for entry in entries.filter_map(|e| e.ok()) {
                         let entry_name = entry.file_name().to_string_lossy().to_string();
                         let child_tar_path = format!("{}/{}", tar_path, entry_name);
-                        Self::collect_file_sizes(&entry.path(), &child_tar_path, size_map, total_size);
+                        Self::collect_file_sizes(
+                            &entry.path(),
+                            &child_tar_path,
+                            size_map,
+                            total_size,
+                        );
                     }
                 }
             } else {
@@ -2857,7 +2966,8 @@ impl App {
                 // Check if it's an image file
                 if crate::ui::image_viewer::is_image_file(&path) {
                     // Skip true color check if inline image protocol is available
-                    let has_inline = self.image_picker
+                    let has_inline = self
+                        .image_picker
                         .as_ref()
                         .map(|p| p.protocol_type != ratatui_image::picker::ProtocolType::Halfblocks)
                         .unwrap_or(false);
@@ -2867,7 +2977,8 @@ impl App {
                             dialog_type: DialogType::TrueColorWarning,
                             input: String::new(),
                             cursor_pos: 0,
-                            message: "Terminal doesn't support true color. Open anyway?".to_string(),
+                            message: "Terminal doesn't support true color. Open anyway?"
+                                .to_string(),
                             completion: None,
                             selected_button: 1, // Default to "No"
                             selection: None,
@@ -2878,9 +2989,7 @@ impl App {
 
                     // Check file size (threshold: 50MB)
                     const LARGE_IMAGE_THRESHOLD: u64 = 50 * 1024 * 1024;
-                    let file_size = std::fs::metadata(&path)
-                        .map(|m| m.len())
-                        .unwrap_or(0);
+                    let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
                     if file_size > LARGE_IMAGE_THRESHOLD {
                         // Show confirmation dialog for large image
@@ -2899,9 +3008,8 @@ impl App {
                         return;
                     }
 
-                    self.image_viewer_state = Some(
-                        crate::ui::image_viewer::ImageViewerState::new(&path)
-                    );
+                    self.image_viewer_state =
+                        Some(crate::ui::image_viewer::ImageViewerState::new(&path));
                     self.current_screen = Screen::ImageViewer;
                     return;
                 }
@@ -2931,7 +3039,8 @@ impl App {
         if let Some(ref ctx) = panel.remote_ctx {
             let tmp_base = dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join(".cokacdir").join("tmp")
+                .join(".remotecc")
+                .join("tmp")
                 .join(format!("{}@{}", ctx.profile.user, ctx.profile.host));
             Some(tmp_base.join(remote_path.trim_start_matches('/')))
         } else {
@@ -2940,7 +3049,12 @@ impl App {
     }
 
     /// 원격 파일을 tmp로 다운로드 (프로그레스 표시) 후 편집기/뷰어로 열기
-    fn download_for_remote_open(&mut self, file_name: &str, file_size: u64, open_action: PendingRemoteOpen) {
+    fn download_for_remote_open(
+        &mut self,
+        file_name: &str,
+        file_size: u64,
+        open_action: PendingRemoteOpen,
+    ) {
         let panel_index = self.active_panel_index;
         let panel = &self.panels[panel_index];
         let remote_path = format!("{}/{}", panel.path.display(), file_name);
@@ -2948,11 +3062,14 @@ impl App {
         let (profile, tmp_path) = if let Some(ref ctx) = panel.remote_ctx {
             let tmp_base = dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join(".cokacdir").join("tmp")
+                .join(".remotecc")
+                .join("tmp")
                 .join(format!("{}@{}", ctx.profile.user, ctx.profile.host));
             let tmp_path = tmp_base.join(remote_path.trim_start_matches('/'));
             (ctx.profile.clone(), tmp_path)
-        } else { return; };
+        } else {
+            return;
+        };
 
         // 디렉토리 생성
         if let Some(parent) = tmp_path.parent() {
@@ -2974,16 +3091,18 @@ impl App {
         let file_name_owned = file_name.to_string();
 
         thread::spawn(move || {
-            let _ = tx.send(file_ops::ProgressMessage::Preparing(
-                format!("Connecting to {}...", profile.host),
-            ));
+            let _ = tx.send(file_ops::ProgressMessage::Preparing(format!(
+                "Connecting to {}...",
+                profile.host
+            )));
 
             // 새 SFTP 세션 연결
             let session = match remote::SftpSession::connect(&profile) {
                 Ok(s) => s,
                 Err(e) => {
                     let _ = tx.send(file_ops::ProgressMessage::Error(
-                        file_name_owned.clone(), format!("Connection failed: {}", e),
+                        file_name_owned.clone(),
+                        format!("Connection failed: {}", e),
                     ));
                     let _ = tx.send(file_ops::ProgressMessage::Completed(0, 1));
                     return;
@@ -2991,7 +3110,9 @@ impl App {
             };
 
             let _ = tx.send(file_ops::ProgressMessage::PrepareComplete);
-            let _ = tx.send(file_ops::ProgressMessage::FileStarted(file_name_owned.clone()));
+            let _ = tx.send(file_ops::ProgressMessage::FileStarted(
+                file_name_owned.clone(),
+            ));
             let _ = tx.send(file_ops::ProgressMessage::TotalProgress(0, 1, 0, file_size));
 
             // 프로그레스 콜백과 함께 다운로드
@@ -3003,18 +3124,20 @@ impl App {
                 &cancel_flag,
                 |downloaded, total| {
                     let _ = tx.send(file_ops::ProgressMessage::FileProgress(downloaded, total));
-                    let _ = tx.send(file_ops::ProgressMessage::TotalProgress(0, 1, downloaded, total));
+                    let _ = tx.send(file_ops::ProgressMessage::TotalProgress(
+                        0, 1, downloaded, total,
+                    ));
                 },
             ) {
                 Ok(_) => {
                     let _ = tx.send(file_ops::ProgressMessage::FileCompleted(file_name_owned));
-                    let _ = tx.send(file_ops::ProgressMessage::TotalProgress(1, 1, file_size, file_size));
+                    let _ = tx.send(file_ops::ProgressMessage::TotalProgress(
+                        1, 1, file_size, file_size,
+                    ));
                     let _ = tx.send(file_ops::ProgressMessage::Completed(1, 0));
                 }
                 Err(e) => {
-                    let _ = tx.send(file_ops::ProgressMessage::Error(
-                        file_name_owned, e,
-                    ));
+                    let _ = tx.send(file_ops::ProgressMessage::Error(file_name_owned, e));
                     let _ = tx.send(file_ops::ProgressMessage::Completed(0, 1));
                 }
             }
@@ -3039,7 +3162,10 @@ impl App {
             let panel = self.active_panel();
             let file = match panel.current_file() {
                 Some(f) if !f.is_directory => f.clone(),
-                Some(_) => { self.show_message("Select a file to edit"); return; }
+                Some(_) => {
+                    self.show_message("Select a file to edit");
+                    return;
+                }
                 None => return,
             };
             let remote_path = format!("{}/{}", panel.path.display(), file.name);
@@ -3049,11 +3175,15 @@ impl App {
                 Some(p) => p,
                 None => return,
             };
-            self.download_for_remote_open(&file.name, file.size, PendingRemoteOpen::Editor {
-                tmp_path,
-                panel_index,
-                remote_path,
-            });
+            self.download_for_remote_open(
+                &file.name,
+                file.size,
+                PendingRemoteOpen::Editor {
+                    tmp_path,
+                    panel_index,
+                    remote_path,
+                },
+            );
         } else {
             // 로컬 파일: 기존 로직
             let panel = self.active_panel();
@@ -3096,7 +3226,7 @@ impl App {
             cursor_pos: 0,
             message: format!("Delete {}?", file_list),
             completion: None,
-            selected_button: 1,  // 기본값: No (안전을 위해)
+            selected_button: 1, // 기본값: No (안전을 위해)
             selection: None,
             use_md5: false,
         });
@@ -3110,10 +3240,13 @@ impl App {
 
         let dir = self.active_panel().path.clone();
         let count = match fs::read_dir(&dir) {
-            Ok(rd) => rd.filter_map(|e| e.ok())
+            Ok(rd) => rd
+                .filter_map(|e| e.ok())
                 .filter(|e| {
                     let path = e.path();
-                    if !path.is_file() { return false; }
+                    if !path.is_file() {
+                        return false;
+                    }
                     let name = e.file_name().to_string_lossy().to_string();
                     !name.ends_with(".cokacenc") && !name.starts_with('.')
                 })
@@ -3148,7 +3281,8 @@ impl App {
 
         let dir = self.active_panel().path.clone();
         let count = match fs::read_dir(&dir) {
-            Ok(rd) => rd.filter_map(|e| e.ok())
+            Ok(rd) => rd
+                .filter_map(|e| e.ok())
                 .filter(|e| {
                     let path = e.path();
                     path.is_file() && e.file_name().to_string_lossy().ends_with(".cokacenc")
@@ -3168,7 +3302,7 @@ impl App {
             cursor_pos: 0,
             message: format!("Decrypt {} .cokacenc file(s) in {}?", count, dir.display()),
             completion: None,
-            selected_button: 1,  // Default: No
+            selected_button: 1, // Default: No
             selection: None,
             use_md5: false,
         });
@@ -3196,7 +3330,14 @@ impl App {
         progress.receiver = Some(rx);
 
         thread::spawn(move || {
-            crate::enc::pack_directory_with_progress(&dir, &key_path, tx, cancel_flag, split_size_mb, use_md5);
+            crate::enc::pack_directory_with_progress(
+                &dir,
+                &key_path,
+                tx,
+                cancel_flag,
+                split_size_mb,
+                use_md5,
+            );
         });
 
         self.file_operation_progress = Some(progress);
@@ -3290,7 +3431,8 @@ impl App {
                     let search_start = if name.starts_with('.') { 1 } else { 0 };
                     if let Some(dot_pos) = name[search_start..].rfind('.') {
                         // 확장자가 있으면 그 앞까지
-                        name[..search_start].chars().count() + name[search_start..search_start + dot_pos].chars().count()
+                        name[..search_start].chars().count()
+                            + name[search_start..search_start + dot_pos].chars().count()
                     } else {
                         // 확장자 없으면 전체
                         len
@@ -3366,7 +3508,7 @@ impl App {
             message: "Go to path:".to_string(),
             completion: Some(PathCompletion::default()),
             selected_button: 0,
-            selection: Some((0, len)),  // 전체 선택
+            selection: Some((0, len)), // 전체 선택
             use_md5: false,
         });
     }
@@ -3393,7 +3535,7 @@ impl App {
         // Note: claude availability is checked inside AIScreenState (displays error in UI if unavailable)
         self.ai_state = Some(
             crate::ui::ai_screen::AIScreenState::load_latest_session(current_path.clone())
-                .unwrap_or_else(|| crate::ui::ai_screen::AIScreenState::new(current_path))
+                .unwrap_or_else(|| crate::ui::ai_screen::AIScreenState::new(current_path)),
         );
         // 원래 포커스 위치 저장
         self.ai_previous_panel = Some(self.active_panel_index);
@@ -3525,7 +3667,9 @@ impl App {
             return;
         }
 
-        if self.remote_spinner.is_some() { return; }
+        if self.remote_spinner.is_some() {
+            return;
+        }
 
         let project_name = state.project_name.clone();
         let repo_path = state.repo_path.clone();
@@ -3534,7 +3678,7 @@ impl App {
         thread::spawn(move || {
             let diff_base = dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join(".cokacdir")
+                .join(".remotecc")
                 .join("diff");
 
             let _ = std::fs::remove_dir_all(&diff_base);
@@ -3598,7 +3742,10 @@ impl App {
         self.advanced_search_state.reset();
     }
 
-    pub fn execute_advanced_search(&mut self, criteria: &crate::ui::advanced_search::SearchCriteria) {
+    pub fn execute_advanced_search(
+        &mut self,
+        criteria: &crate::ui::advanced_search::SearchCriteria,
+    ) {
         let panel = self.active_panel_mut();
         let mut matched_count = 0;
 
@@ -3657,7 +3804,9 @@ impl App {
 
         if is_remote {
             // Remote delete via SFTP (async with spinner)
-            if self.remote_spinner.is_some() { return; }
+            if self.remote_spinner.is_some() {
+                return;
+            }
             let panel_idx = self.active_panel_index;
             let mut ctx = match self.panels[panel_idx].remote_ctx.take() {
                 Some(ctx) => ctx,
@@ -3665,13 +3814,19 @@ impl App {
             };
             let remote_base = source_path.display().to_string();
             // Collect file info before spawning thread
-            let file_infos: Vec<(String, bool)> = files.iter().map(|file_name| {
-                let is_dir = self.active_panel().files.iter()
-                    .find(|f| f.name == *file_name)
-                    .map(|f| f.is_directory)
-                    .unwrap_or(false);
-                (file_name.clone(), is_dir)
-            }).collect();
+            let file_infos: Vec<(String, bool)> = files
+                .iter()
+                .map(|file_name| {
+                    let is_dir = self
+                        .active_panel()
+                        .files
+                        .iter()
+                        .find(|f| f.name == *file_name)
+                        .map(|f| f.is_directory)
+                        .unwrap_or(false);
+                    (file_name.clone(), is_dir)
+                })
+                .collect();
             let total = file_infos.len();
             let (tx, rx) = mpsc::channel();
 
@@ -3679,7 +3834,8 @@ impl App {
                 let mut success_count = 0;
                 let mut last_error = String::new();
                 for (file_name, is_dir) in &file_infos {
-                    let remote_path = format!("{}/{}", remote_base.trim_end_matches('/'), file_name);
+                    let remote_path =
+                        format!("{}/{}", remote_base.trim_end_matches('/'), file_name);
                     match ctx.session.remove(&remote_path, *is_dir) {
                         Ok(_) => success_count += 1,
                         Err(e) => last_error = e,
@@ -3688,7 +3844,10 @@ impl App {
                 let msg = if success_count == total {
                     Ok(format!("Deleted {} file(s)", success_count))
                 } else {
-                    Err(format!("Deleted {}/{}. Error: {}", success_count, total, last_error))
+                    Err(format!(
+                        "Deleted {}/{}. Error: {}",
+                        success_count, total, last_error
+                    ))
                 };
                 let _ = tx.send(RemoteSpinnerResult::PanelOp {
                     ctx,
@@ -3709,10 +3868,10 @@ impl App {
             return;
         } else {
             // Local delete in background thread with spinner
-            if self.remote_spinner.is_some() { return; }
-            let files_to_delete: Vec<PathBuf> = files.iter()
-                .map(|f| source_path.join(f))
-                .collect();
+            if self.remote_spinner.is_some() {
+                return;
+            }
+            let files_to_delete: Vec<PathBuf> = files.iter().map(|f| source_path.join(f)).collect();
             let total = files_to_delete.len();
             let (tx, rx) = mpsc::channel();
 
@@ -3728,7 +3887,10 @@ impl App {
                 let msg = if success_count == total {
                     Ok(format!("Deleted {} file(s)", success_count))
                 } else {
-                    Err(format!("Deleted {}/{}. Error: {}", success_count, total, last_error))
+                    Err(format!(
+                        "Deleted {}/{}. Error: {}",
+                        success_count, total, last_error
+                    ))
                 };
                 let _ = tx.send(RemoteSpinnerResult::LocalOp {
                     message: msg,
@@ -3755,7 +3917,11 @@ impl App {
         }
 
         let source_path = self.active_panel().path.clone();
-        let source_remote_profile = self.active_panel().remote_ctx.as_ref().map(|c| c.profile.clone());
+        let source_remote_profile = self
+            .active_panel()
+            .remote_ctx
+            .as_ref()
+            .map(|c| c.profile.clone());
         let count = files.len();
 
         self.clipboard = Some(Clipboard {
@@ -3777,7 +3943,11 @@ impl App {
         }
 
         let source_path = self.active_panel().path.clone();
-        let source_remote_profile = self.active_panel().remote_ctx.as_ref().map(|c| c.profile.clone());
+        let source_remote_profile = self
+            .active_panel()
+            .remote_ctx
+            .as_ref()
+            .map(|c| c.profile.clone());
         let count = files.len();
 
         self.clipboard = Some(Clipboard {
@@ -3802,12 +3972,20 @@ impl App {
 
         let source_is_remote = clipboard.source_remote_profile.is_some();
         let target_is_remote = self.active_panel().is_remote();
-        let target_remote_profile = self.active_panel().remote_ctx.as_ref().map(|c| c.profile.clone());
+        let target_remote_profile = self
+            .active_panel()
+            .remote_ctx
+            .as_ref()
+            .map(|c| c.profile.clone());
 
         // Remote involved — use remote transfer path (no conflict detection for remote)
         if source_is_remote || target_is_remote {
             let is_cut = clipboard.operation == ClipboardOperation::Cut;
-            let op_type = if is_cut { FileOperationType::Move } else { FileOperationType::Copy };
+            let op_type = if is_cut {
+                FileOperationType::Move
+            } else {
+                FileOperationType::Copy
+            };
 
             // Remote-to-remote: download to local temp, then upload
             if source_is_remote && target_is_remote {
@@ -3932,7 +4110,11 @@ impl App {
 
             thread::spawn(move || {
                 remote_transfer::transfer_files_with_progress(
-                    config, cancel_flag, tx, is_cut, source_profile_for_delete,
+                    config,
+                    cancel_flag,
+                    tx,
+                    is_cut,
+                    source_profile_for_delete,
                 );
             });
 
@@ -3959,7 +4141,10 @@ impl App {
         let target_path = self.active_panel().path.clone();
 
         // Check if source and target are the same (use canonical paths for robustness)
-        let is_same_folder = match (clipboard.source_path.canonicalize(), target_path.canonicalize()) {
+        let is_same_folder = match (
+            clipboard.source_path.canonicalize(),
+            target_path.canonicalize(),
+        ) {
             (Ok(src), Ok(dest)) => src == dest,
             _ => clipboard.source_path == target_path, // Fallback to direct comparison
         };
@@ -3998,7 +4183,8 @@ impl App {
             let src = clipboard.source_path.join(file_name);
 
             // Check for copying/moving directory into itself
-            if let (Some(ref target_canon), Ok(src_canon)) = (&canonical_target, src.canonicalize()) {
+            if let (Some(ref target_canon), Ok(src_canon)) = (&canonical_target, src.canonicalize())
+            {
                 if src.is_dir() && target_canon.starts_with(&src_canon) {
                     self.show_message(&format!("Cannot copy '{}' into itself", file_name));
                     continue;
@@ -4091,10 +4277,17 @@ impl App {
             counter += 1;
             // Safety limit to prevent infinite loop
             if counter > 10000 {
-                return generate_name(&base, &ext, &format!("_dup{}", std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0)));
+                return generate_name(
+                    &base,
+                    &ext,
+                    &format!(
+                        "_dup{}",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0)
+                    ),
+                );
             }
         }
     }
@@ -4114,7 +4307,12 @@ impl App {
     }
 
     /// Execute paste operation (internal, called after conflict resolution or when no conflicts)
-    fn execute_paste_operation(&mut self, clipboard: Clipboard, valid_files: Vec<String>, target_path: PathBuf) {
+    fn execute_paste_operation(
+        &mut self,
+        clipboard: Clipboard,
+        valid_files: Vec<String>,
+        target_path: PathBuf,
+    ) {
         // Set pending focus to pasted file names (will find first match in sorted file list)
         if !valid_files.is_empty() {
             self.pending_paste_focus = Some(valid_files.clone());
@@ -4141,30 +4339,28 @@ impl App {
 
         // Start operation in background thread
         let clipboard_operation = clipboard.operation;
-        thread::spawn(move || {
-            match clipboard_operation {
-                ClipboardOperation::Copy => {
-                    file_ops::copy_files_with_progress(
-                        file_paths,
-                        &source_path,
-                        &target_path,
-                        HashSet::new(),
-                        HashSet::new(),
-                        cancel_flag,
-                        tx,
-                    );
-                }
-                ClipboardOperation::Cut => {
-                    file_ops::move_files_with_progress(
-                        file_paths,
-                        &source_path,
-                        &target_path,
-                        HashSet::new(),
-                        HashSet::new(),
-                        cancel_flag,
-                        tx,
-                    );
-                }
+        thread::spawn(move || match clipboard_operation {
+            ClipboardOperation::Copy => {
+                file_ops::copy_files_with_progress(
+                    file_paths,
+                    &source_path,
+                    &target_path,
+                    HashSet::new(),
+                    HashSet::new(),
+                    cancel_flag,
+                    tx,
+                );
+            }
+            ClipboardOperation::Cut => {
+                file_ops::move_files_with_progress(
+                    file_paths,
+                    &source_path,
+                    &target_path,
+                    HashSet::new(),
+                    HashSet::new(),
+                    cancel_flag,
+                    tx,
+                );
             }
         });
 
@@ -4193,7 +4389,9 @@ impl App {
         let source_path = clipboard.source_path.clone();
 
         // Filter valid files (skip ".." and non-existent)
-        let valid_files: Vec<String> = clipboard.files.iter()
+        let valid_files: Vec<String> = clipboard
+            .files
+            .iter()
             .filter(|f| *f != ".." && source_path.join(f).exists())
             .cloned()
             .collect();
@@ -4225,7 +4423,8 @@ impl App {
         let file_count = rename_map.len();
 
         // Set pending focus to all dup file names (will find first match in sorted file list)
-        let dup_names: Vec<String> = rename_map.iter()
+        let dup_names: Vec<String> = rename_map
+            .iter()
             .filter_map(|(_, dest)| dest.file_name().map(|n| n.to_string_lossy().to_string()))
             .collect();
         if !dup_names.is_empty() {
@@ -4242,7 +4441,8 @@ impl App {
                     return;
                 }
 
-                let file_name = src.file_name()
+                let file_name = src
+                    .file_name()
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_default();
 
@@ -4256,25 +4456,29 @@ impl App {
                     continue;
                 }
 
-                let _ = tx.send(crate::services::file_ops::ProgressMessage::FileStarted(file_name.clone()));
+                let _ = tx.send(crate::services::file_ops::ProgressMessage::FileStarted(
+                    file_name.clone(),
+                ));
 
                 let result = if src.is_dir() {
                     // Use create_dir (not create_dir_all) to fail if already exists
-                    std::fs::create_dir(&dest)
-                        .and_then(|_| {
-                            // Now copy contents into the newly created directory
-                            for entry in std::fs::read_dir(&src)? {
-                                let entry = entry?;
-                                let entry_src = entry.path();
-                                let entry_dest = dest.join(entry.file_name());
-                                if entry_src.is_dir() {
-                                    crate::services::file_ops::copy_dir_recursive(&entry_src, &entry_dest)?;
-                                } else {
-                                    std::fs::copy(&entry_src, &entry_dest)?;
-                                }
+                    std::fs::create_dir(&dest).and_then(|_| {
+                        // Now copy contents into the newly created directory
+                        for entry in std::fs::read_dir(&src)? {
+                            let entry = entry?;
+                            let entry_src = entry.path();
+                            let entry_dest = dest.join(entry.file_name());
+                            if entry_src.is_dir() {
+                                crate::services::file_ops::copy_dir_recursive(
+                                    &entry_src,
+                                    &entry_dest,
+                                )?;
+                            } else {
+                                std::fs::copy(&entry_src, &entry_dest)?;
                             }
-                            Ok(())
-                        })
+                        }
+                        Ok(())
+                    })
                 } else {
                     // Use create_new to ensure we never overwrite
                     std::fs::File::create_new(&dest)
@@ -4285,7 +4489,9 @@ impl App {
                 match result {
                     Ok(_) => {
                         completed += 1;
-                        let _ = tx.send(crate::services::file_ops::ProgressMessage::FileCompleted(file_name));
+                        let _ = tx.send(crate::services::file_ops::ProgressMessage::FileCompleted(
+                            file_name,
+                        ));
                     }
                     Err(e) => {
                         failed += 1;
@@ -4297,7 +4503,9 @@ impl App {
                 }
             }
 
-            let _ = tx.send(crate::services::file_ops::ProgressMessage::Completed(completed, failed));
+            let _ = tx.send(crate::services::file_ops::ProgressMessage::Completed(
+                completed, failed,
+            ));
         });
 
         // Store progress state and show dialog
@@ -4335,17 +4543,13 @@ impl App {
         let valid_files: Vec<String> = clipboard.files.clone();
 
         // Build overwrite and skip sets from source paths
-        let files_to_overwrite: HashSet<PathBuf> = conflict_state
-            .files_to_overwrite
-            .into_iter()
-            .collect();
-        let files_to_skip: HashSet<PathBuf> = conflict_state
-            .files_to_skip
-            .into_iter()
-            .collect();
+        let files_to_overwrite: HashSet<PathBuf> =
+            conflict_state.files_to_overwrite.into_iter().collect();
+        let files_to_skip: HashSet<PathBuf> = conflict_state.files_to_skip.into_iter().collect();
 
         // Check if all files would be skipped
-        let files_to_process: Vec<&String> = valid_files.iter()
+        let files_to_process: Vec<&String> = valid_files
+            .iter()
             .filter(|f| {
                 let src = clipboard.source_path.join(f);
                 !files_to_skip.contains(&src)
@@ -4354,7 +4558,8 @@ impl App {
 
         // Set pending focus to all non-skipped file names (will find first match in sorted file list)
         if !files_to_process.is_empty() {
-            self.pending_paste_focus = Some(files_to_process.iter().map(|f| (*f).clone()).collect());
+            self.pending_paste_focus =
+                Some(files_to_process.iter().map(|f| (*f).clone()).collect());
         }
 
         if files_to_process.is_empty() {
@@ -4388,30 +4593,28 @@ impl App {
 
         // Start operation in background thread
         let clipboard_operation = clipboard.operation;
-        thread::spawn(move || {
-            match clipboard_operation {
-                ClipboardOperation::Copy => {
-                    file_ops::copy_files_with_progress(
-                        file_paths,
-                        &source_path,
-                        &target_path,
-                        files_to_overwrite,
-                        files_to_skip,
-                        cancel_flag,
-                        tx,
-                    );
-                }
-                ClipboardOperation::Cut => {
-                    file_ops::move_files_with_progress(
-                        file_paths,
-                        &source_path,
-                        &target_path,
-                        files_to_overwrite,
-                        files_to_skip,
-                        cancel_flag,
-                        tx,
-                    );
-                }
+        thread::spawn(move || match clipboard_operation {
+            ClipboardOperation::Copy => {
+                file_ops::copy_files_with_progress(
+                    file_paths,
+                    &source_path,
+                    &target_path,
+                    files_to_overwrite,
+                    files_to_skip,
+                    cancel_flag,
+                    tx,
+                );
+            }
+            ClipboardOperation::Cut => {
+                file_ops::move_files_with_progress(
+                    file_paths,
+                    &source_path,
+                    &target_path,
+                    files_to_overwrite,
+                    files_to_skip,
+                    cancel_flag,
+                    tx,
+                );
             }
         });
 
@@ -4453,9 +4656,7 @@ impl App {
 
     pub fn execute_open_large_image(&mut self) {
         if let Some(path) = self.pending_large_image.take() {
-            self.image_viewer_state = Some(
-                crate::ui::image_viewer::ImageViewerState::new(&path)
-            );
+            self.image_viewer_state = Some(crate::ui::image_viewer::ImageViewerState::new(&path));
             self.current_screen = Screen::ImageViewer;
         }
     }
@@ -4485,7 +4686,9 @@ impl App {
 
         if self.active_panel().is_remote() {
             // Remote mkdir via SFTP (async with spinner)
-            if self.remote_spinner.is_some() { return; }
+            if self.remote_spinner.is_some() {
+                return;
+            }
             let panel_idx = self.active_panel_index;
             let mut ctx = match self.panels[panel_idx].remote_ctx.take() {
                 Some(ctx) => ctx,
@@ -4558,7 +4761,9 @@ impl App {
 
         if self.active_panel().is_remote() {
             // Remote file creation via SFTP (async with spinner)
-            if self.remote_spinner.is_some() { return; }
+            if self.remote_spinner.is_some() {
+                return;
+            }
             let panel_idx = self.active_panel_index;
             let mut ctx = match self.panels[panel_idx].remote_ctx.take() {
                 Some(ctx) => ctx,
@@ -4637,7 +4842,9 @@ impl App {
 
             if self.active_panel().is_remote() {
                 // Remote rename via SFTP (async with spinner)
-                if self.remote_spinner.is_some() { return; }
+                if self.remote_spinner.is_some() {
+                    return;
+                }
                 let panel_idx = self.active_panel_index;
                 let mut ctx = match self.panels[panel_idx].remote_ctx.take() {
                     Some(ctx) => ctx,
@@ -4764,9 +4971,14 @@ impl App {
     }
 
     /// Execute tar with specified exclusions (called after confirmation or when no exclusions needed)
-    pub fn execute_tar_with_excludes(&mut self, archive_name: &str, files: &[String], excluded_paths: &[String]) {
-        use std::process::{Command, Stdio};
+    pub fn execute_tar_with_excludes(
+        &mut self,
+        archive_name: &str,
+        files: &[String],
+        excluded_paths: &[String],
+    ) {
         use std::io::BufReader;
+        use std::process::{Command, Stdio};
 
         let current_dir = self.active_panel().path.clone();
 
@@ -4822,7 +5034,10 @@ impl App {
         thread::spawn(move || {
             // Check for cancellation
             if cancel_flag.load(Ordering::Relaxed) {
-                let _ = tx.send(ProgressMessage::Error(archive_name_owned, "Cancelled".to_string()));
+                let _ = tx.send(ProgressMessage::Error(
+                    archive_name_owned,
+                    "Cancelled".to_string(),
+                ));
                 let _ = tx.send(ProgressMessage::Completed(0, 1));
                 return;
             }
@@ -4837,13 +5052,18 @@ impl App {
 
             // Check for cancellation
             if cancel_flag.load(Ordering::Relaxed) {
-                let _ = tx.send(ProgressMessage::Error(archive_name_owned, "Cancelled".to_string()));
+                let _ = tx.send(ProgressMessage::Error(
+                    archive_name_owned,
+                    "Cancelled".to_string(),
+                ));
                 let _ = tx.send(ProgressMessage::Completed(0, 1));
                 return;
             }
 
             // Determine tar command (in background)
-            let _ = tx.send(ProgressMessage::Preparing("Checking tar command...".to_string()));
+            let _ = tx.send(ProgressMessage::Preparing(
+                "Checking tar command...".to_string(),
+            ));
             let tar_cmd = if let Some(ref custom_tar) = tar_path {
                 // Use custom tar path from settings
                 match Command::new(custom_tar).arg("--version").output() {
@@ -4864,30 +5084,43 @@ impl App {
             let tar_cmd = match tar_cmd {
                 Some(cmd) => cmd,
                 None => {
-                    let _ = tx.send(ProgressMessage::Error(archive_name_owned, "tar command not found".to_string()));
+                    let _ = tx.send(ProgressMessage::Error(
+                        archive_name_owned,
+                        "tar command not found".to_string(),
+                    ));
                     let _ = tx.send(ProgressMessage::Completed(0, 1));
                     return;
                 }
             };
 
             // Check if stdbuf is available (in background)
-            let has_stdbuf = Command::new("stdbuf").arg("--version").output()
+            let has_stdbuf = Command::new("stdbuf")
+                .arg("--version")
+                .output()
                 .map(|o| o.status.success())
                 .unwrap_or(false);
 
             // Check for cancellation
             if cancel_flag.load(Ordering::Relaxed) {
-                let _ = tx.send(ProgressMessage::Error(archive_name_owned, "Cancelled".to_string()));
+                let _ = tx.send(ProgressMessage::Error(
+                    archive_name_owned,
+                    "Cancelled".to_string(),
+                ));
                 let _ = tx.send(ProgressMessage::Completed(0, 1));
                 return;
             }
 
             // Calculate file sizes
-            let _ = tx.send(ProgressMessage::Preparing("Calculating file sizes...".to_string()));
+            let _ = tx.send(ProgressMessage::Preparing(
+                "Calculating file sizes...".to_string(),
+            ));
 
             // Check for cancellation during preparation
             if cancel_flag.load(Ordering::Relaxed) {
-                let _ = tx.send(ProgressMessage::Error(archive_name_owned, "Cancelled".to_string()));
+                let _ = tx.send(ProgressMessage::Error(
+                    archive_name_owned,
+                    "Cancelled".to_string(),
+                ));
                 let _ = tx.send(ProgressMessage::Completed(0, 1));
                 return;
             }
@@ -4898,14 +5131,22 @@ impl App {
 
             // Check for cancellation after preparation
             if cancel_flag.load(Ordering::Relaxed) {
-                let _ = tx.send(ProgressMessage::Error(archive_name_owned, "Cancelled".to_string()));
+                let _ = tx.send(ProgressMessage::Error(
+                    archive_name_owned,
+                    "Cancelled".to_string(),
+                ));
                 let _ = tx.send(ProgressMessage::Completed(0, 1));
                 return;
             }
 
             // Preparation complete, send initial totals
             let _ = tx.send(ProgressMessage::PrepareComplete);
-            let _ = tx.send(ProgressMessage::TotalProgress(0, total_file_count, 0, total_bytes));
+            let _ = tx.send(ProgressMessage::TotalProgress(
+                0,
+                total_file_count,
+                0,
+                total_bytes,
+            ));
 
             // Helper function to cleanup partial archive
             let cleanup_archive = |path: &PathBuf| {
@@ -4977,7 +5218,8 @@ impl App {
                                 Ok(_) => {
                                     let filename = line.trim_end();
                                     // Check if this looks like an error line (starts with "tar:")
-                                    if filename.starts_with("tar:") || filename.starts_with("gtar:") {
+                                    if filename.starts_with("tar:") || filename.starts_with("gtar:")
+                                    {
                                         last_error_line = Some(filename.to_string());
                                     } else if !filename.is_empty() {
                                         completed_files += 1;
@@ -4985,8 +5227,12 @@ impl App {
                                         if let Some(&file_size) = size_map.get(filename) {
                                             completed_bytes += file_size;
                                         }
-                                        let _ = tx.send(ProgressMessage::FileStarted(filename.to_string()));
-                                        let _ = tx.send(ProgressMessage::FileCompleted(filename.to_string()));
+                                        let _ = tx.send(ProgressMessage::FileStarted(
+                                            filename.to_string(),
+                                        ));
+                                        let _ = tx.send(ProgressMessage::FileCompleted(
+                                            filename.to_string(),
+                                        ));
                                         let _ = tx.send(ProgressMessage::TotalProgress(
                                             completed_files,
                                             total_file_count,
@@ -5014,23 +5260,24 @@ impl App {
                                         stderr_handle
                                             .and_then(|h| h.join().ok())
                                             .filter(|s| !s.trim().is_empty())
-                                            .map(|s| s.lines().next().unwrap_or("tar command failed").to_string())
+                                            .map(|s| {
+                                                s.lines()
+                                                    .next()
+                                                    .unwrap_or("tar command failed")
+                                                    .to_string()
+                                            })
                                     })
                                     .unwrap_or_else(|| "tar command failed".to_string());
-                                let _ = tx.send(ProgressMessage::Error(
-                                    archive_name_owned,
-                                    error_msg,
-                                ));
+                                let _ =
+                                    tx.send(ProgressMessage::Error(archive_name_owned, error_msg));
                                 let _ = tx.send(ProgressMessage::Completed(0, 1));
                             }
                         }
                         Err(e) => {
                             // Cleanup partial archive on error
                             cleanup_archive(&archive_path_clone);
-                            let _ = tx.send(ProgressMessage::Error(
-                                archive_name_owned,
-                                e.to_string(),
-                            ));
+                            let _ =
+                                tx.send(ProgressMessage::Error(archive_name_owned, e.to_string()));
                             let _ = tx.send(ProgressMessage::Completed(0, 1));
                         }
                     }
@@ -5052,8 +5299,8 @@ impl App {
         archive_path: &std::path::Path,
         archive_name: &str,
     ) -> (usize, u64, std::collections::HashMap<String, u64>) {
-        use std::process::Command;
         use std::collections::HashMap;
+        use std::process::Command;
 
         // Determine list option based on extension
         let list_options = if archive_name.ends_with(".tar.gz") || archive_name.ends_with(".tgz") {
@@ -5104,8 +5351,8 @@ impl App {
             self.show_message("Archive extraction is not supported on remote panels");
             return;
         }
-        use std::process::{Command, Stdio};
         use std::io::BufReader;
+        use std::process::{Command, Stdio};
 
         let archive_name = match archive_path.file_name() {
             Some(name) => name.to_string_lossy().to_string(),
@@ -5196,13 +5443,18 @@ impl App {
         thread::spawn(move || {
             // Check for cancellation
             if cancel_flag.load(Ordering::Relaxed) {
-                let _ = tx.send(ProgressMessage::Error(extract_dir_owned, "Cancelled".to_string()));
+                let _ = tx.send(ProgressMessage::Error(
+                    extract_dir_owned,
+                    "Cancelled".to_string(),
+                ));
                 let _ = tx.send(ProgressMessage::Completed(0, 1));
                 return;
             }
 
             // Determine tar command (in background)
-            let _ = tx.send(ProgressMessage::Preparing("Checking tar command...".to_string()));
+            let _ = tx.send(ProgressMessage::Preparing(
+                "Checking tar command...".to_string(),
+            ));
             let tar_cmd = if let Some(ref custom_tar) = tar_path {
                 // Use custom tar path from settings
                 match Command::new(custom_tar).arg("--version").output() {
@@ -5223,32 +5475,45 @@ impl App {
             let tar_cmd = match tar_cmd {
                 Some(cmd) => cmd,
                 None => {
-                    let _ = tx.send(ProgressMessage::Error(extract_dir_owned, "tar command not found".to_string()));
+                    let _ = tx.send(ProgressMessage::Error(
+                        extract_dir_owned,
+                        "tar command not found".to_string(),
+                    ));
                     let _ = tx.send(ProgressMessage::Completed(0, 1));
                     return;
                 }
             };
 
             // Check if stdbuf is available (in background)
-            let has_stdbuf = Command::new("stdbuf").arg("--version").output()
+            let has_stdbuf = Command::new("stdbuf")
+                .arg("--version")
+                .output()
                 .map(|o| o.status.success())
                 .unwrap_or(false);
 
             // Check for cancellation
             if cancel_flag.load(Ordering::Relaxed) {
-                let _ = tx.send(ProgressMessage::Error(extract_dir_owned, "Cancelled".to_string()));
+                let _ = tx.send(ProgressMessage::Error(
+                    extract_dir_owned,
+                    "Cancelled".to_string(),
+                ));
                 let _ = tx.send(ProgressMessage::Completed(0, 1));
                 return;
             }
 
             // List archive contents
-            let _ = tx.send(ProgressMessage::Preparing("Reading archive contents...".to_string()));
+            let _ = tx.send(ProgressMessage::Preparing(
+                "Reading archive contents...".to_string(),
+            ));
             let (total_file_count, total_bytes, size_map) =
                 Self::list_archive_contents(&tar_cmd, &archive_path_owned, &archive_name_owned);
 
             // Check for cancellation after listing
             if cancel_flag.load(Ordering::Relaxed) {
-                let _ = tx.send(ProgressMessage::Error(extract_dir_owned, "Cancelled".to_string()));
+                let _ = tx.send(ProgressMessage::Error(
+                    extract_dir_owned,
+                    "Cancelled".to_string(),
+                ));
                 let _ = tx.send(ProgressMessage::Completed(0, 1));
                 return;
             }
@@ -5274,7 +5539,12 @@ impl App {
 
             // Preparation complete, send initial totals
             let _ = tx.send(ProgressMessage::PrepareComplete);
-            let _ = tx.send(ProgressMessage::TotalProgress(0, total_file_count, 0, total_bytes));
+            let _ = tx.send(ProgressMessage::TotalProgress(
+                0,
+                total_file_count,
+                0,
+                total_bytes,
+            ));
 
             // Build command arguments
             let archive_path_str = archive_path_owned.to_string_lossy().to_string();
@@ -5347,7 +5617,8 @@ impl App {
                                 Ok(0) => break, // EOF
                                 Ok(_) => {
                                     let filename = line.trim_end();
-                                    if filename.starts_with("tar:") || filename.starts_with("gtar:") {
+                                    if filename.starts_with("tar:") || filename.starts_with("gtar:")
+                                    {
                                         last_error_line = Some(filename.to_string());
                                     } else if !filename.is_empty() {
                                         completed_files += 1;
@@ -5355,8 +5626,12 @@ impl App {
                                         if let Some(&file_size) = size_map.get(filename) {
                                             completed_bytes += file_size;
                                         }
-                                        let _ = tx.send(ProgressMessage::FileStarted(filename.to_string()));
-                                        let _ = tx.send(ProgressMessage::FileCompleted(filename.to_string()));
+                                        let _ = tx.send(ProgressMessage::FileStarted(
+                                            filename.to_string(),
+                                        ));
+                                        let _ = tx.send(ProgressMessage::FileCompleted(
+                                            filename.to_string(),
+                                        ));
                                         let _ = tx.send(ProgressMessage::TotalProgress(
                                             completed_files,
                                             total_file_count,
@@ -5382,22 +5657,23 @@ impl App {
                                         stderr_handle
                                             .and_then(|h| h.join().ok())
                                             .filter(|s| !s.trim().is_empty())
-                                            .map(|s| s.lines().next().unwrap_or("tar extraction failed").to_string())
+                                            .map(|s| {
+                                                s.lines()
+                                                    .next()
+                                                    .unwrap_or("tar extraction failed")
+                                                    .to_string()
+                                            })
                                     })
                                     .unwrap_or_else(|| "tar extraction failed".to_string());
-                                let _ = tx.send(ProgressMessage::Error(
-                                    extract_dir_owned,
-                                    error_msg,
-                                ));
+                                let _ =
+                                    tx.send(ProgressMessage::Error(extract_dir_owned, error_msg));
                                 let _ = tx.send(ProgressMessage::Completed(0, 1));
                             }
                         }
                         Err(e) => {
                             cleanup_extract_dir(&extract_path_clone);
-                            let _ = tx.send(ProgressMessage::Error(
-                                extract_dir_owned,
-                                e.to_string(),
-                            ));
+                            let _ =
+                                tx.send(ProgressMessage::Error(extract_dir_owned, e.to_string()));
                             let _ = tx.send(ProgressMessage::Completed(0, 1));
                         }
                     }
@@ -5423,7 +5699,9 @@ impl App {
             self.show_message("Please enter a search term");
             return;
         }
-        if self.remote_spinner.is_some() { return; }
+        if self.remote_spinner.is_some() {
+            return;
+        }
 
         let base_path = self.active_panel().path.clone();
         let search_term = term.to_string();
@@ -5571,7 +5849,9 @@ impl App {
     /// Handle goto for remote path (user@host:/path)
     fn execute_goto_remote(&mut self, user: &str, host: &str, port: u16, remote_path: &str) {
         // Check if we have a matching saved profile
-        if let Some(profile) = remote::find_matching_profile(&self.settings.remote_profiles, user, host, port) {
+        if let Some(profile) =
+            remote::find_matching_profile(&self.settings.remote_profiles, user, host, port)
+        {
             // Use saved profile credentials to connect
             let profile = profile.clone();
             let path = if remote_path == "/" && !profile.default_path.is_empty() {
@@ -5599,7 +5879,9 @@ impl App {
 
     /// Handle goto for relative path on a remote panel (async with spinner)
     fn execute_goto_remote_relative(&mut self, path_str: &str) {
-        if self.remote_spinner.is_some() { return; }
+        if self.remote_spinner.is_some() {
+            return;
+        }
 
         let current = self.active_panel().path.display().to_string();
         let new_path = if path_str == ".." {
@@ -5623,7 +5905,9 @@ impl App {
 
     /// Connect a panel to a remote server (async with spinner)
     pub fn connect_remote_panel(&mut self, profile: &remote::RemoteProfile, path: &str) {
-        if self.remote_spinner.is_some() { return; }
+        if self.remote_spinner.is_some() {
+            return;
+        }
 
         let (tx, rx) = mpsc::channel();
         let profile_clone = profile.clone();
@@ -5654,7 +5938,10 @@ impl App {
                                     ctx: Box::new(ctx),
                                     entries,
                                     path: "/".to_string(),
-                                    fallback_msg: Some(format!("Path not found: {} — moved to /", path_clone)),
+                                    fallback_msg: Some(format!(
+                                        "Path not found: {} — moved to /",
+                                        path_clone
+                                    )),
                                     profile: profile_clone,
                                 }),
                                 Err(e2) => Err(format!("Connection failed: {}", e2)),
@@ -5691,7 +5978,9 @@ impl App {
 
     /// Spawn a background thread for remote list_dir operation
     fn spawn_remote_list_dir(&mut self, new_path: &str) {
-        if self.remote_spinner.is_some() { return; }
+        if self.remote_spinner.is_some() {
+            return;
+        }
         let panel_idx = self.active_panel_index;
         let mut ctx = match self.panels[panel_idx].remote_ctx.take() {
             Some(ctx) => ctx,
@@ -5727,7 +6016,9 @@ impl App {
 
     /// Spawn a background thread for remote list_dir (for panel refresh)
     pub fn spawn_remote_refresh(&mut self, panel_idx: usize) {
-        if self.remote_spinner.is_some() { return; }
+        if self.remote_spinner.is_some() {
+            return;
+        }
         let mut ctx = match self.panels[panel_idx].remote_ctx.take() {
             Some(ctx) => ctx,
             None => return,
@@ -5802,11 +6093,16 @@ impl App {
                         panel.apply_remote_entries(success.entries, &PathBuf::from(&success.path));
 
                         // Auto-save profile and bookmark on first connection to this server
-                        let already_has_profile = self.settings.remote_profiles.iter()
-                            .any(|p| p.user == success.profile.user && p.host == success.profile.host && p.port == success.profile.port);
+                        let already_has_profile = self.settings.remote_profiles.iter().any(|p| {
+                            p.user == success.profile.user
+                                && p.host == success.profile.host
+                                && p.port == success.profile.port
+                        });
                         let already_bookmarked = self.settings.bookmarked_path.iter().any(|bm| {
                             if let Some((bu, bh, bp, _)) = remote::parse_remote_path(bm) {
-                                bu == success.profile.user && bh == success.profile.host && bp == success.profile.port
+                                bu == success.profile.user
+                                    && bh == success.profile.host
+                                    && bp == success.profile.port
                             } else {
                                 false
                             }
@@ -5817,7 +6113,8 @@ impl App {
                             settings_changed = true;
                         }
                         if !already_bookmarked {
-                            let bookmark_path = remote::format_remote_display(&success.profile, &success.path);
+                            let bookmark_path =
+                                remote::format_remote_display(&success.profile, &success.path);
                             self.settings.bookmarked_path.push(bookmark_path);
                             settings_changed = true;
                         }
@@ -5828,7 +6125,10 @@ impl App {
                         if let Some(msg) = success.fallback_msg {
                             self.show_extension_handler_error(&msg);
                         } else {
-                            self.show_message(&format!("Connected to {}@{}", success.profile.user, success.profile.host));
+                            self.show_message(&format!(
+                                "Connected to {}@{}",
+                                success.profile.user, success.profile.host
+                            ));
                         }
                     }
                     Err(e) => {
@@ -5836,12 +6136,20 @@ impl App {
                     }
                 }
             }
-            RemoteSpinnerResult::PanelOp { ctx, panel_idx, outcome } => {
+            RemoteSpinnerResult::PanelOp {
+                ctx,
+                panel_idx,
+                outcome,
+            } => {
                 // Return ctx to panel
                 self.panels[panel_idx].remote_ctx = Some(ctx);
 
                 match outcome {
-                    PanelOpOutcome::Simple { message, pending_focus, reload } => {
+                    PanelOpOutcome::Simple {
+                        message,
+                        pending_focus,
+                        reload,
+                    } => {
                         let (msg_text, is_err) = match &message {
                             Ok(msg) => (msg.clone(), false),
                             Err(e) => (format!("Error: {}", e), true),
@@ -5874,7 +6182,11 @@ impl App {
                             }
                         }
                     }
-                    PanelOpOutcome::ListDir { entries, path, old_path } => {
+                    PanelOpOutcome::ListDir {
+                        entries,
+                        path,
+                        old_path,
+                    } => {
                         match entries {
                             Ok(sftp_entries) => {
                                 let panel = &mut self.panels[panel_idx];
@@ -5897,11 +6209,17 @@ impl App {
                             }
                         }
                     }
-                    PanelOpOutcome::DirExists { exists, target_entry } => {
+                    PanelOpOutcome::DirExists {
+                        exists,
+                        target_entry,
+                    } => {
                         if exists {
                             self.execute_goto(&target_entry);
                         } else {
-                            self.show_extension_handler_error(&format!("Path not found: {}", target_entry));
+                            self.show_extension_handler_error(&format!(
+                                "Path not found: {}",
+                                target_entry
+                            ));
                         }
                     }
                 }
@@ -5915,7 +6233,11 @@ impl App {
                     self.refresh_panels();
                 }
             }
-            RemoteSpinnerResult::SearchComplete { results, search_term, base_path } => {
+            RemoteSpinnerResult::SearchComplete {
+                results,
+                search_term,
+                base_path,
+            } => {
                 if results.is_empty() {
                     self.show_message(&format!("No files found matching \"{}\"", search_term));
                 } else {
@@ -5928,16 +6250,14 @@ impl App {
                     self.current_screen = Screen::SearchResult;
                 }
             }
-            RemoteSpinnerResult::GitDiffComplete { result } => {
-                match result {
-                    Ok((dir1, dir2)) => {
-                        self.enter_diff_screen(dir1, dir2);
-                    }
-                    Err(e) => {
-                        self.show_message(&e);
-                    }
+            RemoteSpinnerResult::GitDiffComplete { result } => match result {
+                Ok((dir1, dir2)) => {
+                    self.enter_diff_screen(dir1, dir2);
                 }
-            }
+                Err(e) => {
+                    self.show_message(&e);
+                }
+            },
         }
     }
 
@@ -5960,10 +6280,7 @@ impl App {
             } else {
                 // 파일인 경우 부모 디렉토리로 이동하고 해당 파일에 커서
                 if let Some(parent) = item.full_path.parent() {
-                    self.goto_directory_with_focus(
-                        parent,
-                        Some(item.name.clone()),
-                    );
+                    self.goto_directory_with_focus(parent, Some(item.name.clone()));
                 }
             }
             // 검색 결과 화면 닫기
@@ -5987,7 +6304,7 @@ mod tests {
     fn create_temp_dir() -> PathBuf {
         let unique_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
         let temp_dir = std::env::temp_dir().join(format!(
-            "cokacdir_app_test_{}_{}",
+            "remotecc_app_test_{}_{}",
             std::process::id(),
             unique_id
         ));
@@ -6391,7 +6708,12 @@ mod tests {
         app.clipboard_paste();
 
         // Wait for async operation to complete
-        while app.file_operation_progress.as_ref().map(|p| p.is_active).unwrap_or(false) {
+        while app
+            .file_operation_progress
+            .as_ref()
+            .map(|p| p.is_active)
+            .unwrap_or(false)
+        {
             if let Some(ref mut progress) = app.file_operation_progress {
                 progress.poll();
             }
@@ -6434,7 +6756,12 @@ mod tests {
         app.clipboard_paste();
 
         // Wait for async operation to complete
-        while app.file_operation_progress.as_ref().map(|p| p.is_active).unwrap_or(false) {
+        while app
+            .file_operation_progress
+            .as_ref()
+            .map(|p| p.is_active)
+            .unwrap_or(false)
+        {
             if let Some(ref mut progress) = app.file_operation_progress {
                 progress.poll();
             }

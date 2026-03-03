@@ -23,7 +23,10 @@ pub fn seq_label(index: usize) -> Result<String, CokacencError> {
     let b = b'a' + ((index / (26 * 26)) % 26) as u8;
     let c = b'a' + ((index / 26) % 26) as u8;
     let d = b'a' + (index % 26) as u8;
-    Ok(format!("{}{}{}{}", a as char, b as char, c as char, d as char))
+    Ok(format!(
+        "{}{}{}{}",
+        a as char, b as char, c as char, d as char
+    ))
 }
 
 /// Parse a four-letter sequence label back to index.
@@ -53,7 +56,12 @@ pub fn key_prefix(password: &[u8]) -> String {
 }
 
 /// Generate chunk filename: [<key_prefix>_]<group_id_16hex>_<seq_4letter>.cokacenc
-pub fn chunk_filename(dir: &Path, key_prefix: &str, group_id: &str, seq: usize) -> Result<PathBuf, CokacencError> {
+pub fn chunk_filename(
+    dir: &Path,
+    key_prefix: &str,
+    group_id: &str,
+    seq: usize,
+) -> Result<PathBuf, CokacencError> {
     let label = seq_label(seq)?;
     if key_prefix.is_empty() {
         Ok(dir.join(format!("{}_{}{}", group_id, label, EXT)))
@@ -149,10 +157,7 @@ pub fn group_enc_files(dir: &Path) -> Result<BTreeMap<String, Vec<EncFileInfo>>,
             continue;
         }
         if let Some(info) = parse_enc_filename(&path) {
-            groups
-                .entry(info.group_id.clone())
-                .or_default()
-                .push(info);
+            groups.entry(info.group_id.clone()).or_default().push(info);
         }
     }
 
@@ -252,10 +257,16 @@ mod tests {
         // Wrong extension
         assert!(parse_enc_filename(&PathBuf::from("/tmp/a1b2c3d4e5f6a7b8_aaaa.txt")).is_none());
         // Non-hex group_id
-        assert!(parse_enc_filename(&PathBuf::from("/tmp/g1b2c3d4e5f6a7b8_aaaa.cokacenc")).is_none());
+        assert!(
+            parse_enc_filename(&PathBuf::from("/tmp/g1b2c3d4e5f6a7b8_aaaa.cokacenc")).is_none()
+        );
         // Empty key_prefix (just underscore, no content)
-        assert!(parse_enc_filename(&PathBuf::from("/tmp/_a1b2c3d4e5f6a7b8_aaaa.cokacenc")).is_none());
+        assert!(
+            parse_enc_filename(&PathBuf::from("/tmp/_a1b2c3d4e5f6a7b8_aaaa.cokacenc")).is_none()
+        );
         // Non-alphanumeric key_prefix
-        assert!(parse_enc_filename(&PathBuf::from("/tmp/a+b_a1b2c3d4e5f6a7b8_aaaa.cokacenc")).is_none());
+        assert!(
+            parse_enc_filename(&PathBuf::from("/tmp/a+b_a1b2c3d4e5f6a7b8_aaaa.cokacenc")).is_none()
+        );
     }
 }

@@ -1,11 +1,11 @@
+use crate::keybindings::KeybindingsConfig;
+use crate::services::remote::RemoteProfile;
+use crate::ui::theme::{Theme, DEFAULT_THEME_NAME};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use serde::{Deserialize, Serialize};
-use crate::ui::theme::{Theme, DEFAULT_THEME_NAME};
-use crate::services::remote::RemoteProfile;
-use crate::keybindings::KeybindingsConfig;
 
 /// Panel-specific settings
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,10 +32,6 @@ fn default_diff_compare_method() -> String {
 
 fn default_encrypt_split_size() -> u64 {
     1800
-}
-
-fn default_telegram_polling_time() -> u64 {
-    3000
 }
 
 impl Default for PanelSettings {
@@ -101,9 +97,6 @@ pub struct Settings {
     /// Encryption split size in MB (0 = no split)
     #[serde(default = "default_encrypt_split_size")]
     pub encrypt_split_size: u64,
-    /// Telegram API polling interval in milliseconds (minimum 2500, default 3000)
-    #[serde(default = "default_telegram_polling_time")]
-    pub telegram_polling_time: u64,
 }
 
 impl Default for Settings {
@@ -121,16 +114,21 @@ impl Default for Settings {
         extension_handler.insert(
             "py".to_string(),
             vec![
-                "read -p 'Run \"{{FILEPATH}}\"? (Y/n) ' a && [ -n \"$a\" ] && [ \"$a\" != \"y\" ]".to_string(),
-                "python \"{{FILEPATH}}\" && echo 'Press any key to return...' && read -n 1 -s".to_string(),
-                "python3 \"{{FILEPATH}}\" && echo 'Press any key to return...' && read -n 1 -s".to_string(),
+                "read -p 'Run \"{{FILEPATH}}\"? (Y/n) ' a && [ -n \"$a\" ] && [ \"$a\" != \"y\" ]"
+                    .to_string(),
+                "python \"{{FILEPATH}}\" && echo 'Press any key to return...' && read -n 1 -s"
+                    .to_string(),
+                "python3 \"{{FILEPATH}}\" && echo 'Press any key to return...' && read -n 1 -s"
+                    .to_string(),
             ],
         );
         extension_handler.insert(
             "js".to_string(),
             vec![
-                "read -p 'Run \"{{FILEPATH}}\"? (Y/n) ' a && [ -n \"$a\" ] && [ \"$a\" != \"y\" ]".to_string(),
-                "node \"{{FILEPATH}}\" && echo 'Press any key to return...' && read -n 1 -s".to_string(),
+                "read -p 'Run \"{{FILEPATH}}\"? (Y/n) ' a && [ -n \"$a\" ] && [ \"$a\" != \"y\" ]"
+                    .to_string(),
+                "node \"{{FILEPATH}}\" && echo 'Press any key to return...' && read -n 1 -s"
+                    .to_string(),
             ],
         );
 
@@ -145,23 +143,22 @@ impl Default for Settings {
             remote_profiles: Vec::new(),
             keybindings: KeybindingsConfig::default(),
             encrypt_split_size: default_encrypt_split_size(),
-            telegram_polling_time: default_telegram_polling_time(),
         }
     }
 }
 
 impl Settings {
-    /// Returns the config directory path (~/.cokacdir)
+    /// Returns the config directory path (~/.remotecc)
     pub fn config_dir() -> Option<PathBuf> {
-        dirs::home_dir().map(|h| h.join(".cokacdir"))
+        dirs::home_dir().map(|h| h.join(".remotecc"))
     }
 
-    /// Returns the themes directory path (~/.cokacdir/themes)
+    /// Returns the themes directory path (~/.remotecc/themes)
     pub fn themes_dir() -> Option<PathBuf> {
         Self::config_dir().map(|d| d.join("themes"))
     }
 
-    /// Returns the config file path (~/.cokacdir/settings.json)
+    /// Returns the config file path (~/.remotecc/settings.json)
     pub fn config_path() -> Option<PathBuf> {
         Self::config_dir().map(|d| d.join("settings.json"))
     }
@@ -169,7 +166,7 @@ impl Settings {
     /// Ensures config directories and default files exist
     /// Called on app startup to initialize configuration
     pub fn ensure_config_exists() {
-        // Create ~/.cokacdir/
+        // Create ~/.remotecc/
         if let Some(config_dir) = Self::config_dir() {
             if !config_dir.exists() {
                 if fs::create_dir_all(&config_dir).is_ok() {
@@ -184,7 +181,7 @@ impl Settings {
             }
         }
 
-        // Create ~/.cokacdir/themes/
+        // Create ~/.remotecc/themes/
         if let Some(themes_dir) = Self::themes_dir() {
             if !themes_dir.exists() {
                 let _ = fs::create_dir_all(&themes_dir);
@@ -229,14 +226,13 @@ impl Settings {
         // Ensure config directories and files exist
         Self::ensure_config_exists();
 
-        let config_path = Self::config_path()
-            .ok_or_else(|| "Could not determine config path".to_string())?;
+        let config_path =
+            Self::config_path().ok_or_else(|| "Could not determine config path".to_string())?;
 
         let content = fs::read_to_string(&config_path)
             .map_err(|e| format!("Failed to read settings file: {}", e))?;
 
-        serde_json::from_str(&content)
-            .map_err(|e| format!("Invalid JSON in settings.json: {}", e))
+        serde_json::from_str(&content).map_err(|e| format!("Invalid JSON in settings.json: {}", e))
     }
 
     /// Saves settings to the config file using atomic write pattern

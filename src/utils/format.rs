@@ -1,5 +1,5 @@
 // === UTF-8 safe string slicing utilities ===
-use unicode_width::{UnicodeWidthStr, UnicodeWidthChar};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Byte index를 가장 가까운 char boundary로 내림
 pub fn floor_char_boundary(s: &str, index: usize) -> usize {
@@ -244,6 +244,6 @@ mod tests {
     fn test_display_width_suffix() {
         assert_eq!(display_width_suffix("abcdef", 3), "def");
         // CJK: "한글test" → 뒤에서 5칸 = "test" (4칸)... '글'=2칸 넣으면 6칸 초과 → "test"
-        assert_eq!(display_width_suffix("한글test", 5), "ltest");
+        assert_eq!(display_width_suffix("한글test", 5), "test");
     }
 }

@@ -1,24 +1,18 @@
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::path::Path;
-use std::fs;
 
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
-use sha2::{Sha256, Digest};
 
 use poise::serenity_prelude as serenity;
-use serenity::{
-    ChannelId, MessageId, UserId,
-    CreateAttachment, CreateMessage, EditMessage,
-};
+use serenity::{ChannelId, CreateAttachment, CreateMessage, EditMessage, MessageId, UserId};
 
 use crate::services::claude::{self, CancelToken, StreamMessage, DEFAULT_ALLOWED_TOOLS};
 use crate::ui::ai_screen::{self, HistoryItem, HistoryType, SessionData};
-
-// Re-use telegram's helpers for settings persistence
-use crate::services::telegram;
 
 /// Discord message length limit
 const DISCORD_MSG_LIMIT: usize = 2000;
@@ -30,12 +24,10 @@ struct DiscordSession {
     history: Vec<HistoryItem>,
     pending_uploads: Vec<String>,
     cleared: bool,
-    /// Discord channel name (for webui display)
-    channel_name: Option<String>,
-    /// Discord parent category name (for webui room grouping)
-    category_name: Option<String>,
     /// Remote profile name for SSH execution (None = local)
     remote_profile_name: Option<String>,
+    channel_name: Option<String>,
+    category_name: Option<String>,
 }
 
 /// Bot-level settings persisted to disk
@@ -44,6 +36,8 @@ struct DiscordBotSettings {
     allowed_tools: Vec<String>,
     /// channel_id (string) → last working directory path
     last_sessions: std::collections::HashMap<String, String>,
+    /// channel_id (string) → last remote profile name
+    last_remotes: std::collections::HashMap<String, String>,
     /// Discord user ID of the registered owner (imprinting auth)
     owner_user_id: Option<u64>,
     /// Additional authorized user IDs (added by owner via /adduser)
@@ -53,8 +47,12 @@ struct DiscordBotSettings {
 impl Default for DiscordBotSettings {
     fn default() -> Self {
         Self {
-            allowed_tools: DEFAULT_ALLOWED_TOOLS.iter().map(|s| s.to_string()).collect(),
+            allowed_tools: DEFAULT_ALLOWED_TOOLS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             last_sessions: std::collections::HashMap::new(),
+            last_remotes: std::collections::HashMap::new(),
             owner_user_id: None,
             allowed_user_ids: Vec::new(),
         }
@@ -62,6 +60,16 @@ impl Default for DiscordBotSettings {
 }
 
 /// Shared state for the Discord bot (multi-channel: each channel has its own session)
+/// Handle for a background tmux output watcher
+struct TmuxWatcherHandle {
+    /// Signal to stop the watcher
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Signal to pause monitoring (while Discord handler reads its own turn)
+    paused: Arc<std::sync::atomic::AtomicBool>,
+    /// After Discord handler finishes its turn, set this offset so watcher resumes from here
+    resume_offset: Arc<std::sync::Mutex<Option<u64>>>,
+}
+
 struct SharedData {
     /// Per-channel sessions (each Discord channel can have its own Claude Code session)
     sessions: HashMap<ChannelId, DiscordSession>,
@@ -73,6 +81,8 @@ struct SharedData {
     api_timestamps: HashMap<ChannelId, tokio::time::Instant>,
     /// Cached skill list: (name, description)
     skills_cache: Vec<(String, String)>,
+    /// Per-channel tmux output watchers for terminal→Discord relay
+    tmux_watchers: HashMap<ChannelId, TmuxWatcherHandle>,
 }
 
 /// Poise user data type
@@ -85,7 +95,7 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Data, Error>;
 
 /// Compute a short hash key from the bot token (first 16 chars of SHA-256 hex)
-/// Uses "discord_" prefix to avoid collision with Telegram settings.
+/// Uses "discord_" prefix to namespace Discord bot entries in settings.
 fn discord_token_hash(token: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
@@ -93,9 +103,9 @@ fn discord_token_hash(token: &str) -> String {
     format!("discord_{}", hex::encode(&result[..8]))
 }
 
-/// Path to bot settings file: ~/.cokacdir/bot_settings.json
+/// Path to bot settings file: ~/.remotecc/bot_settings.json
 fn bot_settings_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".cokacdir").join("bot_settings.json"))
+    dirs::home_dir().map(|h| h.join(".remotecc").join("bot_settings.json"))
 }
 
 /// Load Discord bot settings from bot_settings.json
@@ -115,16 +125,23 @@ fn load_bot_settings(token: &str) -> DiscordBotSettings {
     };
     let owner_user_id = entry.get("owner_user_id").and_then(|v| v.as_u64());
     let Some(tools_arr) = entry.get("allowed_tools").and_then(|v| v.as_array()) else {
-        return DiscordBotSettings { owner_user_id, ..DiscordBotSettings::default() };
+        return DiscordBotSettings {
+            owner_user_id,
+            ..DiscordBotSettings::default()
+        };
     };
     let tools: Vec<String> = tools_arr
         .iter()
         .filter_map(|v| v.as_str().map(String::from))
         .collect();
     if tools.is_empty() {
-        return DiscordBotSettings { owner_user_id, ..DiscordBotSettings::default() };
+        return DiscordBotSettings {
+            owner_user_id,
+            ..DiscordBotSettings::default()
+        };
     }
-    let last_sessions = entry.get("last_sessions")
+    let last_sessions = entry
+        .get("last_sessions")
         .and_then(|v| v.as_object())
         .map(|obj| {
             obj.iter()
@@ -132,16 +149,34 @@ fn load_bot_settings(token: &str) -> DiscordBotSettings {
                 .collect()
         })
         .unwrap_or_default();
-    let allowed_user_ids = entry.get("allowed_user_ids")
+    let last_remotes = entry
+        .get("last_remotes")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    let allowed_user_ids = entry
+        .get("allowed_user_ids")
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
         .unwrap_or_default();
-    DiscordBotSettings { allowed_tools: tools, last_sessions, owner_user_id, allowed_user_ids }
+    DiscordBotSettings {
+        allowed_tools: tools,
+        last_sessions,
+        last_remotes,
+        owner_user_id,
+        allowed_user_ids,
+    }
 }
 
 /// Save Discord bot settings to bot_settings.json
 fn save_bot_settings(token: &str, settings: &DiscordBotSettings) {
-    let Some(path) = bot_settings_path() else { return };
+    let Some(path) = bot_settings_path() else {
+        return;
+    };
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -155,6 +190,7 @@ fn save_bot_settings(token: &str, settings: &DiscordBotSettings) {
         "token": token,
         "allowed_tools": settings.allowed_tools,
         "last_sessions": settings.last_sessions,
+        "last_remotes": settings.last_remotes,
         "allowed_user_ids": settings.allowed_user_ids,
     });
     if let Some(owner_id) = settings.owner_user_id {
@@ -173,7 +209,10 @@ pub fn resolve_discord_token_by_hash(hash: &str) -> Option<String> {
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
     let obj = json.as_object()?;
     let entry = obj.get(hash)?;
-    entry.get("token").and_then(|v| v.as_str()).map(String::from)
+    entry
+        .get("token")
+        .and_then(|v| v.as_str())
+        .map(String::from)
 }
 
 /// Normalize tool name: first letter uppercase, rest lowercase
@@ -188,31 +227,48 @@ fn normalize_tool_name(name: &str) -> String {
 
 /// All available tools with (name, description, is_destructive)
 const ALL_TOOLS: &[(&str, &str, bool)] = &[
-    ("Bash",            "Execute shell commands",                          true),
-    ("Read",            "Read file contents from the filesystem",          false),
-    ("Edit",            "Perform find-and-replace edits in files",         true),
-    ("Write",           "Create or overwrite files",                       true),
-    ("Glob",            "Find files by name pattern",                      false),
-    ("Grep",            "Search file contents with regex",                 false),
-    ("Task",            "Launch autonomous sub-agents for complex tasks",  true),
-    ("TaskOutput",      "Retrieve output from background tasks",           false),
-    ("TaskStop",        "Stop a running background task",                  false),
-    ("WebFetch",        "Fetch and process web page content",              true),
-    ("WebSearch",       "Search the web for up-to-date information",       true),
-    ("NotebookEdit",    "Edit Jupyter notebook cells",                     true),
-    ("Skill",           "Invoke slash-command skills",                     false),
-    ("TaskCreate",      "Create a structured task in the task list",       false),
-    ("TaskGet",         "Retrieve task details by ID",                     false),
-    ("TaskUpdate",      "Update task status or details",                   false),
-    ("TaskList",        "List all tasks and their status",                 false),
-    ("AskUserQuestion", "Ask the user a question (interactive)",           false),
-    ("EnterPlanMode",   "Enter planning mode (interactive)",               false),
-    ("ExitPlanMode",    "Exit planning mode (interactive)",                false),
+    ("Bash", "Execute shell commands", true),
+    ("Read", "Read file contents from the filesystem", false),
+    ("Edit", "Perform find-and-replace edits in files", true),
+    ("Write", "Create or overwrite files", true),
+    ("Glob", "Find files by name pattern", false),
+    ("Grep", "Search file contents with regex", false),
+    (
+        "Task",
+        "Launch autonomous sub-agents for complex tasks",
+        true,
+    ),
+    ("TaskOutput", "Retrieve output from background tasks", false),
+    ("TaskStop", "Stop a running background task", false),
+    ("WebFetch", "Fetch and process web page content", true),
+    (
+        "WebSearch",
+        "Search the web for up-to-date information",
+        true,
+    ),
+    ("NotebookEdit", "Edit Jupyter notebook cells", true),
+    ("Skill", "Invoke slash-command skills", false),
+    (
+        "TaskCreate",
+        "Create a structured task in the task list",
+        false,
+    ),
+    ("TaskGet", "Retrieve task details by ID", false),
+    ("TaskUpdate", "Update task status or details", false),
+    ("TaskList", "List all tasks and their status", false),
+    (
+        "AskUserQuestion",
+        "Ask the user a question (interactive)",
+        false,
+    ),
+    ("EnterPlanMode", "Enter planning mode (interactive)", false),
+    ("ExitPlanMode", "Exit planning mode (interactive)", false),
 ];
 
 /// Tool info: (description, is_destructive)
 fn tool_info(name: &str) -> (&'static str, bool) {
-    ALL_TOOLS.iter()
+    ALL_TOOLS
+        .iter()
         .find(|(n, _, _)| *n == name)
         .map(|(_, desc, destr)| (*desc, *destr))
         .unwrap_or(("Custom tool", false))
@@ -220,34 +276,38 @@ fn tool_info(name: &str) -> (&'static str, bool) {
 
 /// Format a risk badge for display
 fn risk_badge(destructive: bool) -> &'static str {
-    if destructive { "⚠️" } else { "" }
+    if destructive {
+        "⚠️"
+    } else {
+        ""
+    }
 }
 
 /// Claude Code built-in slash commands
 const BUILTIN_SKILLS: &[(&str, &str)] = &[
-    ("clear",       "Clear conversation context and start fresh"),
-    ("compact",     "Compact conversation to reduce context"),
-    ("context",     "Visualize current context usage"),
-    ("cost",        "Show token usage and cost for this session"),
-    ("diff",        "View uncommitted changes and per-turn diffs"),
-    ("doctor",      "Check Claude Code health and configuration"),
-    ("export",      "Export conversation to file"),
-    ("fast",        "Toggle fast output mode"),
-    ("files",       "List all files currently in context"),
-    ("fork",        "Create a fork of the current conversation"),
-    ("init",        "Initialize project with CLAUDE.md guide"),
-    ("memory",      "Edit CLAUDE.md memory files"),
-    ("model",       "Switch AI model"),
+    ("clear", "Clear conversation context and start fresh"),
+    ("compact", "Compact conversation to reduce context"),
+    ("context", "Visualize current context usage"),
+    ("cost", "Show token usage and cost for this session"),
+    ("diff", "View uncommitted changes and per-turn diffs"),
+    ("doctor", "Check Claude Code health and configuration"),
+    ("export", "Export conversation to file"),
+    ("fast", "Toggle fast output mode"),
+    ("files", "List all files currently in context"),
+    ("fork", "Create a fork of the current conversation"),
+    ("init", "Initialize project with CLAUDE.md guide"),
+    ("memory", "Edit CLAUDE.md memory files"),
+    ("model", "Switch AI model"),
     ("permissions", "View and manage tool permissions"),
-    ("plan",        "Enable plan mode or view current plan"),
+    ("plan", "Enable plan mode or view current plan"),
     ("pr-comments", "View PR comments for current branch"),
-    ("rename",      "Rename the current conversation"),
-    ("review",      "Code review for uncommitted changes"),
-    ("skills",      "List available skills"),
-    ("stats",       "Show usage statistics"),
-    ("status",      "Show session status and git info"),
-    ("todos",       "List current todo items"),
-    ("usage",       "Show plan usage limits"),
+    ("rename", "Rename the current conversation"),
+    ("review", "Code review for uncommitted changes"),
+    ("skills", "List available skills"),
+    ("stats", "Show usage statistics"),
+    ("status", "Show session status and git info"),
+    ("todos", "List current todo items"),
+    ("usage", "Show plan usage limits"),
 ];
 
 /// Extract a description from a skill .md file.
@@ -343,7 +403,9 @@ fn scan_skills(project_path: Option<&str>) -> Vec<(String, String)> {
         if !dir.is_dir() {
             continue;
         }
-        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.filter_map(|e| e.ok()) {
             let path = entry.path();
             if path.extension().map(|e| e == "md").unwrap_or(false) {
@@ -384,6 +446,7 @@ pub async fn run_bot(token: &str) {
         cancel_tokens: HashMap::new(),
         api_timestamps: HashMap::new(),
         skills_cache: initial_skills,
+        tmux_watchers: HashMap::new(),
     }));
 
     let token_owned = token.to_string();
@@ -405,9 +468,7 @@ pub async fn run_bot(token: &str) {
                 cmd_removeuser(),
                 cmd_help(),
             ],
-            event_handler: |ctx, event, _framework, data| {
-                Box::pin(handle_event(ctx, event, data))
-            },
+            event_handler: |ctx, event, _framework, data| Box::pin(handle_event(ctx, event, data)),
             ..Default::default()
         })
         .setup(move |ctx, _ready, framework| {
@@ -418,15 +479,31 @@ pub async fn run_bot(token: &str) {
                 // (register_globally can take up to 1 hour)
                 let commands = &framework.options().commands;
                 for guild in &_ready.guilds {
-                    if let Err(e) = poise::builtins::register_in_guild(ctx, commands, guild.id).await {
-                        eprintln!("  ⚠ Failed to register commands in guild {}: {}", guild.id, e);
+                    if let Err(e) =
+                        poise::builtins::register_in_guild(ctx, commands, guild.id).await
+                    {
+                        eprintln!(
+                            "  ⚠ Failed to register commands in guild {}: {}",
+                            guild.id, e
+                        );
                     }
                 }
-                println!("  ✓ Bot connected — Registered commands in {} guild(s)", _ready.guilds.len());
+                println!(
+                    "  ✓ Bot connected — Registered commands in {} guild(s)",
+                    _ready.guilds.len()
+                );
 
                 // Background: resolve category names for all known channels
+                let shared_for_tmux = shared_for_migrate.clone();
                 tokio::spawn(async move {
                     migrate_session_categories(&ctx_clone, &shared_for_migrate).await;
+                });
+
+                // Background: restore tmux watchers for surviving tmux sessions
+                let http_for_tmux = ctx.http.clone();
+                let shared_for_tmux2 = shared_for_tmux.clone();
+                tokio::spawn(async move {
+                    restore_tmux_watchers(&http_for_tmux, &shared_for_tmux2).await;
                 });
 
                 Ok(Data {
@@ -467,7 +544,10 @@ async fn check_auth(
             data.settings.owner_user_id = Some(user_id.get());
             save_bot_settings(token, &data.settings);
             let ts = chrono::Local::now().format("%H:%M:%S");
-            println!("  [{ts}] ★ Owner registered: {user_name} (id:{})", user_id.get());
+            println!(
+                "  [{ts}] ★ Owner registered: {user_name} (id:{})",
+                user_id.get()
+            );
             true
         }
         Some(owner_id) => {
@@ -484,10 +564,7 @@ async fn check_auth(
 }
 
 /// Check if a user is the owner (not just allowed)
-async fn check_owner(
-    user_id: UserId,
-    shared: &Arc<Mutex<SharedData>>,
-) -> bool {
+async fn check_owner(user_id: UserId, shared: &Arc<Mutex<SharedData>>) -> bool {
     let data = shared.lock().await;
     data.settings.owner_user_id == Some(user_id.get())
 }
@@ -497,12 +574,17 @@ async fn rate_limit_wait(shared: &Arc<Mutex<SharedData>>, channel_id: ChannelId)
     let min_gap = tokio::time::Duration::from_millis(1000);
     let sleep_until = {
         let mut data = shared.lock().await;
-        let last = data.api_timestamps.entry(channel_id).or_insert_with(||
-            tokio::time::Instant::now() - tokio::time::Duration::from_secs(10)
-        );
+        let last = data
+            .api_timestamps
+            .entry(channel_id)
+            .or_insert_with(|| tokio::time::Instant::now() - tokio::time::Duration::from_secs(10));
         let earliest_next = *last + min_gap;
         let now = tokio::time::Instant::now();
-        let target = if earliest_next > now { earliest_next } else { now };
+        let target = if earliest_next > now {
+            earliest_next
+        } else {
+            now
+        };
         *last = target;
         target
     };
@@ -517,7 +599,9 @@ async fn add_reaction(
     emoji: char,
 ) {
     let reaction = serenity::ReactionType::Unicode(emoji.to_string());
-    let _ = channel_id.create_reaction(&ctx.http, message_id, reaction).await;
+    let _ = channel_id
+        .create_reaction(&ctx.http, message_id, reaction)
+        .await;
 }
 
 // ─── Event handler ───────────────────────────────────────────────────────────
@@ -552,7 +636,10 @@ async fn handle_event(
             // Handle file attachments
             if !new_message.attachments.is_empty() {
                 let ts = chrono::Local::now().format("%H:%M:%S");
-                println!("  [{ts}] ◀ [{user_name}] Upload: {} file(s)", new_message.attachments.len());
+                println!(
+                    "  [{ts}] ◀ [{user_name}] Upload: {} file(s)",
+                    new_message.attachments.len()
+                );
                 handle_file_upload(ctx, new_message, &data.shared).await?;
                 return Ok(());
             }
@@ -571,7 +658,9 @@ async fn handle_event(
                 if d.cancel_tokens.contains_key(&channel_id) {
                     drop(d);
                     rate_limit_wait(&data.shared, channel_id).await;
-                    let _ = channel_id.say(&ctx.http, "AI request in progress. Use `/stop` to cancel.").await;
+                    let _ = channel_id
+                        .say(&ctx.http, "AI request in progress. Use `/stop` to cancel.")
+                        .await;
                     return Ok(());
                 }
             }
@@ -589,7 +678,15 @@ async fn handle_event(
             let ts = chrono::Local::now().format("%H:%M:%S");
             let preview = truncate_str(text, 60);
             println!("  [{ts}] ◀ [{user_name}] {preview}");
-            handle_text_message(ctx, channel_id, new_message.id, text, &data.shared, &data.token).await?;
+            handle_text_message(
+                ctx,
+                channel_id,
+                new_message.id,
+                text,
+                &data.shared,
+                &data.token,
+            )
+            .await?;
         }
         _ => {}
     }
@@ -607,7 +704,10 @@ async fn autocomplete_remote_profile<'a>(
     let partial_lower = partial.to_lowercase();
     let mut choices = Vec::new();
     if partial.is_empty() || "off".contains(&partial_lower) {
-        choices.push(serenity::AutocompleteChoice::new("off (local execution)", "off"));
+        choices.push(serenity::AutocompleteChoice::new(
+            "off (local execution)",
+            "off",
+        ));
     }
     for p in &settings.remote_profiles {
         if partial.is_empty() || p.name.to_lowercase().contains(&partial_lower) {
@@ -636,7 +736,10 @@ async fn cmd_start(
     }
 
     let ts = chrono::Local::now().format("%H:%M:%S");
-    println!("  [{ts}] ◀ [{user_name}] /start path={:?} remote={:?}", path, remote);
+    println!(
+        "  [{ts}] ◀ [{user_name}] /start path={:?} remote={:?}",
+        path, remote
+    );
 
     let path_str = path.as_deref().unwrap_or("").trim();
 
@@ -649,7 +752,8 @@ async fn cmd_start(
             if settings.remote_profiles.iter().any(|p| p.name == name) {
                 Some(Some(name.to_string()))
             } else {
-                ctx.say(format!("Remote profile '{}' not found.", name)).await?;
+                ctx.say(format!("Remote profile '{}' not found.", name))
+                    .await?;
                 return Ok(());
             }
         }
@@ -661,7 +765,8 @@ async fn cmd_start(
         Some(None) => false,
         None => {
             let data = ctx.data().shared.lock().await;
-            data.sessions.get(&ctx.channel_id())
+            data.sessions
+                .get(&ctx.channel_id())
                 .and_then(|s| s.remote_profile_name.as_ref())
                 .is_some()
         }
@@ -671,9 +776,17 @@ async fn cmd_start(
         // Remote + no path: use profile's default_path or "~"
         if let Some(Some(ref name)) = remote_override {
             let settings = crate::config::Settings::load();
-            settings.remote_profiles.iter()
+            settings
+                .remote_profiles
+                .iter()
                 .find(|p| p.name == *name)
-                .map(|p| if p.default_path.is_empty() { "~".to_string() } else { p.default_path.clone() })
+                .map(|p| {
+                    if p.default_path.is_empty() {
+                        "~".to_string()
+                    } else {
+                        p.default_path.clone()
+                    }
+                })
                 .unwrap_or_else(|| "~".to_string())
         } else {
             "~".to_string()
@@ -684,7 +797,7 @@ async fn cmd_start(
             ctx.say("Error: cannot determine home directory.").await?;
             return Ok(());
         };
-        let workspace_dir = home.join(".cokacdir").join("workspace");
+        let workspace_dir = home.join(".remotecc").join("workspace");
         use rand::Rng;
         let random_name: String = rand::thread_rng()
             .sample_iter(&rand::distributions::Alphanumeric)
@@ -693,7 +806,8 @@ async fn cmd_start(
             .collect();
         let new_dir = workspace_dir.join(&random_name);
         if let Err(e) = fs::create_dir_all(&new_dir) {
-            ctx.say(format!("Error: failed to create workspace: {}", e)).await?;
+            ctx.say(format!("Error: failed to create workspace: {}", e))
+                .await?;
             return Ok(());
         }
         new_dir.display().to_string()
@@ -709,7 +823,9 @@ async fn cmd_start(
         // Local + path specified: expand ~ and validate locally
         let expanded = if path_str.starts_with("~/") || path_str == "~" {
             if let Some(home) = dirs::home_dir() {
-                home.join(path_str.strip_prefix("~/").unwrap_or("")).display().to_string()
+                home.join(path_str.strip_prefix("~/").unwrap_or(""))
+                    .display()
+                    .to_string()
             } else {
                 path_str.to_string()
             }
@@ -718,7 +834,8 @@ async fn cmd_start(
         };
         let p = Path::new(&expanded);
         if !p.exists() || !p.is_dir() {
-            ctx.say(format!("Error: '{}' is not a valid directory.", expanded)).await?;
+            ctx.say(format!("Error: '{}' is not a valid directory.", expanded))
+                .await?;
             return Ok(());
         }
         p.canonicalize()
@@ -730,7 +847,8 @@ async fn cmd_start(
     let existing = load_existing_session(&canonical_path);
 
     // Resolve channel/category names before taking the lock
-    let (ch_name, cat_name) = resolve_channel_category(ctx.serenity_context(), ctx.channel_id()).await;
+    let (ch_name, cat_name) =
+        resolve_channel_category(ctx.serenity_context(), ctx.channel_id()).await;
 
     let mut response_lines = Vec::new();
 
@@ -741,16 +859,19 @@ async fn cmd_start(
         // Check if session already exists in memory (e.g. user already ran /remote off)
         let session_existed = data.sessions.contains_key(&channel_id);
 
-        let session = data.sessions.entry(channel_id).or_insert_with(|| DiscordSession {
-            session_id: None,
-            current_path: None,
-            history: Vec::new(),
-            pending_uploads: Vec::new(),
-            cleared: false,
-            channel_name: None,
-            category_name: None,
-            remote_profile_name: None,
-        });
+        let session = data
+            .sessions
+            .entry(channel_id)
+            .or_insert_with(|| DiscordSession {
+                session_id: None,
+                current_path: None,
+                history: Vec::new(),
+                pending_uploads: Vec::new(),
+                cleared: false,
+                channel_name: None,
+                category_name: None,
+                remote_profile_name: None,
+            });
         session.channel_name = ch_name;
         session.category_name = cat_name;
 
@@ -783,11 +904,16 @@ async fn cmd_start(
             }
 
             let ts = chrono::Local::now().format("%H:%M:%S");
-            let remote_info = session.remote_profile_name.as_ref()
+            let remote_info = session
+                .remote_profile_name
+                .as_ref()
                 .map(|n| format!(" (remote: {})", n))
                 .unwrap_or_default();
             println!("  [{ts}] ▶ Session restored: {canonical_path}{remote_info}");
-            response_lines.push(format!("Session restored at `{}`{}.", canonical_path, remote_info));
+            response_lines.push(format!(
+                "Session restored at `{}`{}.",
+                canonical_path, remote_info
+            ));
             response_lines.push(String::new());
 
             // Show last 5 conversation items
@@ -803,7 +929,11 @@ async fn cmd_start(
                     HistoryType::ToolResult => "Result",
                 };
                 let content: String = item.content.chars().take(200).collect();
-                let truncated = if item.content.chars().count() > 200 { "..." } else { "" };
+                let truncated = if item.content.chars().count() > 200 {
+                    "..."
+                } else {
+                    ""
+                };
                 response_lines.push(format!("[{}] {}{}", prefix, content, truncated));
             }
         } else {
@@ -812,15 +942,42 @@ async fn cmd_start(
             session.history.clear();
 
             let ts = chrono::Local::now().format("%H:%M:%S");
-            let remote_info = session.remote_profile_name.as_ref()
+            let remote_info = session
+                .remote_profile_name
+                .as_ref()
                 .map(|n| format!(" (remote: {})", n))
                 .unwrap_or_default();
             println!("  [{ts}] ▶ Session started: {canonical_path}{remote_info}");
-            response_lines.push(format!("Session started at `{}`{}.", canonical_path, remote_info));
+            response_lines.push(format!(
+                "Session started at `{}`{}.",
+                canonical_path, remote_info
+            ));
         }
 
         // Persist channel → path mapping for auto-restore
-        data.settings.last_sessions.insert(channel_id.get().to_string(), canonical_path.clone());
+        let ch_key = channel_id.get().to_string();
+        data.settings
+            .last_sessions
+            .insert(ch_key.clone(), canonical_path.clone());
+        // Persist remote profile: store if active, remove if cleared
+        match &remote_override {
+            Some(Some(name)) => {
+                data.settings.last_remotes.insert(ch_key, name.clone());
+            }
+            Some(None) => {
+                data.settings.last_remotes.remove(&ch_key);
+            }
+            None => {
+                // No explicit override — persist current session state
+                let current_remote = data
+                    .sessions
+                    .get(&channel_id)
+                    .and_then(|s| s.remote_profile_name.clone());
+                if let Some(name) = current_remote {
+                    data.settings.last_remotes.insert(ch_key, name);
+                }
+            }
+        }
         save_bot_settings(&ctx.data().token, &data.settings);
 
         // Rescan skills with project path to pick up project-level commands
@@ -845,6 +1002,9 @@ async fn cmd_pwd(ctx: Context<'_>) -> Result<(), Error> {
     let ts = chrono::Local::now().format("%H:%M:%S");
     println!("  [{ts}] ◀ [{user_name}] /pwd");
 
+    // Auto-restore session
+    auto_restore_session(&ctx.data().shared, ctx.channel_id(), ctx.serenity_context()).await;
+
     let (current_path, remote_name) = {
         let data = ctx.data().shared.lock().await;
         let session = data.sessions.get(&ctx.channel_id());
@@ -861,7 +1021,10 @@ async fn cmd_pwd(ctx: Context<'_>) -> Result<(), Error> {
                 .unwrap_or_else(|| " (local)".to_string());
             ctx.say(format!("`{}`{}", path, remote_info)).await?
         }
-        None => ctx.say("No active session. Use `/start <path>` first.").await?,
+        None => {
+            ctx.say("No active session. Use `/start <path>` first.")
+                .await?
+        }
     };
     Ok(())
 }
@@ -890,7 +1053,9 @@ async fn cmd_clear(ctx: Context<'_>) -> Result<(), Error> {
         if let Ok(guard) = token.child_pid.lock() {
             if let Some(pid) = *guard {
                 #[cfg(unix)]
-                unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                }
             }
         }
     }
@@ -942,7 +1107,9 @@ async fn cmd_stop(ctx: Context<'_>) -> Result<(), Error> {
             if let Ok(guard) = token.child_pid.lock() {
                 if let Some(pid) = *guard {
                     #[cfg(unix)]
-                    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                    }
                 }
             }
             println!("  [{ts}] ■ Cancel signal sent");
@@ -971,7 +1138,8 @@ async fn cmd_down(
 
     let file_path = file.trim();
     if file_path.is_empty() {
-        ctx.say("Usage: `/down <filepath>`\nExample: `/down /home/user/file.txt`").await?;
+        ctx.say("Usage: `/down <filepath>`\nExample: `/down /home/user/file.txt`")
+            .await?;
         return Ok(());
     }
 
@@ -981,12 +1149,15 @@ async fn cmd_down(
     } else {
         let current_path = {
             let data = ctx.data().shared.lock().await;
-            data.sessions.get(&ctx.channel_id()).and_then(|s| s.current_path.clone())
+            data.sessions
+                .get(&ctx.channel_id())
+                .and_then(|s| s.current_path.clone())
         };
         match current_path {
             Some(base) => format!("{}/{}", base.trim_end_matches('/'), file_path),
             None => {
-                ctx.say("No active session. Use absolute path or `/start <path>` first.").await?;
+                ctx.say("No active session. Use absolute path or `/start <path>` first.")
+                    .await?;
                 return Ok(());
             }
         }
@@ -994,7 +1165,8 @@ async fn cmd_down(
 
     let path = Path::new(&resolved_path);
     if !path.exists() {
-        ctx.say(format!("File not found: {}", resolved_path)).await?;
+        ctx.say(format!("File not found: {}", resolved_path))
+            .await?;
         return Ok(());
     }
     if !path.is_file() {
@@ -1004,7 +1176,8 @@ async fn cmd_down(
 
     // Send file as attachment
     let attachment = CreateAttachment::path(path).await?;
-    ctx.send(poise::CreateReply::default().attachment(attachment)).await?;
+    ctx.send(poise::CreateReply::default().attachment(attachment))
+        .await?;
 
     Ok(())
 }
@@ -1030,7 +1203,8 @@ async fn cmd_shell(
 
     let working_dir = {
         let data = ctx.data().shared.lock().await;
-        data.sessions.get(&ctx.channel_id())
+        data.sessions
+            .get(&ctx.channel_id())
             .and_then(|s| s.current_path.clone())
             .unwrap_or_else(|| {
                 dirs::home_dir()
@@ -1055,7 +1229,8 @@ async fn cmd_shell(
             Ok(child) => child.wait_with_output(),
             Err(e) => Err(e),
         }
-    }).await;
+    })
+    .await;
 
     let response = match result {
         Ok(Ok(output)) => {
@@ -1113,7 +1288,11 @@ async fn cmd_allowedtools(ctx: Context<'_>) -> Result<(), Error> {
             msg.push_str(&format!("`{}` {} — {}\n", tool, badge, desc));
         }
     }
-    msg.push_str(&format!("\n{} = destructive\nTotal: {}", risk_badge(true), tools.len()));
+    msg.push_str(&format!(
+        "\n{} = destructive\nTotal: {}",
+        risk_badge(true),
+        tools.len()
+    ));
 
     send_long_message_ctx(ctx, &msg).await?;
     Ok(())
@@ -1140,7 +1319,8 @@ async fn cmd_allowed(
     } else if let Some(name) = arg.strip_prefix('-') {
         ('-', name.trim())
     } else {
-        ctx.say("Use `+toolname` to add or `-toolname` to remove.\nExample: `/allowed +Bash`").await?;
+        ctx.say("Use `+toolname` to add or `-toolname` to remove.\nExample: `/allowed +Bash`")
+            .await?;
         return Ok(());
     };
 
@@ -1189,7 +1369,14 @@ async fn cmd_adduser(
 ) -> Result<(), Error> {
     let author_id = ctx.author().id;
     let author_name = &ctx.author().name;
-    if !check_auth(author_id, author_name, &ctx.data().shared, &ctx.data().token).await {
+    if !check_auth(
+        author_id,
+        author_name,
+        &ctx.data().shared,
+        &ctx.data().token,
+    )
+    .await
+    {
         return Ok(());
     }
     if !check_owner(author_id, &ctx.data().shared).await {
@@ -1206,14 +1393,16 @@ async fn cmd_adduser(
     {
         let mut data = ctx.data().shared.lock().await;
         if data.settings.allowed_user_ids.contains(&target_id) {
-            ctx.say(format!("`{}` is already authorized.", target_name)).await?;
+            ctx.say(format!("`{}` is already authorized.", target_name))
+                .await?;
             return Ok(());
         }
         data.settings.allowed_user_ids.push(target_id);
         save_bot_settings(&ctx.data().token, &data.settings);
     }
 
-    ctx.say(format!("Added `{}` as authorized user.", target_name)).await?;
+    ctx.say(format!("Added `{}` as authorized user.", target_name))
+        .await?;
     println!("  [{ts}] ▶ Added user: {target_name} (id:{target_id})");
     Ok(())
 }
@@ -1226,7 +1415,14 @@ async fn cmd_removeuser(
 ) -> Result<(), Error> {
     let author_id = ctx.author().id;
     let author_name = &ctx.author().name;
-    if !check_auth(author_id, author_name, &ctx.data().shared, &ctx.data().token).await {
+    if !check_auth(
+        author_id,
+        author_name,
+        &ctx.data().shared,
+        &ctx.data().token,
+    )
+    .await
+    {
         return Ok(());
     }
     if !check_owner(author_id, &ctx.data().shared).await {
@@ -1245,13 +1441,15 @@ async fn cmd_removeuser(
         let before_len = data.settings.allowed_user_ids.len();
         data.settings.allowed_user_ids.retain(|&id| id != target_id);
         if data.settings.allowed_user_ids.len() == before_len {
-            ctx.say(format!("`{}` is not in the authorized list.", target_name)).await?;
+            ctx.say(format!("`{}` is not in the authorized list.", target_name))
+                .await?;
             return Ok(());
         }
         save_bot_settings(&ctx.data().token, &data.settings);
     }
 
-    ctx.say(format!("Removed `{}` from authorized users.", target_name)).await?;
+    ctx.say(format!("Removed `{}` from authorized users.", target_name))
+        .await?;
     println!("  [{ts}] ▶ Removed user: {target_name} (id:{target_id})");
     Ok(())
 }
@@ -1260,7 +1458,7 @@ async fn cmd_removeuser(
 #[poise::command(slash_command, rename = "help")]
 async fn cmd_help(ctx: Context<'_>) -> Result<(), Error> {
     let help = "\
-**cokacdir Discord Bot**
+**RemoteCC Discord Bot**
 Manage server files & chat with Claude AI.
 Each channel gets its own independent Claude Code session.
 
@@ -1310,9 +1508,7 @@ async fn autocomplete_skill<'a>(
     let partial_lower = partial.to_lowercase();
     data.skills_cache
         .iter()
-        .filter(|(name, _)| {
-            partial.is_empty() || name.to_lowercase().contains(&partial_lower)
-        })
+        .filter(|(name, _)| partial.is_empty() || name.to_lowercase().contains(&partial_lower))
         .take(25) // Discord autocomplete limit
         .map(|(name, desc)| {
             let label = format!("{} — {}", name, truncate_str(desc, 60));
@@ -1353,7 +1549,9 @@ async fn cmd_cc(
                 if let Ok(guard) = token.child_pid.lock() {
                     if let Some(pid) = *guard {
                         #[cfg(unix)]
-                        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+                        unsafe {
+                            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                        }
                     }
                 }
             }
@@ -1388,7 +1586,9 @@ async fn cmd_cc(
                     if let Ok(guard) = token.child_pid.lock() {
                         if let Some(pid) = *guard {
                             #[cfg(unix)]
-                            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+                            unsafe {
+                                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                            }
                         }
                     }
                     println!("  [{ts}] ■ Cancel signal sent");
@@ -1415,7 +1615,10 @@ async fn cmd_cc(
                         .unwrap_or_else(|| " (local)".to_string());
                     ctx.say(format!("`{}`{}", path, remote_info)).await?
                 }
-                None => ctx.say("No active session. Use `/start <path>` first.").await?,
+                None => {
+                    ctx.say("No active session. Use `/start <path>` first.")
+                        .await?
+                }
             };
             return Ok(());
         }
@@ -1427,6 +1630,9 @@ async fn cmd_cc(
         _ => {}
     }
 
+    // Auto-restore session (must run before skill check to refresh skills_cache with project path)
+    auto_restore_session(&ctx.data().shared, ctx.channel_id(), ctx.serenity_context()).await;
+
     // Verify skill exists
     let skill_exists = {
         let data = ctx.data().shared.lock().await;
@@ -1434,23 +1640,26 @@ async fn cmd_cc(
     };
 
     if !skill_exists {
-        ctx.say(format!("Unknown skill: `{}`. Use `/cc` to see available skills.", skill)).await?;
+        ctx.say(format!(
+            "Unknown skill: `{}`. Use `/cc` to see available skills.",
+            skill
+        ))
+        .await?;
         return Ok(());
     }
-
-    // Auto-restore session
-    auto_restore_session(&ctx.data().shared, ctx.channel_id(), ctx.serenity_context()).await;
 
     // Check session exists
     let has_session = {
         let data = ctx.data().shared.lock().await;
-        data.sessions.get(&ctx.channel_id())
+        data.sessions
+            .get(&ctx.channel_id())
             .and_then(|s| s.current_path.as_ref())
             .is_some()
     };
 
     if !has_session {
-        ctx.say("No active session. Use `/start <path>` first.").await?;
+        ctx.say("No active session. Use `/start <path>` first.")
+            .await?;
         return Ok(());
     }
 
@@ -1459,7 +1668,8 @@ async fn cmd_cc(
         let d = ctx.data().shared.lock().await;
         if d.cancel_tokens.contains_key(&ctx.channel_id()) {
             drop(d);
-            ctx.say("AI request in progress. Use `/stop` to cancel.").await?;
+            ctx.say("AI request in progress. Use `/stop` to cancel.")
+                .await?;
             return Ok(());
         }
     }
@@ -1479,10 +1689,13 @@ async fn cmd_cc(
 
     // Send a confirmation message that we can use as the "user message" for reactions
     ctx.defer().await?;
-    let confirm = ctx.channel_id().send_message(
-        ctx.serenity_context(),
-        CreateMessage::new().content(format!("⚡ Running skill: `/{skill}`")),
-    ).await?;
+    let confirm = ctx
+        .channel_id()
+        .send_message(
+            ctx.serenity_context(),
+            CreateMessage::new().content(format!("⚡ Running skill: `/{skill}`")),
+        )
+        .await?;
 
     // Hand off to the text message handler (it creates its own placeholder)
     handle_text_message(
@@ -1492,7 +1705,8 @@ async fn cmd_cc(
         &skill_prompt,
         &ctx.data().shared,
         &ctx.data().token,
-    ).await?;
+    )
+    .await?;
 
     Ok(())
 }
@@ -1513,11 +1727,16 @@ async fn handle_text_message(
         let mut data = shared.lock().await;
         let info = data.sessions.get(&channel_id).and_then(|session| {
             session.current_path.as_ref().map(|_| {
-                (session.session_id.clone(), session.current_path.clone().unwrap_or_default())
+                (
+                    session.session_id.clone(),
+                    session.current_path.clone().unwrap_or_default(),
+                )
             })
         });
         let tools = data.settings.allowed_tools.clone();
-        let uploads = data.sessions.get_mut(&channel_id)
+        let uploads = data
+            .sessions
+            .get_mut(&channel_id)
             .map(|s| {
                 s.cleared = false;
                 std::mem::take(&mut s.pending_uploads)
@@ -1530,7 +1749,9 @@ async fn handle_text_message(
         Some(info) => info,
         None => {
             rate_limit_wait(shared, channel_id).await;
-            let _ = channel_id.say(&ctx.http, "No active session. Use `/start <path>` first.").await;
+            let _ = channel_id
+                .say(&ctx.http, "No active session. Use `/start <path>` first.")
+                .await;
             return Ok(());
         }
     };
@@ -1540,10 +1761,9 @@ async fn handle_text_message(
 
     // Send placeholder message
     rate_limit_wait(shared, channel_id).await;
-    let placeholder = channel_id.send_message(
-        &ctx.http,
-        CreateMessage::new().content("..."),
-    ).await?;
+    let placeholder = channel_id
+        .send_message(&ctx.http, CreateMessage::new().content("..."))
+        .await?;
     let placeholder_msg_id = placeholder.id;
 
     // Sanitize input
@@ -1558,9 +1778,14 @@ async fn handle_text_message(
     };
 
     // Build disabled tools notice
-    let default_tools: std::collections::HashSet<&str> = DEFAULT_ALLOWED_TOOLS.iter().copied().collect();
-    let allowed_set: std::collections::HashSet<&str> = allowed_tools.iter().map(|s| s.as_str()).collect();
-    let disabled: Vec<&&str> = default_tools.iter().filter(|t| !allowed_set.contains(**t)).collect();
+    let default_tools: std::collections::HashSet<&str> =
+        DEFAULT_ALLOWED_TOOLS.iter().copied().collect();
+    let allowed_set: std::collections::HashSet<&str> =
+        allowed_tools.iter().map(|s| s.as_str()).collect();
+    let disabled: Vec<&&str> = default_tools
+        .iter()
+        .filter(|t| !allowed_set.contains(**t))
+        .collect();
     let disabled_notice = if disabled.is_empty() {
         String::new()
     } else {
@@ -1581,7 +1806,9 @@ async fn handle_text_message(
         if data.skills_cache.is_empty() {
             String::new()
         } else {
-            let list: Vec<String> = data.skills_cache.iter()
+            let list: Vec<String> = data
+                .skills_cache
+                .iter()
                 .map(|(name, desc)| format!("  - /{}: {}", name, desc))
                 .collect();
             format!(
@@ -1597,7 +1824,7 @@ async fn handle_text_message(
          Current working directory: {}\n\n\
          When your work produces a file the user would want (generated code, reports, images, archives, etc.),\n\
          send it by running this bash command:\n\n\
-         cokacdir --discord-sendfile <filepath> --channel {} --key {}\n\n\
+         remotecc --discord-sendfile <filepath> --channel {} --key {}\n\n\
          This delivers the file directly to the user's Discord channel.\n\
          Do NOT tell the user to use /down — use the command above instead.\n\n\
          Always keep the user informed about what you are doing. \
@@ -1616,22 +1843,29 @@ async fn handle_text_message(
         data.cancel_tokens.insert(channel_id, cancel_token.clone());
     }
 
-    // Notify webui: agent is now active
-    if let Some(ref sid) = session_id {
-        crate::services::webui::push_status_by_session(sid, "active");
-    }
-
     // Resolve remote profile for this channel
     let remote_profile = {
         let data = shared.lock().await;
-        data.sessions.get(&channel_id)
+        data.sessions
+            .get(&channel_id)
             .and_then(|s| s.remote_profile_name.as_ref())
             .and_then(|name| {
                 let settings = crate::config::Settings::load();
-                settings.remote_profiles.iter()
+                settings
+                    .remote_profiles
+                    .iter()
                     .find(|p| p.name == *name)
                     .cloned()
             })
+    };
+
+    // Resolve tmux session name from channel name
+    let tmux_session_name = {
+        let data = shared.lock().await;
+        data.sessions
+            .get(&channel_id)
+            .and_then(|s| s.channel_name.as_ref())
+            .map(|name| claude::sanitize_tmux_session_name(name))
     };
 
     // Create channel for streaming
@@ -1640,6 +1874,14 @@ async fn handle_text_message(
     let session_id_clone = session_id.clone();
     let current_path_clone = current_path.clone();
     let cancel_token_clone = cancel_token.clone();
+
+    // Pause tmux watcher if one exists (so it doesn't read our turn's output)
+    {
+        let data = shared.lock().await;
+        if let Some(watcher) = data.tmux_watchers.get(&channel_id) {
+            watcher.paused.store(true, Ordering::Relaxed);
+        }
+    }
 
     // Run Claude in a blocking thread
     tokio::task::spawn_blocking(move || {
@@ -1652,10 +1894,16 @@ async fn handle_text_message(
             Some(&allowed_tools),
             Some(cancel_token_clone),
             remote_profile.as_ref(),
+            tmux_session_name.as_deref(),
         );
 
         if let Err(e) = result {
-            let _ = tx.send(StreamMessage::Error { message: e, stdout: String::new(), stderr: String::new(), exit_code: None });
+            let _ = tx.send(StreamMessage::Error {
+                message: e,
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: None,
+            });
         }
     });
 
@@ -1665,14 +1913,13 @@ async fn handle_text_message(
     let user_text_owned = user_text.to_string();
     let session_id_for_status = session_id.clone();
     tokio::spawn(async move {
-        const SPINNER: &[&str] = &[
-            "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
-        ];
+        const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let mut full_response = String::new();
         let mut last_edit_text = String::new();
         let mut done = false;
         let mut cancelled = false;
         let mut new_session_id: Option<String> = None;
+        let mut tmux_last_offset: Option<u64> = None;
         let mut spin_idx: usize = 0;
         let mut current_msg_id = placeholder_msg_id;
         let mut current_msg_len: usize = 0;
@@ -1702,36 +1949,33 @@ async fn handle_text_message(
                                 full_response.push_str(&content);
                             }
                             StreamMessage::ToolUse { name, input } => {
-                                let summary = telegram::format_tool_input(&name, &input);
+                                let summary = format_tool_input(&name, &input);
                                 let ts = chrono::Local::now().format("%H:%M:%S");
                                 println!("  [{ts}]   ⚙ {name}: {}", truncate_str(&summary, 80));
-                                full_response.push_str(&format!("\n\n⚙️ {}\n", summary));
+                                // Ensure paragraph break between text blocks separated by tool calls
+                                if !full_response.is_empty() {
+                                    let trimmed = full_response.trim_end();
+                                    full_response.truncate(trimmed.len());
+                                    full_response.push_str("\n\n");
+                                }
                             }
                             StreamMessage::ToolResult { content, is_error } => {
                                 if is_error {
                                     let ts = chrono::Local::now().format("%H:%M:%S");
                                     println!("  [{ts}]   ✗ Error: {}", truncate_str(&content, 80));
-                                    let truncated = truncate_str(&content, 500);
-                                    if truncated.contains('\n') {
-                                        full_response.push_str(&format!("\n❌\n```\n{}\n```\n", truncated));
-                                    } else {
-                                        full_response.push_str(&format!("\n❌ `{}`\n\n", truncated));
-                                    }
-                                } else if !content.is_empty() {
-                                    let truncated = truncate_str(&content, 300);
-                                    if truncated.contains('\n') {
-                                        full_response.push_str(&format!("\n```\n{}\n```\n", truncated));
-                                    } else {
-                                        full_response.push_str(&format!("\n✅ `{}`\n\n", truncated));
-                                    }
                                 }
+                                // Tool results (including errors) are only logged to console, not sent to Discord
+                                let _ = (content, is_error);
                             }
                             StreamMessage::TaskNotification { summary, .. } => {
                                 if !summary.is_empty() {
                                     full_response.push_str(&format!("\n[Task: {}]\n", summary));
                                 }
                             }
-                            StreamMessage::Done { result, session_id: sid } => {
+                            StreamMessage::Done {
+                                result,
+                                session_id: sid,
+                            } => {
                                 if !result.is_empty() && full_response.is_empty() {
                                     full_response = result;
                                 }
@@ -1740,27 +1984,65 @@ async fn handle_text_message(
                                 }
                                 done = true;
                             }
-                            StreamMessage::Error { message, stderr, .. } => {
+                            StreamMessage::Error {
+                                message, stderr, ..
+                            } => {
                                 if !stderr.is_empty() {
-                                    full_response = format!("Error: {}\nstderr: {}", message, &stderr[..stderr.len().min(500)]);
+                                    full_response = format!(
+                                        "Error: {}\nstderr: {}",
+                                        message,
+                                        &stderr[..stderr.len().min(500)]
+                                    );
                                 } else {
                                     full_response = format!("Error: {}", message);
                                 }
                                 done = true;
                             }
-                            StreamMessage::StatusUpdate { model, cost_usd, total_cost_usd, duration_ms, num_turns, input_tokens, output_tokens } => {
-                                // Push statusline info to web UI
-                                if let Some(ref sid) = session_id_for_status {
-                                    crate::services::webui::push_statusline_by_session(
-                                        sid,
-                                        model.as_deref(),
-                                        cost_usd,
-                                        total_cost_usd,
-                                        duration_ms,
-                                        num_turns,
-                                        input_tokens,
-                                        output_tokens,
-                                    );
+                            StreamMessage::StatusUpdate { .. } => {
+                                // Status updates handled by external dashboard
+                            }
+                            StreamMessage::TmuxReady {
+                                output_path,
+                                input_fifo_path: _,
+                                tmux_session_name,
+                                last_offset,
+                            } => {
+                                // Record offset so we can resume watcher from here
+                                tmux_last_offset = Some(last_offset);
+                                // Start background tmux watcher for terminal→Discord relay
+                                let already_watching = {
+                                    let data = shared_owned.lock().await;
+                                    data.tmux_watchers.contains_key(&channel_id)
+                                };
+                                if !already_watching {
+                                    let cancel =
+                                        Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                    let paused =
+                                        Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                    let resume_offset =
+                                        Arc::new(std::sync::Mutex::new(None::<u64>));
+                                    let handle = TmuxWatcherHandle {
+                                        cancel: cancel.clone(),
+                                        paused: paused.clone(),
+                                        resume_offset: resume_offset.clone(),
+                                    };
+                                    {
+                                        let mut data = shared_owned.lock().await;
+                                        data.tmux_watchers.insert(channel_id, handle);
+                                    }
+                                    let http_bg = http.clone();
+                                    let shared_bg = shared_owned.clone();
+                                    tokio::spawn(tmux_output_watcher(
+                                        channel_id,
+                                        http_bg,
+                                        shared_bg,
+                                        output_path,
+                                        tmux_session_name,
+                                        last_offset,
+                                        cancel,
+                                        paused,
+                                        resume_offset,
+                                    ));
                                 }
                             }
                         }
@@ -1794,31 +2076,47 @@ async fn handle_text_message(
                     current_msg_len = finalize_text.len();
 
                     rate_limit_wait(&shared_owned, channel_id).await;
-                    let _ = channel_id.edit_message(
-                        &http,
-                        current_msg_id,
-                        EditMessage::new().content(&finalize_text),
-                    ).await;
+                    let _ = channel_id
+                        .edit_message(
+                            &http,
+                            current_msg_id,
+                            EditMessage::new().content(&finalize_text),
+                        )
+                        .await;
 
                     // Start new message
                     rate_limit_wait(&shared_owned, channel_id).await;
-                    if let Ok(new_msg) = channel_id.send_message(
-                        &http,
-                        CreateMessage::new().content(format!("{} Processing...", indicator)),
-                    ).await {
+                    if let Ok(new_msg) = channel_id
+                        .send_message(
+                            &http,
+                            CreateMessage::new().content(format!("{} Processing...", indicator)),
+                        )
+                        .await
+                    {
                         current_msg_id = new_msg.id;
                         current_msg_len = 0;
                     }
                 } else {
                     rate_limit_wait(&shared_owned, channel_id).await;
-                    let _ = channel_id.edit_message(
-                        &http,
-                        current_msg_id,
-                        EditMessage::new().content(&display_text),
-                    ).await;
+                    let _ = channel_id
+                        .edit_message(
+                            &http,
+                            current_msg_id,
+                            EditMessage::new().content(&display_text),
+                        )
+                        .await;
                     current_msg_len = display_text.len();
                 }
                 last_edit_text = display_text;
+            }
+        }
+
+        // Resume tmux watcher if it was paused
+        if let Some(offset) = tmux_last_offset {
+            let data = shared_owned.lock().await;
+            if let Some(watcher) = data.tmux_watchers.get(&channel_id) {
+                *watcher.resume_offset.lock().unwrap() = Some(offset);
+                watcher.paused.store(false, Ordering::Relaxed);
             }
         }
 
@@ -1826,11 +2124,6 @@ async fn handle_text_message(
         {
             let mut data = shared_owned.lock().await;
             data.cancel_tokens.remove(&channel_id);
-        }
-
-        // Notify webui: agent is now waiting
-        if let Some(ref sid) = session_id_for_status {
-            crate::services::webui::push_status_by_session(sid, "waiting");
         }
 
         // Remove hourglass reaction
@@ -1841,24 +2134,28 @@ async fn handle_text_message(
             if let Ok(guard) = cancel_token.child_pid.lock() {
                 if let Some(pid) = *guard {
                     #[cfg(unix)]
-                    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                    }
                 }
             }
 
             let stopped_response = if full_response.trim().is_empty() {
                 "[Stopped]".to_string()
             } else {
-                let normalized = normalize_empty_lines(&full_response);
-                format!("{}\n\n[Stopped]", normalized)
+                let formatted = format_for_discord(&full_response);
+                format!("{}\n\n[Stopped]", formatted)
             };
 
             // Send final stopped message
             rate_limit_wait(&shared_owned, channel_id).await;
-            let _ = channel_id.edit_message(
-                &http,
-                current_msg_id,
-                EditMessage::new().content(truncate_str(&stopped_response, DISCORD_MSG_LIMIT)),
-            ).await;
+            let _ = channel_id
+                .edit_message(
+                    &http,
+                    current_msg_id,
+                    EditMessage::new().content(truncate_str(&stopped_response, DISCORD_MSG_LIMIT)),
+                )
+                .await;
 
             // Add stop reaction
             add_reaction_raw(&http, channel_id, user_msg_id, '🛑').await;
@@ -1895,21 +2192,25 @@ async fn handle_text_message(
             full_response = "(No response)".to_string();
         }
 
-        let full_response = normalize_empty_lines(&full_response);
+        let full_response = format_for_discord(&full_response);
 
         // Delete placeholder and send final split messages
         rate_limit_wait(&shared_owned, channel_id).await;
         let _ = channel_id.delete_message(&http, current_msg_id).await;
 
-        if let Err(e) = send_long_message_raw(&http, channel_id, &full_response, &shared_owned).await {
+        if let Err(e) =
+            send_long_message_raw(&http, channel_id, &full_response, &shared_owned).await
+        {
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!("  [{ts}]   ⚠ send_long_message failed: {e}");
             // Fallback: send truncated
             rate_limit_wait(&shared_owned, channel_id).await;
-            let _ = channel_id.send_message(
-                &http,
-                CreateMessage::new().content(truncate_str(&full_response, DISCORD_MSG_LIMIT)),
-            ).await;
+            let _ = channel_id
+                .send_message(
+                    &http,
+                    CreateMessage::new().content(truncate_str(&full_response, DISCORD_MSG_LIMIT)),
+                )
+                .await;
         }
 
         // Add checkmark reaction
@@ -1957,12 +2258,16 @@ async fn handle_file_upload(
 
     let current_path = {
         let data = shared.lock().await;
-        data.sessions.get(&channel_id).and_then(|s| s.current_path.clone())
+        data.sessions
+            .get(&channel_id)
+            .and_then(|s| s.current_path.clone())
     };
 
     let Some(save_dir) = current_path else {
         rate_limit_wait(shared, channel_id).await;
-        let _ = channel_id.say(&ctx.http, "No active session. Use `/start <path>` first.").await;
+        let _ = channel_id
+            .say(&ctx.http, "No active session. Use `/start <path>` first.")
+            .await;
         return Ok(());
     };
 
@@ -1975,13 +2280,17 @@ async fn handle_file_upload(
                 Ok(bytes) => bytes,
                 Err(e) => {
                     rate_limit_wait(shared, channel_id).await;
-                    let _ = channel_id.say(&ctx.http, format!("Download failed: {}", e)).await;
+                    let _ = channel_id
+                        .say(&ctx.http, format!("Download failed: {}", e))
+                        .await;
                     continue;
                 }
             },
             Err(e) => {
                 rate_limit_wait(shared, channel_id).await;
-                let _ = channel_id.say(&ctx.http, format!("Download failed: {}", e)).await;
+                let _ = channel_id
+                    .say(&ctx.http, format!("Download failed: {}", e))
+                    .await;
                 continue;
             }
         };
@@ -2001,7 +2310,9 @@ async fn handle_file_upload(
             }
             Err(e) => {
                 rate_limit_wait(shared, channel_id).await;
-                let _ = channel_id.say(&ctx.http, format!("Failed to save file: {}", e)).await;
+                let _ = channel_id
+                    .say(&ctx.http, format!("Failed to save file: {}", e))
+                    .await;
                 continue;
             }
         }
@@ -2009,7 +2320,9 @@ async fn handle_file_upload(
         // Record upload in session
         let upload_record = format!(
             "[File uploaded] {} → {} ({} bytes)",
-            file_name, dest.display(), file_size
+            file_name,
+            dest.display(),
+            file_size
         );
         {
             let mut data = shared.lock().await;
@@ -2039,13 +2352,16 @@ async fn handle_shell_command_raw(
     let cmd_str = text.strip_prefix('!').unwrap_or("").trim();
     if cmd_str.is_empty() {
         rate_limit_wait(shared, channel_id).await;
-        let _ = channel_id.say(&ctx.http, "Usage: `!<command>`\nExample: `!ls -la`").await;
+        let _ = channel_id
+            .say(&ctx.http, "Usage: `!<command>`\nExample: `!ls -la`")
+            .await;
         return Ok(());
     }
 
     let working_dir = {
         let data = shared.lock().await;
-        data.sessions.get(&channel_id)
+        data.sessions
+            .get(&channel_id)
             .and_then(|s| s.current_path.clone())
             .unwrap_or_else(|| {
                 dirs::home_dir()
@@ -2069,7 +2385,8 @@ async fn handle_shell_command_raw(
             Ok(child) => child.wait_with_output(),
             Err(e) => Err(e),
         }
-    }).await;
+    })
+    .await;
 
     let response = match result {
         Ok(Ok(output)) => {
@@ -2116,12 +2433,17 @@ pub async fn send_file_to_channel(
     let channel = ChannelId::new(channel_id);
     let attachment = CreateAttachment::path(path).await?;
 
-    channel.send_message(
-        &http,
-        CreateMessage::new()
-            .content(format!("📎 {}", path.file_name().unwrap_or_default().to_string_lossy()))
-            .add_file(attachment),
-    ).await?;
+    channel
+        .send_message(
+            &http,
+            CreateMessage::new()
+                .content(format!(
+                    "📎 {}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ))
+                .add_file(attachment),
+        )
+        .await?;
 
     Ok(())
 }
@@ -2151,18 +2473,23 @@ async fn auto_restore_session(
 
     let channel_key = channel_id.get().to_string();
     if let Some(last_path) = data.settings.last_sessions.get(&channel_key).cloned() {
-        if Path::new(&last_path).is_dir() {
+        let is_remote = data.settings.last_remotes.contains_key(&channel_key);
+        if is_remote || Path::new(&last_path).is_dir() {
             let existing = load_existing_session(&last_path);
-            let session = data.sessions.entry(channel_id).or_insert_with(|| DiscordSession {
-                session_id: None,
-                current_path: None,
-                history: Vec::new(),
-                pending_uploads: Vec::new(),
-                cleared: false,
-                channel_name: ch_name,
-                category_name: cat_name,
-                remote_profile_name: None,
-            });
+            let saved_remote = data.settings.last_remotes.get(&channel_key).cloned();
+            let session = data
+                .sessions
+                .entry(channel_id)
+                .or_insert_with(|| DiscordSession {
+                    session_id: None,
+                    current_path: None,
+                    history: Vec::new(),
+                    pending_uploads: Vec::new(),
+                    cleared: false,
+                    channel_name: ch_name,
+                    category_name: cat_name,
+                    remote_profile_name: saved_remote.clone(),
+                });
             session.current_path = Some(last_path.clone());
             if let Some((session_data, _)) = existing {
                 session.session_id = Some(session_data.session_id.clone());
@@ -2171,7 +2498,11 @@ async fn auto_restore_session(
             // Rescan skills with project path
             data.skills_cache = scan_skills(Some(&last_path));
             let ts = chrono::Local::now().format("%H:%M:%S");
-            println!("  [{ts}] ↻ Auto-restored session: {last_path}");
+            let remote_info = saved_remote
+                .as_ref()
+                .map(|n| format!(" (remote: {})", n))
+                .unwrap_or_default();
+            println!("  [{ts}] ↻ Auto-restored session: {last_path}{remote_info}");
         }
     }
 }
@@ -2232,13 +2563,19 @@ async fn resolve_channel_category(
                 serenity::model::channel::Channel::Guild(cat) => Some(cat.name.clone()),
                 _ => {
                     let ts = chrono::Local::now().format("%H:%M:%S");
-                    println!("  [{ts}] ⚠ Category channel {parent_id} is not a Guild channel for #{}", gc.name);
+                    println!(
+                        "  [{ts}] ⚠ Category channel {parent_id} is not a Guild channel for #{}",
+                        gc.name
+                    );
                     None
                 }
             }
         } else {
             let ts = chrono::Local::now().format("%H:%M:%S");
-            println!("  [{ts}] ⚠ Failed to resolve category {parent_id} for #{}", gc.name);
+            println!(
+                "  [{ts}] ⚠ Failed to resolve category {parent_id} for #{}",
+                gc.name
+            );
             None
         }
     } else {
@@ -2262,14 +2599,18 @@ async fn migrate_session_categories(
     // Collect channel IDs from bot_settings.last_sessions
     let channel_keys: Vec<(String, String)> = {
         let data = shared.lock().await;
-        data.settings.last_sessions.iter()
+        data.settings
+            .last_sessions
+            .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
     };
 
     let mut updated = 0usize;
     for (channel_key, session_path) in &channel_keys {
-        let Ok(cid) = channel_key.parse::<u64>() else { continue };
+        let Ok(cid) = channel_key.parse::<u64>() else {
+            continue;
+        };
         let channel_id = serenity::model::id::ChannelId::new(cid);
         let (ch_name, cat_name) = resolve_channel_category(ctx, channel_id).await;
         if ch_name.is_none() && cat_name.is_none() {
@@ -2286,12 +2627,16 @@ async fn migrate_session_categories(
                     if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&content) {
                         if let Some(obj) = val.as_object_mut() {
                             if let Some(ref name) = ch_name {
-                                obj.insert("discord_channel_name".to_string(),
-                                    serde_json::Value::String(name.clone()));
+                                obj.insert(
+                                    "discord_channel_name".to_string(),
+                                    serde_json::Value::String(name.clone()),
+                                );
                             }
                             if let Some(ref cat) = cat_name {
-                                obj.insert("discord_category_name".to_string(),
-                                    serde_json::Value::String(cat.clone()));
+                                obj.insert(
+                                    "discord_category_name".to_string(),
+                                    serde_json::Value::String(cat.clone()),
+                                );
                             }
                             if let Ok(json) = serde_json::to_string_pretty(&val) {
                                 let _ = fs::write(&file_path, json);
@@ -2328,7 +2673,9 @@ fn save_session_to_file(session: &DiscordSession, current_path: &str) {
         return;
     }
 
-    let saveable_history: Vec<HistoryItem> = session.history.iter()
+    let saveable_history: Vec<HistoryItem> = session
+        .history
+        .iter()
         .filter(|item| !matches!(item.item_type, HistoryType::System))
         .cloned()
         .collect();
@@ -2346,22 +2693,29 @@ fn save_session_to_file(session: &DiscordSession, current_path: &str) {
     }
 
     // Preserve existing category/channel names from the file when in-memory values are None
-    let (effective_channel_name, effective_category_name) = if session.channel_name.is_none() || session.category_name.is_none() {
-        if let Ok(content) = fs::read_to_string(&file_path) {
-            if let Ok(existing) = serde_json::from_str::<SessionData>(&content) {
-                (
-                    session.channel_name.clone().or(existing.discord_channel_name),
-                    session.category_name.clone().or(existing.discord_category_name),
-                )
+    let (effective_channel_name, effective_category_name) =
+        if session.channel_name.is_none() || session.category_name.is_none() {
+            if let Ok(content) = fs::read_to_string(&file_path) {
+                if let Ok(existing) = serde_json::from_str::<SessionData>(&content) {
+                    (
+                        session
+                            .channel_name
+                            .clone()
+                            .or(existing.discord_channel_name),
+                        session
+                            .category_name
+                            .clone()
+                            .or(existing.discord_category_name),
+                    )
+                } else {
+                    (session.channel_name.clone(), session.category_name.clone())
+                }
             } else {
                 (session.channel_name.clone(), session.category_name.clone())
             }
         } else {
             (session.channel_name.clone(), session.category_name.clone())
-        }
-    } else {
-        (session.channel_name.clone(), session.category_name.clone())
-    };
+        };
 
     // Clean up old session files for the same channel (different session_id)
     if let Some(ref ch_name) = effective_channel_name {
@@ -2370,7 +2724,9 @@ fn save_session_to_file(session: &DiscordSession, current_path: &str) {
                 let path = entry.path();
                 if path.extension().map(|e| e == "json").unwrap_or(false) {
                     let fname = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                    if fname == session_id { continue; } // keep current
+                    if fname == session_id {
+                        continue;
+                    } // keep current
                     if let Ok(content) = fs::read_to_string(&path) {
                         if let Ok(old) = serde_json::from_str::<SessionData>(&content) {
                             if old.discord_channel_name.as_deref() == Some(ch_name) {
@@ -2452,6 +2808,270 @@ fn normalize_empty_lines(s: &str) -> String {
     result
 }
 
+/// Format tool input JSON into a human-readable summary
+fn format_tool_input(name: &str, input: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(input) else {
+        return format!("{} {}", name, truncate_str(input, 200));
+    };
+
+    match name {
+        "Bash" => {
+            let desc = v.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            let cmd = v.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            if !desc.is_empty() {
+                format!("{}: `{}`", desc, truncate_str(cmd, 150))
+            } else {
+                format!("`{}`", truncate_str(cmd, 200))
+            }
+        }
+        "Read" => {
+            let fp = v.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+            format!("Read {}", fp)
+        }
+        "Write" => {
+            let fp = v.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+            let content = v.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let lines = content.lines().count();
+            if lines > 0 {
+                format!("Write {} ({} lines)", fp, lines)
+            } else {
+                format!("Write {}", fp)
+            }
+        }
+        "Edit" => {
+            let fp = v.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+            let replace_all = v
+                .get("replace_all")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if replace_all {
+                format!("Edit {} (replace all)", fp)
+            } else {
+                format!("Edit {}", fp)
+            }
+        }
+        "Glob" => {
+            let pattern = v.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            let path = v.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            if !path.is_empty() {
+                format!("Glob {} in {}", pattern, path)
+            } else {
+                format!("Glob {}", pattern)
+            }
+        }
+        "Grep" => {
+            let pattern = v.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            let path = v.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let output_mode = v.get("output_mode").and_then(|v| v.as_str()).unwrap_or("");
+            if !path.is_empty() {
+                if !output_mode.is_empty() {
+                    format!("Grep \"{}\" in {} ({})", pattern, path, output_mode)
+                } else {
+                    format!("Grep \"{}\" in {}", pattern, path)
+                }
+            } else {
+                format!("Grep \"{}\"", pattern)
+            }
+        }
+        "NotebookEdit" => {
+            let nb_path = v
+                .get("notebook_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let cell_id = v.get("cell_id").and_then(|v| v.as_str()).unwrap_or("");
+            if !cell_id.is_empty() {
+                format!("Notebook {} ({})", nb_path, cell_id)
+            } else {
+                format!("Notebook {}", nb_path)
+            }
+        }
+        "WebSearch" => {
+            let query = v.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            format!("Search: {}", query)
+        }
+        "WebFetch" => {
+            let url = v.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            format!("Fetch {}", url)
+        }
+        "Task" => {
+            let desc = v.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            let subagent_type = v
+                .get("subagent_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !subagent_type.is_empty() {
+                format!("Task [{}]: {}", subagent_type, desc)
+            } else {
+                format!("Task: {}", desc)
+            }
+        }
+        "TaskOutput" => {
+            let task_id = v.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+            format!("Get task output: {}", task_id)
+        }
+        "TaskStop" => {
+            let task_id = v.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+            format!("Stop task: {}", task_id)
+        }
+        "TodoWrite" => {
+            if let Some(todos) = v.get("todos").and_then(|v| v.as_array()) {
+                let pending = todos
+                    .iter()
+                    .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("pending"))
+                    .count();
+                let in_progress = todos
+                    .iter()
+                    .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("in_progress"))
+                    .count();
+                let completed = todos
+                    .iter()
+                    .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("completed"))
+                    .count();
+                format!(
+                    "Todo: {} pending, {} in progress, {} completed",
+                    pending, in_progress, completed
+                )
+            } else {
+                "Update todos".to_string()
+            }
+        }
+        "Skill" => {
+            let skill = v.get("skill").and_then(|v| v.as_str()).unwrap_or("");
+            format!("Skill: {}", skill)
+        }
+        "AskUserQuestion" => {
+            if let Some(questions) = v.get("questions").and_then(|v| v.as_array()) {
+                if let Some(q) = questions.first() {
+                    let question = q.get("question").and_then(|v| v.as_str()).unwrap_or("");
+                    truncate_str(question, 200)
+                } else {
+                    "Ask user question".to_string()
+                }
+            } else {
+                "Ask user question".to_string()
+            }
+        }
+        "ExitPlanMode" => "Exit plan mode".to_string(),
+        "EnterPlanMode" => "Enter plan mode".to_string(),
+        "TaskCreate" => {
+            let subject = v.get("subject").and_then(|v| v.as_str()).unwrap_or("");
+            format!("Create task: {}", subject)
+        }
+        "TaskUpdate" => {
+            let task_id = v.get("taskId").and_then(|v| v.as_str()).unwrap_or("");
+            let status = v.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            if !status.is_empty() {
+                format!("Update task {}: {}", task_id, status)
+            } else {
+                format!("Update task {}", task_id)
+            }
+        }
+        "TaskGet" => {
+            let task_id = v.get("taskId").and_then(|v| v.as_str()).unwrap_or("");
+            format!("Get task: {}", task_id)
+        }
+        "TaskList" => "List tasks".to_string(),
+        _ => format!("{} {}", name, truncate_str(input, 200)),
+    }
+}
+
+/// Mechanical formatting for Discord readability.
+/// Converts markdown headers to bold, ensures spacing around lists, etc.
+fn format_for_discord(s: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut in_code_block = false;
+
+    for line in s.lines() {
+        // Don't touch anything inside code blocks
+        if line.trim_start().starts_with("```") {
+            in_code_block = !in_code_block;
+            lines.push(line.to_string());
+            continue;
+        }
+        if in_code_block {
+            lines.push(line.to_string());
+            continue;
+        }
+
+        let trimmed = line.trim_start();
+
+        // Convert # headers to **bold** (Discord doesn't render headers in bot messages)
+        if let Some(rest) = trimmed.strip_prefix("### ") {
+            // Ensure blank line before header
+            if let Some(prev) = lines.last() {
+                if !prev.trim().is_empty() {
+                    lines.push(String::new());
+                }
+            }
+            lines.push(format!("**{}**", rest));
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("## ") {
+            if let Some(prev) = lines.last() {
+                if !prev.trim().is_empty() {
+                    lines.push(String::new());
+                }
+            }
+            lines.push(format!("**{}**", rest));
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("# ") {
+            if let Some(prev) = lines.last() {
+                if !prev.trim().is_empty() {
+                    lines.push(String::new());
+                }
+            }
+            lines.push(format!("**{}**", rest));
+            continue;
+        }
+
+        // Ensure blank line before the first item of a list block
+        let is_list_item = trimmed.starts_with("- ")
+            || trimmed.starts_with("* ")
+            || (trimmed.len() > 2
+                && trimmed.as_bytes()[0].is_ascii_digit()
+                && trimmed.contains(". "));
+
+        if is_list_item {
+            if let Some(prev) = lines.last() {
+                let prev_trimmed = prev.trim();
+                // Add blank line only if previous line is non-empty and not itself a list item
+                let prev_is_list = prev_trimmed.starts_with("- ")
+                    || prev_trimmed.starts_with("* ")
+                    || (prev_trimmed.len() > 2
+                        && prev_trimmed.as_bytes()[0].is_ascii_digit()
+                        && prev_trimmed.contains(". "));
+                if !prev_trimmed.is_empty() && !prev_is_list {
+                    lines.push(String::new());
+                }
+            }
+        }
+
+        lines.push(line.to_string());
+    }
+
+    // Collapse consecutive blank lines (max 1)
+    let mut result = String::with_capacity(s.len());
+    let mut prev_was_empty = false;
+    for line in &lines {
+        let is_empty = line.trim().is_empty();
+        if is_empty {
+            if !prev_was_empty && !result.is_empty() {
+                result.push('\n');
+            }
+            prev_was_empty = true;
+        } else {
+            if !result.is_empty() {
+                result.push('\n');
+            }
+            result.push_str(line);
+            prev_was_empty = false;
+        }
+    }
+
+    result
+}
+
 /// Send a message using poise Context, splitting if necessary
 async fn send_long_message_ctx(ctx: Context<'_>, text: &str) -> Result<(), Error> {
     if text.len() <= DISCORD_MSG_LIMIT {
@@ -2481,14 +3101,18 @@ async fn send_long_message_raw(
 ) -> Result<(), Error> {
     if text.len() <= DISCORD_MSG_LIMIT {
         rate_limit_wait(shared, channel_id).await;
-        channel_id.send_message(http, CreateMessage::new().content(text)).await?;
+        channel_id
+            .send_message(http, CreateMessage::new().content(text))
+            .await?;
         return Ok(());
     }
 
     let chunks = split_message(text);
     for chunk in &chunks {
         rate_limit_wait(shared, channel_id).await;
-        channel_id.send_message(http, CreateMessage::new().content(chunk)).await?;
+        channel_id
+            .send_message(http, CreateMessage::new().content(chunk))
+            .await?;
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     }
 
@@ -2511,7 +3135,9 @@ fn split_message(text: &str) -> Vec<String> {
         } else {
             0
         };
-        let effective_limit = DISCORD_MSG_LIMIT.saturating_sub(tag_overhead).saturating_sub(10);
+        let effective_limit = DISCORD_MSG_LIMIT
+            .saturating_sub(tag_overhead)
+            .saturating_sub(10);
 
         if remaining.len() <= effective_limit {
             let mut chunk = String::new();
@@ -2527,9 +3153,7 @@ fn split_message(text: &str) -> Vec<String> {
 
         // Find a safe split point
         let safe_end = floor_char_boundary(remaining, effective_limit);
-        let split_at = remaining[..safe_end]
-            .rfind('\n')
-            .unwrap_or(safe_end);
+        let split_at = remaining[..safe_end].rfind('\n').unwrap_or(safe_end);
 
         let (raw_chunk, rest) = remaining.split_at(split_at);
 
@@ -2586,5 +3210,348 @@ async fn remove_reaction_raw(
     emoji: char,
 ) {
     let reaction = serenity::ReactionType::Unicode(emoji.to_string());
-    let _ = channel_id.delete_reaction(http, message_id, None, reaction).await;
+    let _ = channel_id
+        .delete_reaction(http, message_id, None, reaction)
+        .await;
+}
+
+/// Background watcher that continuously tails a tmux output file.
+/// When Claude produces output from terminal input (not Discord), relay it to Discord.
+async fn tmux_output_watcher(
+    channel_id: ChannelId,
+    http: Arc<serenity::Http>,
+    shared: Arc<Mutex<SharedData>>,
+    output_path: String,
+    tmux_session_name: String,
+    initial_offset: u64,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    paused: Arc<std::sync::atomic::AtomicBool>,
+    resume_offset: Arc<std::sync::Mutex<Option<u64>>>,
+) {
+    use claude::StreamLineState;
+    use std::io::{Read, Seek, SeekFrom};
+
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    println!("  [{ts}] 👁 tmux watcher started for #{tmux_session_name} at offset {initial_offset}");
+
+    let mut current_offset = initial_offset;
+
+    loop {
+        // Check cancel
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // If paused (Discord handler is processing its own turn), wait
+        if paused.load(Ordering::Relaxed) {
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+            // Check if resumed with a new offset
+            if let Some(new_offset) = resume_offset.lock().unwrap().take() {
+                current_offset = new_offset;
+            }
+            continue;
+        }
+
+        // Check if tmux session is still alive
+        let alive = tokio::task::spawn_blocking({
+            let name = tmux_session_name.clone();
+            move || {
+                std::process::Command::new("tmux")
+                    .args(["has-session", "-t", &name])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        if !alive {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!("  [{ts}] 👁 tmux session {tmux_session_name} ended, watcher stopping");
+            break;
+        }
+
+        // Try to read new data from output file
+        let read_result = tokio::task::spawn_blocking({
+            let path = output_path.clone();
+            let offset = current_offset;
+            move || -> Result<(Vec<u8>, u64), String> {
+                let mut file = std::fs::File::open(&path).map_err(|e| format!("open: {}", e))?;
+                file.seek(SeekFrom::Start(offset))
+                    .map_err(|e| format!("seek: {}", e))?;
+                let mut buf = vec![0u8; 16384];
+                let n = file.read(&mut buf).map_err(|e| format!("read: {}", e))?;
+                buf.truncate(n);
+                Ok((buf, offset + n as u64))
+            }
+        })
+        .await;
+
+        let (data, new_offset) = match read_result {
+            Ok(Ok((data, off))) => (data, off),
+            _ => {
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                continue;
+            }
+        };
+
+        if data.is_empty() {
+            // No new data, sleep and retry
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            continue;
+        }
+
+        // We got new data while not paused — this means terminal input triggered a response
+        current_offset = new_offset;
+
+        // Collect the full turn: keep reading until we see a "result" event
+        let mut all_data = String::from_utf8_lossy(&data).to_string();
+        let mut state = StreamLineState::new();
+        let mut full_response = String::new();
+
+        // Process any complete lines we already have
+        let mut found_result = process_watcher_lines(&mut all_data, &mut state, &mut full_response);
+
+        // Keep reading until result or timeout
+        if !found_result {
+            let turn_start = tokio::time::Instant::now();
+            let turn_timeout = tokio::time::Duration::from_secs(600); // 10 min max
+
+            while !found_result && turn_start.elapsed() < turn_timeout {
+                if cancel.load(Ordering::Relaxed) || paused.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let read_more = tokio::task::spawn_blocking({
+                    let path = output_path.clone();
+                    let offset = current_offset;
+                    move || -> Result<(Vec<u8>, u64), String> {
+                        let mut file =
+                            std::fs::File::open(&path).map_err(|e| format!("open: {}", e))?;
+                        file.seek(SeekFrom::Start(offset))
+                            .map_err(|e| format!("seek: {}", e))?;
+                        let mut buf = vec![0u8; 16384];
+                        let n = file.read(&mut buf).map_err(|e| format!("read: {}", e))?;
+                        buf.truncate(n);
+                        Ok((buf, offset + n as u64))
+                    }
+                })
+                .await;
+
+                match read_more {
+                    Ok(Ok((chunk, off))) if !chunk.is_empty() => {
+                        current_offset = off;
+                        all_data.push_str(&String::from_utf8_lossy(&chunk));
+                        found_result =
+                            process_watcher_lines(&mut all_data, &mut state, &mut full_response);
+                    }
+                    _ => {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                    }
+                }
+            }
+        }
+
+        // If paused was set while we were reading, discard — Discord handler will handle it
+        if paused.load(Ordering::Relaxed) {
+            continue;
+        }
+
+        // Send the terminal response to Discord
+        if !full_response.trim().is_empty() {
+            let formatted = format_for_discord(&full_response);
+            let prefixed = format!("🖥 **[Terminal]**\n{}", formatted);
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] 👁 Relaying terminal response to Discord ({} chars)",
+                prefixed.len()
+            );
+            if let Err(e) = send_long_message_raw(&http, channel_id, &prefixed, &shared).await {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!("  [{ts}] 👁 Failed to relay: {e}");
+            }
+        }
+    }
+
+    // Cleanup
+    {
+        let mut data = shared.lock().await;
+        data.tmux_watchers.remove(&channel_id);
+    }
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    println!("  [{ts}] 👁 tmux watcher stopped for #{tmux_session_name}");
+}
+
+/// Process buffered lines for the tmux watcher.
+/// Extracts text content and detects result events.
+/// Returns true if a "result" event was found.
+fn process_watcher_lines(
+    buffer: &mut String,
+    state: &mut claude::StreamLineState,
+    full_response: &mut String,
+) -> bool {
+    let mut found_result = false;
+
+    while let Some(pos) = buffer.find('\n') {
+        let line: String = buffer.drain(..=pos).collect();
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Parse the JSON line
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            let event_type = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            match event_type {
+                "assistant" => {
+                    // Text content from assistant message
+                    if let Some(message) = val.get("message") {
+                        if let Some(content) = message.get("content") {
+                            if let Some(arr) = content.as_array() {
+                                for block in arr {
+                                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                        if let Some(text) =
+                                            block.get("text").and_then(|t| t.as_str())
+                                        {
+                                            full_response.push_str(text);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                "content_block_delta" => {
+                    if let Some(delta) = val.get("delta") {
+                        if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
+                            full_response.push_str(text);
+                        }
+                    }
+                }
+                "result" => {
+                    // Extract text from result if full_response is still empty
+                    if full_response.is_empty() {
+                        if let Some(result_str) = val.get("result").and_then(|r| r.as_str()) {
+                            full_response.push_str(result_str);
+                        }
+                    }
+                    state.final_result = Some(String::new());
+                    found_result = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    found_result
+}
+
+/// On startup, scan for surviving tmux sessions (remoteCC-*) and restore watchers.
+/// This handles the case where RemoteCC was restarted but tmux sessions are still alive.
+async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &Arc<Mutex<SharedData>>) {
+    // List tmux sessions matching our naming convention
+    let output = match tokio::task::spawn_blocking(|| {
+        std::process::Command::new("tmux")
+            .args(["list-sessions", "-F", "#{session_name}"])
+            .output()
+    })
+    .await
+    {
+        Ok(Ok(o)) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return, // No tmux or no sessions
+    };
+
+    // Collect sessions to restore (under lock), then spawn watchers outside lock
+    struct PendingWatcher {
+        channel_id: ChannelId,
+        output_path: String,
+        session_name: String,
+        initial_offset: u64,
+    }
+
+    let pending: Vec<PendingWatcher> = {
+        let data = shared.lock().await;
+        let mut result = Vec::new();
+
+        for session_name in output.lines() {
+            let session_name = session_name.trim();
+            if !session_name.starts_with("remoteCC-") {
+                continue;
+            }
+
+            // Find the channel that maps to this tmux session name
+            let mut found_channel: Option<ChannelId> = None;
+            for (&ch_id, session) in &data.sessions {
+                if let Some(ref ch_name) = session.channel_name {
+                    if claude::sanitize_tmux_session_name(ch_name) == session_name {
+                        found_channel = Some(ch_id);
+                        break;
+                    }
+                }
+            }
+
+            let Some(channel_id) = found_channel else {
+                continue;
+            };
+            if data.tmux_watchers.contains_key(&channel_id) {
+                continue;
+            }
+
+            let output_path = format!("/tmp/remotecc-{}.jsonl", session_name);
+            if std::fs::metadata(&output_path).is_err() {
+                continue;
+            }
+
+            let initial_offset = std::fs::metadata(&output_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+
+            result.push(PendingWatcher {
+                channel_id,
+                output_path,
+                session_name: session_name.to_string(),
+                initial_offset,
+            });
+        }
+
+        result
+    }; // lock dropped here
+
+    // Now spawn watchers outside the lock
+    for pw in pending {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        println!(
+            "  [{ts}] ↻ Restoring tmux watcher for {} (offset {})",
+            pw.session_name, pw.initial_offset
+        );
+
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let resume_offset = Arc::new(std::sync::Mutex::new(None::<u64>));
+
+        {
+            let mut data = shared.lock().await;
+            data.tmux_watchers.insert(
+                pw.channel_id,
+                TmuxWatcherHandle {
+                    cancel: cancel.clone(),
+                    paused: paused.clone(),
+                    resume_offset: resume_offset.clone(),
+                },
+            );
+        }
+
+        tokio::spawn(tmux_output_watcher(
+            pw.channel_id,
+            http.clone(),
+            shared.clone(),
+            pw.output_path,
+            pw.session_name,
+            pw.initial_offset,
+            cancel,
+            paused,
+            resume_offset,
+        ));
+    }
 }

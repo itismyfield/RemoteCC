@@ -1,10 +1,10 @@
-use std::process::{Command, Stdio};
-use std::io::{BufRead, BufReader, Write};
-use std::sync::mpsc::Sender;
-use std::sync::OnceLock;
-use std::fs::OpenOptions;
 use regex::Regex;
 use serde_json::Value;
+use std::fs::OpenOptions;
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Command, Stdio};
+use std::sync::mpsc::Sender;
+use std::sync::OnceLock;
 
 use crate::services::remote::RemoteProfile;
 
@@ -27,10 +27,7 @@ fn resolve_claude_path() -> Option<String> {
     }
 
     // Fallback: use login shell to resolve PATH
-    if let Ok(output) = Command::new("bash")
-        .args(["-lc", "which claude"])
-        .output()
-    {
+    if let Ok(output) = Command::new("bash").args(["-lc", "which claude"]).output() {
         if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !path.is_empty() {
@@ -51,18 +48,18 @@ fn get_claude_path() -> Option<&'static str> {
 fn debug_log(msg: &str) {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     let enabled = ENABLED.get_or_init(|| {
-        std::env::var("COKACDIR_DEBUG").map(|v| v == "1").unwrap_or(false)
+        std::env::var("COKACDIR_DEBUG")
+            .map(|v| v == "1")
+            .unwrap_or(false)
     });
-    if !*enabled { return; }
+    if !*enabled {
+        return;
+    }
     if let Some(home) = dirs::home_dir() {
-        let debug_dir = home.join(".cokacdir").join("debug");
+        let debug_dir = home.join(".remotecc").join("debug");
         let _ = std::fs::create_dir_all(&debug_dir);
         let log_path = debug_dir.join("claude.log");
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)
-        {
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
             let timestamp = chrono::Local::now().format("%H:%M:%S%.3f");
             let _ = writeln!(file, "[{}] {}", timestamp, msg);
         }
@@ -89,11 +86,23 @@ pub enum StreamMessage {
     /// Tool execution result
     ToolResult { content: String, is_error: bool },
     /// Background task notification
-    TaskNotification { task_id: String, status: String, summary: String },
+    TaskNotification {
+        task_id: String,
+        status: String,
+        summary: String,
+    },
     /// Completion
-    Done { result: String, session_id: Option<String> },
+    Done {
+        result: String,
+        session_id: Option<String>,
+    },
     /// Error
-    Error { message: String, stdout: String, stderr: String, exit_code: Option<i32> },
+    Error {
+        message: String,
+        stdout: String,
+        stderr: String,
+        exit_code: Option<i32>,
+    },
     /// Statusline info extracted from result/assistant events
     StatusUpdate {
         model: Option<String>,
@@ -104,6 +113,13 @@ pub enum StreamMessage {
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
     },
+    /// tmux session is ready for background monitoring (first turn completed)
+    TmuxReady {
+        output_path: String,
+        input_fifo_path: String,
+        tmux_session_name: String,
+        last_offset: u64,
+    },
 }
 
 /// Token for cooperative cancellation of streaming requests.
@@ -113,6 +129,8 @@ pub struct CancelToken {
     pub child_pid: std::sync::Mutex<Option<u32>>,
     /// SSH cancel flag — set to true to signal remote execution to close the channel
     pub ssh_cancel: std::sync::Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
+    /// tmux session name for cleanup on cancel
+    pub tmux_session: std::sync::Mutex<Option<String>>,
 }
 
 impl CancelToken {
@@ -121,6 +139,18 @@ impl CancelToken {
             cancelled: std::sync::atomic::AtomicBool::new(false),
             child_pid: std::sync::Mutex::new(None),
             ssh_cancel: std::sync::Mutex::new(None),
+            tmux_session: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Cancel and clean up any associated tmux session
+    pub fn cancel_with_tmux_cleanup(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(name) = self.tmux_session.lock().unwrap().take() {
+            let _ = Command::new("tmux")
+                .args(["kill-session", "-t", &name])
+                .output();
         }
     }
 }
@@ -139,9 +169,23 @@ fn is_valid_session_id(session_id: &str) -> bool {
 
 /// Default allowed tools for Claude CLI
 pub const DEFAULT_ALLOWED_TOOLS: &[&str] = &[
-    "Bash", "Read", "Edit", "Write", "Glob", "Grep", "Task", "TaskOutput",
-    "TaskStop", "WebFetch", "WebSearch", "NotebookEdit", "Skill",
-    "TaskCreate", "TaskGet", "TaskUpdate", "TaskList",
+    "Bash",
+    "Read",
+    "Edit",
+    "Write",
+    "Glob",
+    "Grep",
+    "Task",
+    "TaskOutput",
+    "TaskStop",
+    "WebFetch",
+    "WebSearch",
+    "NotebookEdit",
+    "Skill",
+    "TaskCreate",
+    "TaskGet",
+    "TaskUpdate",
+    "TaskList",
 ];
 
 /// Execute a command using Claude CLI
@@ -222,9 +266,9 @@ IMPORTANT: Format your responses using Markdown for better readability:
         .args(&args)
         .current_dir(working_dir)
         .env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "64000")
-        .env("BASH_DEFAULT_TIMEOUT_MS", "86400000")  // 24 hours (no practical timeout)
-        .env("BASH_MAX_TIMEOUT_MS", "86400000")      // 24 hours (no practical timeout)
-        .env_remove("CLAUDECODE")  // Allow running from within Claude Code sessions
+        .env("BASH_DEFAULT_TIMEOUT_MS", "86400000") // 24 hours (no practical timeout)
+        .env("BASH_MAX_TIMEOUT_MS", "86400000") // 24 hours (no practical timeout)
+        .env_remove("CLAUDECODE") // Allow running from within Claude Code sessions
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -236,7 +280,10 @@ IMPORTANT: Format your responses using Markdown for better readability:
                 success: false,
                 response: None,
                 session_id: None,
-                error: Some(format!("Failed to start Claude: {}. Is Claude CLI installed?", e)),
+                error: Some(format!(
+                    "Failed to start Claude: {}. Is Claude CLI installed?",
+                    e
+                )),
             };
         }
     };
@@ -344,6 +391,7 @@ pub fn execute_command_streaming(
     allowed_tools: Option<&[String]>,
     cancel_token: Option<std::sync::Arc<CancelToken>>,
     remote_profile: Option<&RemoteProfile>,
+    tmux_session_name: Option<&str>,
 ) -> Result<(), String> {
     debug_log("========================================");
     debug_log("=== execute_command_streaming START ===");
@@ -418,31 +466,60 @@ IMPORTANT: Format your responses using Markdown for better readability:
         args.push(sid.to_string());
     }
 
+    // tmux execution path: wrap Claude in a tmux session for terminal attach
+    if let Some(tmux_name) = tmux_session_name {
+        if is_tmux_available() {
+            debug_log(&format!("tmux session requested: {}", tmux_name));
+            // Add stream-json input format for bidirectional communication
+            args.push("--input-format".to_string());
+            args.push("stream-json".to_string());
+            if let Some(profile) = remote_profile {
+                return execute_streaming_remote_tmux(
+                    profile,
+                    &args,
+                    prompt,
+                    working_dir,
+                    sender,
+                    cancel_token,
+                    tmux_name,
+                );
+            } else {
+                return execute_streaming_local_tmux(
+                    &args,
+                    prompt,
+                    working_dir,
+                    sender,
+                    cancel_token,
+                    tmux_name,
+                );
+            }
+        } else {
+            debug_log("tmux requested but not available, falling back to direct execution");
+        }
+    }
+
     // Remote execution path: SSH to remote host
     if let Some(profile) = remote_profile {
         debug_log("Remote profile detected — delegating to execute_streaming_remote()");
-        return execute_streaming_remote(
-            profile,
-            &args,
-            prompt,
-            working_dir,
-            sender,
-            cancel_token,
-        );
+        return execute_streaming_remote(profile, &args, prompt, working_dir, sender, cancel_token);
     }
 
-    let claude_bin = get_claude_path()
-        .ok_or_else(|| {
-            debug_log("ERROR: Claude CLI not found");
-            "Claude CLI not found. Is Claude CLI installed?".to_string()
-        })?;
+    let claude_bin = get_claude_path().ok_or_else(|| {
+        debug_log("ERROR: Claude CLI not found");
+        "Claude CLI not found. Is Claude CLI installed?".to_string()
+    })?;
 
     debug_log("--- Spawning claude process ---");
     debug_log(&format!("Command: {}", claude_bin));
     debug_log(&format!("Args count: {}", args.len()));
     for (i, arg) in args.iter().enumerate() {
         if arg.len() > 100 {
-            debug_log(&format!("  arg[{}]: {}... (truncated, {} chars total)", i, &arg[..100], arg.len()));
+            debug_log(&format!(
+                "  arg[{}]: {}... (truncated, {} chars total)",
+                i,
+                &arg[..100],
+                arg.len()
+            ));
         } else {
             debug_log(&format!("  arg[{}]: {}", i, arg));
         }
@@ -456,18 +533,26 @@ IMPORTANT: Format your responses using Markdown for better readability:
         .args(&args)
         .current_dir(working_dir)
         .env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "64000")
-        .env("BASH_DEFAULT_TIMEOUT_MS", "86400000")  // 24 hours (no practical timeout)
-        .env("BASH_MAX_TIMEOUT_MS", "86400000")      // 24 hours (no practical timeout)
-        .env_remove("CLAUDECODE")  // Allow running from within Claude Code sessions
+        .env("BASH_DEFAULT_TIMEOUT_MS", "86400000") // 24 hours (no practical timeout)
+        .env("BASH_MAX_TIMEOUT_MS", "86400000") // 24 hours (no practical timeout)
+        .env_remove("CLAUDECODE") // Allow running from within Claude Code sessions
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| {
-            debug_log(&format!("ERROR: Failed to spawn after {:?}: {}", spawn_start.elapsed(), e));
+            debug_log(&format!(
+                "ERROR: Failed to spawn after {:?}: {}",
+                spawn_start.elapsed(),
+                e
+            ));
             format!("Failed to start Claude: {}. Is Claude CLI installed?", e)
         })?;
-    debug_log(&format!("Claude process spawned successfully in {:?}, pid={:?}", spawn_start.elapsed(), child.id()));
+    debug_log(&format!(
+        "Claude process spawned successfully in {:?}, pid={:?}",
+        spawn_start.elapsed(),
+        child.id()
+    ));
 
     // Store child PID in cancel token so the caller can kill it externally
     if let Some(ref token) = cancel_token {
@@ -476,10 +561,17 @@ IMPORTANT: Format your responses using Markdown for better readability:
 
     // Write prompt to stdin
     if let Some(mut stdin) = child.stdin.take() {
-        debug_log(&format!("Writing prompt to stdin ({} bytes)...", prompt.len()));
+        debug_log(&format!(
+            "Writing prompt to stdin ({} bytes)...",
+            prompt.len()
+        ));
         let write_start = std::time::Instant::now();
         let write_result = stdin.write_all(prompt.as_bytes());
-        debug_log(&format!("stdin.write_all completed in {:?}, result={:?}", write_start.elapsed(), write_result.is_ok()));
+        debug_log(&format!(
+            "stdin.write_all completed in {:?}, result={:?}",
+            write_start.elapsed(),
+            write_result.is_ok()
+        ));
         // stdin is dropped here, which closes it - this signals end of input to claude
         debug_log("stdin handle dropped (closed)");
     } else {
@@ -488,11 +580,10 @@ IMPORTANT: Format your responses using Markdown for better readability:
 
     // Read stdout line by line for streaming
     debug_log("Taking stdout handle...");
-    let stdout = child.stdout.take()
-        .ok_or_else(|| {
-            debug_log("ERROR: Failed to capture stdout");
-            "Failed to capture stdout".to_string()
-        })?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        debug_log("ERROR: Failed to capture stdout");
+        "Failed to capture stdout".to_string()
+    })?;
     let reader = BufReader::new(stdout);
     debug_log("BufReader created, ready to read lines...");
 
@@ -519,14 +610,20 @@ IMPORTANT: Format your responses using Markdown for better readability:
         debug_log(&format!("Line {} - read started", line_count + 1));
         let line = match line {
             Ok(l) => {
-                debug_log(&format!("Line {} - read completed: {} chars", line_count + 1, l.len()));
+                debug_log(&format!(
+                    "Line {} - read completed: {} chars",
+                    line_count + 1,
+                    l.len()
+                ));
                 l
-            },
+            }
             Err(e) => {
                 debug_log(&format!("ERROR: Failed to read line: {}", e));
                 let _ = sender.send(StreamMessage::Error {
                     message: format!("Failed to read output: {}", e),
-                    stdout: String::new(), stderr: String::new(), exit_code: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: None,
                 });
                 break;
             }
@@ -544,9 +641,15 @@ IMPORTANT: Format your responses using Markdown for better readability:
         debug_log(&format!("  Raw line preview: {}", line_preview));
 
         if let Ok(json) = serde_json::from_str::<Value>(&line) {
-            let msg_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let msg_type = json
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
             let msg_subtype = json.get("subtype").and_then(|v| v.as_str()).unwrap_or("-");
-            debug_log(&format!("  JSON parsed: type={}, subtype={}", msg_type, msg_subtype));
+            debug_log(&format!(
+                "  JSON parsed: type={}, subtype={}",
+                msg_type, msg_subtype
+            ));
 
             // Log more details for specific message types
             if msg_type == "assistant" {
@@ -574,7 +677,10 @@ IMPORTANT: Format your responses using Markdown for better readability:
                 let cost_usd = json.get("cost_usd").and_then(|v| v.as_f64());
                 let total_cost_usd = json.get("total_cost_usd").and_then(|v| v.as_f64());
                 let duration_ms = json.get("duration_ms").and_then(|v| v.as_u64());
-                let num_turns = json.get("num_turns").and_then(|v| v.as_u64()).map(|v| v as u32);
+                let num_turns = json
+                    .get("num_turns")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32);
                 if cost_usd.is_some() || total_cost_usd.is_some() || last_model.is_some() {
                     let _ = sender.send(StreamMessage::StatusUpdate {
                         model: last_model.clone(),
@@ -582,15 +688,26 @@ IMPORTANT: Format your responses using Markdown for better readability:
                         total_cost_usd,
                         duration_ms,
                         num_turns,
-                        input_tokens: if accum_input_tokens > 0 { Some(accum_input_tokens) } else { None },
-                        output_tokens: if accum_output_tokens > 0 { Some(accum_output_tokens) } else { None },
+                        input_tokens: if accum_input_tokens > 0 {
+                            Some(accum_input_tokens)
+                        } else {
+                            None
+                        },
+                        output_tokens: if accum_output_tokens > 0 {
+                            Some(accum_output_tokens)
+                        } else {
+                            None
+                        },
                     });
                 }
             }
 
             debug_log("  Calling parse_stream_message...");
             if let Some(msg) = parse_stream_message(&json) {
-                debug_log(&format!("  Parsed message variant: {:?}", std::mem::discriminant(&msg)));
+                debug_log(&format!(
+                    "  Parsed message variant: {:?}",
+                    std::mem::discriminant(&msg)
+                ));
 
                 // Track session_id and final result for Done message
                 match &msg {
@@ -600,21 +717,36 @@ IMPORTANT: Format your responses using Markdown for better readability:
                     }
                     StreamMessage::Text { content } => {
                         let preview: String = content.chars().take(100).collect();
-                        debug_log(&format!("  >>> Text: {} chars, preview: {:?}", content.len(), preview));
+                        debug_log(&format!(
+                            "  >>> Text: {} chars, preview: {:?}",
+                            content.len(),
+                            preview
+                        ));
                     }
                     StreamMessage::ToolUse { name, input } => {
                         let input_preview: String = input.chars().take(200).collect();
-                        debug_log(&format!("  >>> ToolUse: name={}, input_preview={:?}", name, input_preview));
+                        debug_log(&format!(
+                            "  >>> ToolUse: name={}, input_preview={:?}",
+                            name, input_preview
+                        ));
                     }
                     StreamMessage::ToolResult { content, is_error } => {
                         let content_preview: String = content.chars().take(200).collect();
-                        debug_log(&format!("  >>> ToolResult: is_error={}, content_len={}, preview={:?}",
-                            is_error, content.len(), content_preview));
+                        debug_log(&format!(
+                            "  >>> ToolResult: is_error={}, content_len={}, preview={:?}",
+                            is_error,
+                            content.len(),
+                            content_preview
+                        ));
                     }
                     StreamMessage::Done { result, session_id } => {
                         let result_preview: String = result.chars().take(100).collect();
-                        debug_log(&format!("  >>> Done: result_len={}, session_id={:?}, preview={:?}",
-                            result.len(), session_id, result_preview));
+                        debug_log(&format!(
+                            "  >>> Done: result_len={}, session_id={:?}, preview={:?}",
+                            result.len(),
+                            session_id,
+                            result_preview
+                        ));
                         final_result = Some(result.clone());
                         if session_id.is_some() {
                             last_session_id = session_id.clone();
@@ -625,11 +757,29 @@ IMPORTANT: Format your responses using Markdown for better readability:
                         stdout_error = Some((message.clone(), line.clone()));
                         continue; // don't send yet; will combine with stderr after process exits
                     }
-                    StreamMessage::TaskNotification { task_id, status, summary } => {
-                        debug_log(&format!("  >>> TaskNotification: task_id={}, status={}, summary={}", task_id, status, summary));
+                    StreamMessage::TaskNotification {
+                        task_id,
+                        status,
+                        summary,
+                    } => {
+                        debug_log(&format!(
+                            "  >>> TaskNotification: task_id={}, status={}, summary={}",
+                            task_id, status, summary
+                        ));
                     }
-                    StreamMessage::StatusUpdate { ref model, cost_usd, total_cost_usd, .. } => {
-                        debug_log(&format!("  >>> StatusUpdate: model={:?}, cost={:?}, total_cost={:?}", model, cost_usd, total_cost_usd));
+                    StreamMessage::StatusUpdate {
+                        ref model,
+                        cost_usd,
+                        total_cost_usd,
+                        ..
+                    } => {
+                        debug_log(&format!(
+                            "  >>> StatusUpdate: model={:?}, cost={:?}, total_cost={:?}",
+                            model, cost_usd, total_cost_usd
+                        ));
+                    }
+                    StreamMessage::TmuxReady { .. } => {
+                        debug_log("  >>> TmuxReady (ignored in direct execution)");
                     }
                 }
 
@@ -642,7 +792,10 @@ IMPORTANT: Format your responses using Markdown for better readability:
                 }
                 debug_log("  Message sent to channel successfully");
             } else {
-                debug_log(&format!("  parse_stream_message returned None for type={}", msg_type));
+                debug_log(&format!(
+                    "  parse_stream_message returned None for type={}",
+                    msg_type
+                ));
             }
         } else {
             let invalid_preview: String = line.chars().take(200).collect();
@@ -669,25 +822,42 @@ IMPORTANT: Format your responses using Markdown for better readability:
     debug_log("Waiting for child process to finish (child.wait())...");
     let wait_start = std::time::Instant::now();
     let status = child.wait().map_err(|e| {
-        debug_log(&format!("ERROR: Process wait failed after {:?}: {}", wait_start.elapsed(), e));
+        debug_log(&format!(
+            "ERROR: Process wait failed after {:?}: {}",
+            wait_start.elapsed(),
+            e
+        ));
         format!("Process error: {}", e)
     })?;
-    debug_log(&format!("Process finished in {:?}, status: {:?}, exit_code: {:?}",
-        wait_start.elapsed(), status, status.code()));
+    debug_log(&format!(
+        "Process finished in {:?}, status: {:?}, exit_code: {:?}",
+        wait_start.elapsed(),
+        status,
+        status.code()
+    ));
 
     // Handle stdout error or non-zero exit code
     if stdout_error.is_some() || !status.success() {
-        let stderr_msg = child.stderr.take()
+        let stderr_msg = child
+            .stderr
+            .take()
             .and_then(|s| std::io::read_to_string(s).ok())
             .unwrap_or_default();
 
         let (message, stdout_raw) = if let Some((msg, raw)) = stdout_error {
             (msg, raw)
         } else {
-            (format!("Process exited with code {:?}", status.code()), String::new())
+            (
+                format!("Process exited with code {:?}", status.code()),
+                String::new(),
+            )
         };
 
-        debug_log(&format!("Sending error: message={}, exit_code={:?}", message, status.code()));
+        debug_log(&format!(
+            "Sending error: message={}, exit_code={:?}",
+            message,
+            status.code()
+        ));
         let _ = sender.send(StreamMessage::Error {
             message,
             stdout: stdout_raw,
@@ -704,7 +874,10 @@ IMPORTANT: Format your responses using Markdown for better readability:
             result: String::new(),
             session_id: last_session_id.clone(),
         });
-        debug_log(&format!("Synthetic Done message sent, result={:?}", send_result.is_ok()));
+        debug_log(&format!(
+            "Synthetic Done message sent, result={:?}",
+            send_result.is_ok()
+        ));
     } else {
         debug_log("Done message was already received, not sending synthetic one");
     }
@@ -717,17 +890,17 @@ IMPORTANT: Format your responses using Markdown for better readability:
 
 /// Shared state for processing stream-json lines from Claude.
 /// Used by both local and remote execution paths.
-struct StreamLineState {
-    last_session_id: Option<String>,
-    last_model: Option<String>,
-    accum_input_tokens: u64,
-    accum_output_tokens: u64,
-    final_result: Option<String>,
-    stdout_error: Option<(String, String)>,
+pub struct StreamLineState {
+    pub last_session_id: Option<String>,
+    pub last_model: Option<String>,
+    pub accum_input_tokens: u64,
+    pub accum_output_tokens: u64,
+    pub final_result: Option<String>,
+    pub stdout_error: Option<(String, String)>,
 }
 
 impl StreamLineState {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             last_session_id: None,
             last_model: None,
@@ -755,7 +928,10 @@ fn process_stream_line(
         Err(_) => return true,
     };
 
-    let msg_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let msg_type = json
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
 
     // Extract model name and token usage from assistant messages
     if msg_type == "assistant" {
@@ -779,7 +955,10 @@ fn process_stream_line(
         let cost_usd = json.get("cost_usd").and_then(|v| v.as_f64());
         let total_cost_usd = json.get("total_cost_usd").and_then(|v| v.as_f64());
         let duration_ms = json.get("duration_ms").and_then(|v| v.as_u64());
-        let num_turns = json.get("num_turns").and_then(|v| v.as_u64()).map(|v| v as u32);
+        let num_turns = json
+            .get("num_turns")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
         if cost_usd.is_some() || total_cost_usd.is_some() || state.last_model.is_some() {
             let _ = sender.send(StreamMessage::StatusUpdate {
                 model: state.last_model.clone(),
@@ -787,8 +966,16 @@ fn process_stream_line(
                 total_cost_usd,
                 duration_ms,
                 num_turns,
-                input_tokens: if state.accum_input_tokens > 0 { Some(state.accum_input_tokens) } else { None },
-                output_tokens: if state.accum_output_tokens > 0 { Some(state.accum_output_tokens) } else { None },
+                input_tokens: if state.accum_input_tokens > 0 {
+                    Some(state.accum_input_tokens)
+                } else {
+                    None
+                },
+                output_tokens: if state.accum_output_tokens > 0 {
+                    Some(state.accum_output_tokens)
+                } else {
+                    None
+                },
             });
         }
     }
@@ -836,12 +1023,15 @@ fn execute_streaming_remote(
     sender: Sender<StreamMessage>,
     cancel_token: Option<std::sync::Arc<CancelToken>>,
 ) -> Result<(), String> {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use crate::services::remote::{RemoteAuth, SshHandler};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     debug_log("=== execute_streaming_remote START ===");
-    debug_log(&format!("Remote host: {}@{}:{}", profile.user, profile.host, profile.port));
+    debug_log(&format!(
+        "Remote host: {}@{}:{}",
+        profile.user, profile.host, profile.port
+    ));
 
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|e| format!("Failed to create tokio runtime: {}", e))?;
@@ -1060,21 +1250,28 @@ fn parse_stream_message(json: &Value) -> Option<StreamMessage> {
                     Some(StreamMessage::Init { session_id })
                 }
                 "task_notification" => {
-                    let task_id = json.get("task_id")
+                    let task_id = json
+                        .get("task_id")
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let status = json.get("status")
+                    let status = json
+                        .get("status")
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let summary = json.get("summary")
+                    let summary = json
+                        .get("summary")
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    Some(StreamMessage::TaskNotification { task_id, status, summary })
+                    Some(StreamMessage::TaskNotification {
+                        task_id,
+                        status,
+                        summary,
+                    })
                 }
-                _ => None
+                _ => None,
             }
         }
         "assistant" => {
@@ -1091,7 +1288,8 @@ fn parse_stream_message(json: &Value) -> Option<StreamMessage> {
                     }
                     "tool_use" => {
                         let name = item.get("name")?.as_str()?.to_string();
-                        let input = item.get("input")
+                        let input = item
+                            .get("input")
                             .map(|v| serde_json::to_string_pretty(v).unwrap_or_default())
                             .unwrap_or_default();
                         return Some(StreamMessage::ToolUse { name, input });
@@ -1109,7 +1307,8 @@ fn parse_stream_message(json: &Value) -> Option<StreamMessage> {
                 let item_type = item.get("type")?.as_str()?;
                 if item_type == "tool_result" {
                     // content can be a string or an array of text items
-                    let content_text = if let Some(s) = item.get("content").and_then(|v| v.as_str()) {
+                    let content_text = if let Some(s) = item.get("content").and_then(|v| v.as_str())
+                    {
                         s.to_string()
                     } else if let Some(arr) = item.get("content").and_then(|v| v.as_array()) {
                         // Extract text from array: [{"type":"text","text":"..."},...]
@@ -1120,10 +1319,14 @@ fn parse_stream_message(json: &Value) -> Option<StreamMessage> {
                     } else {
                         String::new()
                     };
-                    let is_error = item.get("is_error")
+                    let is_error = item
+                        .get("is_error")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
-                    return Some(StreamMessage::ToolResult { content: content_text, is_error });
+                    return Some(StreamMessage::ToolResult {
+                        content: content_text,
+                        is_error,
+                    });
                 }
             }
             None
@@ -1131,7 +1334,8 @@ fn parse_stream_message(json: &Value) -> Option<StreamMessage> {
         "result" => {
             // {"type":"result","subtype":"error_during_execution","is_error":true,"errors":["..."]}
             // {"type":"result","subtype":"success","result":"...","session_id":"..."}
-            let is_error = json.get("is_error")
+            let is_error = json
+                .get("is_error")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             if is_error {
@@ -1148,19 +1352,660 @@ fn parse_stream_message(json: &Value) -> Option<StreamMessage> {
                     })
                     .or_else(|| result_raw.map(|s| s.to_string()))
                     .unwrap_or_else(|| "Unknown error".to_string());
-                return Some(StreamMessage::Error { message: error_msg, stdout: String::new(), stderr: String::new(), exit_code: None });
+                return Some(StreamMessage::Error {
+                    message: error_msg,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: None,
+                });
             }
-            let result = json.get("result")
+            let result = json
+                .get("result")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let session_id = json.get("session_id")
+            let session_id = json
+                .get("session_id")
                 .and_then(|v| v.as_str())
                 .map(String::from);
             Some(StreamMessage::Done { result, session_id })
         }
-        _ => None
+        _ => None,
     }
+}
+
+/// Check if tmux is available on the system
+pub fn is_tmux_available() -> bool {
+    Command::new("tmux")
+        .arg("-V")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Sanitize a name for use as a tmux session name.
+/// Replaces non-alphanumeric characters (except - and _) with -.
+pub fn sanitize_tmux_session_name(channel_name: &str) -> String {
+    let sanitized: String = channel_name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = &sanitized[..sanitized.len().min(50)];
+    format!("remoteCC-{}", trimmed)
+}
+
+/// Execute Claude inside a local tmux session with bidirectional input.
+///
+/// If a tmux session with this name already exists, sends the prompt as a
+/// follow-up message to the running Claude process. Otherwise creates a new session.
+///
+/// Communication:
+/// - Output: wrapper appends JSON lines to a file; parent reads with polling
+/// - Input (Discord→Claude): parent writes stream-json to INPUT_FIFO
+/// - Input (terminal→Claude): wrapper reads stdin directly
+fn execute_streaming_local_tmux(
+    args: &[String],
+    prompt: &str,
+    working_dir: &str,
+    sender: Sender<StreamMessage>,
+    cancel_token: Option<std::sync::Arc<CancelToken>>,
+    tmux_session_name: &str,
+) -> Result<(), String> {
+    debug_log(&format!(
+        "=== execute_streaming_local_tmux START: {} ===",
+        tmux_session_name
+    ));
+
+    let output_path = format!("/tmp/remotecc-{}.jsonl", tmux_session_name);
+    let input_fifo_path = format!("/tmp/remotecc-{}.input", tmux_session_name);
+    let prompt_path = format!("/tmp/remotecc-{}.prompt", tmux_session_name);
+
+    // Check if tmux session already exists (follow-up to running session)
+    let session_exists = Command::new("tmux")
+        .args(["has-session", "-t", tmux_session_name])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if session_exists {
+        debug_log("Existing tmux session found — sending follow-up message");
+        return send_followup_to_tmux(
+            prompt,
+            &output_path,
+            &input_fifo_path,
+            sender,
+            cancel_token,
+            tmux_session_name,
+        );
+    }
+
+    // === Create new tmux session ===
+    debug_log("No existing tmux session — creating new one");
+
+    // Clean up any leftover files
+    let _ = std::fs::remove_file(&output_path);
+    let _ = std::fs::remove_file(&input_fifo_path);
+    let _ = std::fs::remove_file(&prompt_path);
+
+    // Create output file (empty)
+    std::fs::write(&output_path, "").map_err(|e| format!("Failed to create output file: {}", e))?;
+
+    // Create input FIFO
+    let mkfifo = Command::new("mkfifo")
+        .arg(&input_fifo_path)
+        .output()
+        .map_err(|e| format!("Failed to create input FIFO: {}", e))?;
+    if !mkfifo.status.success() {
+        let _ = std::fs::remove_file(&output_path);
+        return Err(format!(
+            "mkfifo failed: {}",
+            String::from_utf8_lossy(&mkfifo.stderr)
+        ));
+    }
+
+    // Write prompt to temp file
+    std::fs::write(&prompt_path, prompt)
+        .map_err(|e| format!("Failed to write prompt file: {}", e))?;
+
+    // Get paths
+    let exe =
+        std::env::current_exe().map_err(|e| format!("Failed to get executable path: {}", e))?;
+    let claude_bin = get_claude_path().ok_or_else(|| "Claude CLI not found".to_string())?;
+
+    // Build wrapper command
+    let mut wrapper_parts = vec![
+        shell_escape(&exe.display().to_string()),
+        "--tmux-wrapper".to_string(),
+        "--output-file".to_string(),
+        shell_escape(&output_path),
+        "--input-fifo".to_string(),
+        shell_escape(&input_fifo_path),
+        "--prompt-file".to_string(),
+        shell_escape(&prompt_path),
+        "--cwd".to_string(),
+        shell_escape(working_dir),
+        "--".to_string(),
+        claude_bin.to_string(),
+    ];
+    for arg in args {
+        wrapper_parts.push(shell_escape(arg));
+    }
+    let wrapper_cmd = wrapper_parts.join(" ");
+
+    debug_log(&format!(
+        "Wrapper cmd: {}",
+        &wrapper_cmd[..wrapper_cmd.len().min(300)]
+    ));
+
+    // Launch tmux session (remove CLAUDECODE so nested claude invocations work)
+    let wrapper_cmd_with_env = format!("env -u CLAUDECODE {}", wrapper_cmd);
+    let tmux_result = Command::new("tmux")
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            tmux_session_name,
+            "-c",
+            working_dir,
+            &wrapper_cmd_with_env,
+        ])
+        .env_remove("CLAUDECODE")
+        .output()
+        .map_err(|e| format!("Failed to create tmux session: {}", e))?;
+
+    if !tmux_result.status.success() {
+        let stderr = String::from_utf8_lossy(&tmux_result.stderr);
+        let _ = std::fs::remove_file(&output_path);
+        let _ = std::fs::remove_file(&input_fifo_path);
+        let _ = std::fs::remove_file(&prompt_path);
+        return Err(format!("tmux error: {}", stderr));
+    }
+
+    debug_log("tmux session created, storing in cancel token...");
+
+    // Store tmux session name in cancel token
+    if let Some(ref token) = cancel_token {
+        *token.tmux_session.lock().unwrap() = Some(tmux_session_name.to_string());
+    }
+
+    // Read output file from beginning (new session)
+    let last_offset = read_output_file_until_result(
+        &output_path,
+        0,
+        sender.clone(),
+        cancel_token,
+        tmux_session_name,
+    )?;
+
+    // Notify caller that tmux session is ready for background monitoring
+    let _ = sender.send(StreamMessage::TmuxReady {
+        output_path,
+        input_fifo_path,
+        tmux_session_name: tmux_session_name.to_string(),
+        last_offset,
+    });
+
+    Ok(())
+}
+
+/// Send a follow-up message to an existing tmux Claude session.
+fn send_followup_to_tmux(
+    prompt: &str,
+    output_path: &str,
+    input_fifo_path: &str,
+    sender: Sender<StreamMessage>,
+    cancel_token: Option<std::sync::Arc<CancelToken>>,
+    tmux_session_name: &str,
+) -> Result<(), String> {
+    use std::io::Write;
+
+    debug_log(&format!(
+        "=== send_followup_to_tmux: {} ===",
+        tmux_session_name
+    ));
+
+    // Get current output file size (we'll read from this offset)
+    let start_offset = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+
+    debug_log(&format!("Output file offset: {}", start_offset));
+
+    // Format prompt as stream-json
+    let msg = serde_json::json!({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": prompt
+        }
+    });
+
+    // Write to input FIFO (blocks briefly until wrapper's reader is ready)
+    let mut fifo = std::fs::OpenOptions::new()
+        .write(true)
+        .open(input_fifo_path)
+        .map_err(|e| format!("Failed to open input FIFO: {}", e))?;
+
+    writeln!(fifo, "{}", msg).map_err(|e| format!("Failed to write to input FIFO: {}", e))?;
+    fifo.flush()
+        .map_err(|e| format!("Failed to flush input FIFO: {}", e))?;
+    drop(fifo);
+
+    debug_log("Follow-up message sent to input FIFO");
+
+    // Store tmux session name in cancel token
+    if let Some(ref token) = cancel_token {
+        *token.tmux_session.lock().unwrap() = Some(tmux_session_name.to_string());
+    }
+
+    // Read output file from the offset
+    let last_offset = read_output_file_until_result(
+        output_path,
+        start_offset,
+        sender.clone(),
+        cancel_token,
+        tmux_session_name,
+    )?;
+
+    // Notify caller that tmux session is ready for background monitoring
+    let _ = sender.send(StreamMessage::TmuxReady {
+        output_path: output_path.to_string(),
+        input_fifo_path: input_fifo_path.to_string(),
+        tmux_session_name: tmux_session_name.to_string(),
+        last_offset,
+    });
+
+    Ok(())
+}
+
+/// Poll-read the output file from a given offset until a "result" event is received.
+/// Uses raw File::read to handle growing file (not BufReader which caches EOF).
+/// Returns the file offset after the last read on success.
+fn read_output_file_until_result(
+    output_path: &str,
+    start_offset: u64,
+    sender: Sender<StreamMessage>,
+    cancel_token: Option<std::sync::Arc<CancelToken>>,
+    tmux_session_name: &str,
+) -> Result<u64, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    debug_log(&format!(
+        "=== read_output_file_until_result: offset={} ===",
+        start_offset
+    ));
+
+    // Wait for output file to exist (wrapper might not have created it yet)
+    let wait_start = std::time::Instant::now();
+    loop {
+        if std::fs::metadata(output_path).is_ok() {
+            break;
+        }
+        if wait_start.elapsed() > Duration::from_secs(30) {
+            return Err("Timeout waiting for output file".to_string());
+        }
+        if let Some(ref token) = cancel_token {
+            if token.cancelled.load(Ordering::Relaxed) {
+                return Ok(start_offset);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let mut file = std::fs::File::open(output_path)
+        .map_err(|e| format!("Failed to open output file: {}", e))?;
+    file.seek(SeekFrom::Start(start_offset))
+        .map_err(|e| format!("Failed to seek output file: {}", e))?;
+
+    let mut current_offset = start_offset;
+    let mut partial_line = String::new();
+    let mut state = StreamLineState::new();
+    let mut buf = [0u8; 8192];
+    let mut no_data_count: u32 = 0;
+
+    loop {
+        // Check cancellation
+        if let Some(ref token) = cancel_token {
+            if token.cancelled.load(Ordering::Relaxed) {
+                debug_log("Cancel detected during output file read");
+                break;
+            }
+        }
+
+        match file.read(&mut buf) {
+            Ok(0) => {
+                // No new data — check if tmux session is still alive
+                no_data_count += 1;
+                if no_data_count % 50 == 0 {
+                    // Every ~5 seconds
+                    let alive = Command::new("tmux")
+                        .args(["has-session", "-t", tmux_session_name])
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false);
+                    if !alive {
+                        debug_log("tmux session ended while reading output");
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Ok(n) => {
+                no_data_count = 0;
+                current_offset += n as u64;
+                partial_line.push_str(&String::from_utf8_lossy(&buf[..n]));
+
+                // Process complete lines
+                while let Some(pos) = partial_line.find('\n') {
+                    let line: String = partial_line.drain(..=pos).collect();
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+
+                    if !process_stream_line(trimmed, &sender, &mut state) {
+                        debug_log("Channel disconnected during output file read");
+                        return Ok(current_offset);
+                    }
+
+                    // Check if we got a result (turn complete)
+                    if state.final_result.is_some() {
+                        debug_log("Result received — returning from output file read");
+                        return Ok(current_offset);
+                    }
+                }
+            }
+            Err(e) => {
+                debug_log(&format!("Error reading output file: {}", e));
+                break;
+            }
+        }
+    }
+
+    // Handle deferred error or missing Done message
+    if let Some((message, stdout_raw)) = state.stdout_error {
+        let _ = sender.send(StreamMessage::Error {
+            message,
+            stdout: stdout_raw,
+            stderr: String::new(),
+            exit_code: None,
+        });
+    } else if state.final_result.is_none() {
+        let _ = sender.send(StreamMessage::Done {
+            result: String::new(),
+            session_id: state.last_session_id,
+        });
+    }
+
+    debug_log("=== read_output_file_until_result END ===");
+    Ok(current_offset)
+}
+
+/// Execute Claude inside a tmux session on a remote host via SSH.
+///
+/// For new sessions: SSH carries prompt file, creates tmux, tails output file.
+/// For follow-ups: SSH writes to input FIFO, tails output file from offset.
+fn execute_streaming_remote_tmux(
+    profile: &RemoteProfile,
+    args: &[String],
+    prompt: &str,
+    working_dir: &str,
+    sender: Sender<StreamMessage>,
+    cancel_token: Option<std::sync::Arc<CancelToken>>,
+    tmux_session_name: &str,
+) -> Result<(), String> {
+    use crate::services::remote::{RemoteAuth, SshHandler};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    debug_log(&format!(
+        "=== execute_streaming_remote_tmux START: {} ===",
+        tmux_session_name
+    ));
+
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|e| format!("Failed to create tokio runtime: {}", e))?;
+
+    let profile = profile.clone();
+    let args = args.to_vec();
+    let prompt = prompt.to_string();
+    let working_dir = working_dir.to_string();
+    let tmux_name = tmux_session_name.to_string();
+
+    let ssh_cancel_flag = Arc::new(AtomicBool::new(false));
+    if let Some(ref token) = cancel_token {
+        *token.ssh_cancel.lock().unwrap() = Some(ssh_cancel_flag.clone());
+        *token.tmux_session.lock().unwrap() = Some(tmux_name.clone());
+    }
+
+    let ssh_cancel = ssh_cancel_flag.clone();
+    let cancel_token_inner = cancel_token.clone();
+
+    runtime.block_on(async move {
+        // Connect & authenticate
+        let config = russh::client::Config {
+            inactivity_timeout: Some(std::time::Duration::from_secs(3600)),
+            keepalive_interval: Some(std::time::Duration::from_secs(30)),
+            keepalive_max: 10,
+            ..Default::default()
+        };
+
+        let mut ssh = russh::client::connect(
+            Arc::new(config),
+            (profile.host.as_str(), profile.port),
+            SshHandler,
+        )
+        .await
+        .map_err(|e| format!("SSH connection failed: {}", e))?;
+
+        let auth_result = match &profile.auth {
+            RemoteAuth::Password { password } => {
+                ssh.authenticate_password(&profile.user, password)
+                    .await
+                    .map_err(|e| format!("Password auth failed: {}", e))?
+            }
+            RemoteAuth::KeyFile { path, passphrase } => {
+                let key_path = if path.starts_with('~') {
+                    if let Some(home) = dirs::home_dir() {
+                        home.join(path.trim_start_matches('~').trim_start_matches('/'))
+                    } else {
+                        std::path::PathBuf::from(path)
+                    }
+                } else {
+                    std::path::PathBuf::from(path)
+                };
+
+                let key_pair = if let Some(pass) = passphrase {
+                    russh_keys::load_secret_key(&key_path, Some(pass))
+                        .map_err(|e| format!("Failed to load key: {}", e))?
+                } else {
+                    russh_keys::load_secret_key(&key_path, None)
+                        .map_err(|e| format!("Failed to load key: {}", e))?
+                };
+
+                ssh.authenticate_publickey(&profile.user, Arc::new(key_pair))
+                    .await
+                    .map_err(|e| format!("Key auth failed: {}", e))?
+            }
+        };
+
+        if !auth_result {
+            return Err("Authentication rejected by server".to_string());
+        }
+
+        debug_log("SSH authenticated for tmux, opening channel...");
+
+        let mut channel = ssh.channel_open_session()
+            .await
+            .map_err(|e| format!("Failed to open channel: {}", e))?;
+
+        let claude_bin = profile.claude_path.as_deref().unwrap_or("claude");
+        let escaped_args: Vec<String> = args.iter().map(|a| shell_escape(a)).collect();
+
+        let cd_part = if working_dir == "~" {
+            String::new()
+        } else if working_dir.starts_with("~/") {
+            format!("cd {} && ", working_dir)
+        } else {
+            format!("cd {} && ", shell_escape(&working_dir))
+        };
+
+        let output_path = format!("/tmp/remotecc-{}.jsonl", tmux_name);
+        let input_fifo_path = format!("/tmp/remotecc-{}.input", tmux_name);
+        let prompt_path = format!("/tmp/remotecc-{}.prompt", tmux_name);
+
+        // Remote command: check if tmux session exists, then create or follow-up
+        // For new sessions: create files, launch tmux, tail output file
+        // For follow-ups: get offset, write to input FIFO, tail from offset
+        let wrapper_args = format!(
+            "remotecc --tmux-wrapper --output-file {} --input-fifo {} --prompt-file {} --cwd {} -- {} {}",
+            shell_escape(&output_path),
+            shell_escape(&input_fifo_path),
+            shell_escape(&prompt_path),
+            shell_escape(&working_dir),
+            claude_bin,
+            escaped_args.join(" "),
+        );
+
+        // Build a script that handles both new and follow-up cases
+        let cmd = format!(
+            r#"{{ [ -f ~/.zshrc ] && source ~/.zshrc; [ -f ~/.bashrc ] && source ~/.bashrc; }} 2>/dev/null; \
+            {cd}if tmux has-session -t {name} 2>/dev/null; then \
+                OFFSET=$(wc -c < {output} 2>/dev/null || echo 0); \
+                cat > {input_fifo}; \
+                tail -c +$((OFFSET + 1)) -f {output} & TAIL_PID=$!; \
+                while tmux has-session -t {name} 2>/dev/null; do \
+                    if grep -q '"type":"result"' {output} 2>/dev/null; then break; fi; \
+                    sleep 0.5; \
+                done; \
+                kill $TAIL_PID 2>/dev/null; \
+            else \
+                cat > {prompt} && \
+                rm -f {output} {input_fifo} && touch {output} && mkfifo {input_fifo} && \
+                CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000 BASH_DEFAULT_TIMEOUT_MS=86400000 BASH_MAX_TIMEOUT_MS=86400000 \
+                tmux new-session -d -s {name} -c {wd} {wrapper} && \
+                tail -f {output} & TAIL_PID=$!; \
+                while tmux has-session -t {name} 2>/dev/null && ! grep -q '"type":"result"' {output} 2>/dev/null; do \
+                    sleep 0.5; \
+                done; \
+                sleep 1; \
+                kill $TAIL_PID 2>/dev/null; \
+            fi"#,
+            cd = cd_part,
+            name = shell_escape(&tmux_name),
+            output = shell_escape(&output_path),
+            input_fifo = shell_escape(&input_fifo_path),
+            prompt = shell_escape(&prompt_path),
+            wd = shell_escape(&working_dir),
+            wrapper = shell_escape(&wrapper_args),
+        );
+
+        debug_log(&format!("Remote tmux command: {}", &cmd[..cmd.len().min(500)]));
+
+        channel.exec(true, cmd)
+            .await
+            .map_err(|e| format!("Failed to exec command: {}", e))?;
+
+        // Send prompt to stdin
+        channel.data(&prompt.into_bytes()[..])
+            .await
+            .map_err(|e| format!("Failed to send stdin: {}", e))?;
+        channel.eof()
+            .await
+            .map_err(|e| format!("Failed to close stdin: {}", e))?;
+
+        debug_log("Prompt sent to remote, reading output via SSH...");
+
+        // Read output (same pattern as execute_streaming_remote)
+        let mut line_buf = Vec::new();
+        let mut stderr_buf = Vec::new();
+        let mut exit_status: Option<u32> = None;
+        let mut line_state = StreamLineState::new();
+
+        while let Some(msg) = channel.wait().await {
+            if let Some(ref token) = cancel_token_inner {
+                if token.cancelled.load(Ordering::Relaxed) {
+                    debug_log("Cancel detected — closing SSH channel");
+                    ssh_cancel.store(true, Ordering::Relaxed);
+                    let _ = channel.close().await;
+                    return Ok(());
+                }
+            }
+
+            match msg {
+                russh::ChannelMsg::Data { ref data } => {
+                    line_buf.extend_from_slice(data);
+                    while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
+                        let line_bytes: Vec<u8> = line_buf.drain(..=pos).collect();
+                        if let Ok(line) = String::from_utf8(line_bytes) {
+                            let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+                            if !process_stream_line(trimmed, &sender, &mut line_state) {
+                                debug_log("Channel disconnected, stopping remote tmux read");
+                                let _ = channel.close().await;
+                                return Ok(());
+                            }
+                            // Stop reading after result event (turn complete)
+                            if line_state.final_result.is_some() {
+                                let _ = channel.close().await;
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                russh::ChannelMsg::ExtendedData { data, ext } => {
+                    if ext == 1 {
+                        stderr_buf.extend_from_slice(&data);
+                    }
+                }
+                russh::ChannelMsg::ExitStatus { exit_status: s } => {
+                    exit_status = Some(s);
+                }
+                _ => {}
+            }
+        }
+
+        // Process remaining buffer
+        if !line_buf.is_empty() {
+            if let Ok(line) = String::from_utf8(line_buf) {
+                let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+                let _ = process_stream_line(trimmed, &sender, &mut line_state);
+            }
+        }
+
+        // Handle errors
+        let success = exit_status.map_or(true, |s| s == 0); // Allow no exit status (tail killed)
+        if line_state.stdout_error.is_some() || (!success && line_state.final_result.is_none()) {
+            let stderr_msg = String::from_utf8_lossy(&stderr_buf).to_string();
+            let (message, stdout_raw) = if let Some((msg, raw)) = line_state.stdout_error {
+                (msg, raw)
+            } else {
+                (format!("Remote tmux process exited with code {:?}", exit_status), String::new())
+            };
+            let _ = sender.send(StreamMessage::Error {
+                message,
+                stdout: stdout_raw,
+                stderr: stderr_msg,
+                exit_code: exit_status.map(|s| s as i32),
+            });
+            return Ok(());
+        }
+
+        if line_state.final_result.is_none() {
+            let _ = sender.send(StreamMessage::Done {
+                result: String::new(),
+                session_id: line_state.last_session_id,
+            });
+        }
+
+        debug_log("=== execute_streaming_remote_tmux END (success) ===");
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -1273,7 +2118,10 @@ mod tests {
         let response = parse_claude_output(output);
 
         assert!(response.success);
-        assert_eq!(response.response, Some("Just plain text response".to_string()));
+        assert_eq!(
+            response.response,
+            Some("Just plain text response".to_string())
+        );
     }
 
     #[test]
@@ -1324,9 +2172,9 @@ mod tests {
 
     #[test]
     fn test_parse_stream_message_init() {
-        let json: Value = serde_json::from_str(
-            r#"{"type":"system","subtype":"init","session_id":"test-123"}"#
-        ).unwrap();
+        let json: Value =
+            serde_json::from_str(r#"{"type":"system","subtype":"init","session_id":"test-123"}"#)
+                .unwrap();
 
         match parse_stream_message(&json) {
             Some(StreamMessage::Init { session_id }) => {
@@ -1339,8 +2187,9 @@ mod tests {
     #[test]
     fn test_parse_stream_message_text() {
         let json: Value = serde_json::from_str(
-            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello world"}]}}"#
-        ).unwrap();
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello world"}]}}"#,
+        )
+        .unwrap();
 
         match parse_stream_message(&json) {
             Some(StreamMessage::Text { content }) => {
@@ -1398,8 +2247,9 @@ mod tests {
     #[test]
     fn test_parse_stream_message_result() {
         let json: Value = serde_json::from_str(
-            r#"{"type":"result","subtype":"success","result":"Done!","session_id":"sess-456"}"#
-        ).unwrap();
+            r#"{"type":"result","subtype":"success","result":"Done!","session_id":"sess-456"}"#,
+        )
+        .unwrap();
 
         match parse_stream_message(&json) {
             Some(StreamMessage::Done { result, session_id }) => {
@@ -1412,9 +2262,7 @@ mod tests {
 
     #[test]
     fn test_parse_stream_message_unknown_type() {
-        let json: Value = serde_json::from_str(
-            r#"{"type":"unknown","data":"something"}"#
-        ).unwrap();
+        let json: Value = serde_json::from_str(r#"{"type":"unknown","data":"something"}"#).unwrap();
 
         let msg = parse_stream_message(&json);
         assert!(msg.is_none());

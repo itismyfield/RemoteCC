@@ -1,4 +1,4 @@
-# COKACDIR Rust Build System 사용 설명서
+# RemoteCC Rust Build System 사용 설명서
 
 Linux 및 macOS용 크로스 컴파일을 지원하는 Python 기반 빌드 시스템입니다.
 모든 빌드 도구는 `builder/tools/` 폴더에 로컬 설치되어 시스템 환경을 오염시키지 않습니다.
@@ -137,10 +137,10 @@ python3 build.py --release --all
 
 | 파일명 | 대상 플랫폼 |
 |--------|-------------|
-| `cokacdir-linux-aarch64` | Linux ARM64 |
-| `cokacdir-linux-x86_64` | Linux x86_64 |
-| `cokacdir-macos-aarch64` | macOS Apple Silicon (M1/M2/M3/M4) |
-| `cokacdir-macos-x86_64` | macOS Intel |
+| `remotecc-linux-aarch64` | Linux ARM64 |
+| `remotecc-linux-x86_64` | Linux x86_64 |
+| `remotecc-macos-aarch64` | macOS Apple Silicon (M1/M2/M3/M4) |
+| `remotecc-macos-x86_64` | macOS Intel |
 
 ## 설치되는 도구
 
@@ -171,10 +171,10 @@ project/
 │       ├── zig-0.13.0/   # Zig 컴파일러
 │       └── MacOSX14.0.sdk/  # macOS SDK
 └── dist/                 # 빌드 결과물
-    ├── cokacdir-linux-aarch64
-    ├── cokacdir-linux-x86_64
-    ├── cokacdir-macos-aarch64
-    └── cokacdir-macos-x86_64
+    ├── remotecc-linux-aarch64
+    ├── remotecc-linux-x86_64
+    ├── remotecc-macos-aarch64
+    └── remotecc-macos-x86_64
 ```
 
 ## 문제 해결

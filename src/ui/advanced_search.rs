@@ -127,7 +127,13 @@ fn parse_date(s: &str) -> Option<chrono::NaiveDate> {
     chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
 }
 
-pub fn draw(frame: &mut Frame, state: &AdvancedSearchState, area: Rect, theme: &Theme, kb: &crate::keybindings::Keybindings) {
+pub fn draw(
+    frame: &mut Frame,
+    state: &AdvancedSearchState,
+    area: Rect,
+    theme: &Theme,
+    kb: &crate::keybindings::Keybindings,
+) {
     let width = 50u16;
     let height = 12u16;
     let x = area.x + (area.width.saturating_sub(width)) / 2;
@@ -171,7 +177,10 @@ pub fn draw(frame: &mut Frame, state: &AdvancedSearchState, area: Rect, theme: &
                     Style::default().fg(theme.advanced_search.label)
                 },
             ),
-            Span::styled("[", Style::default().fg(theme.advanced_search.field_bracket)),
+            Span::styled(
+                "[",
+                Style::default().fg(theme.advanced_search.field_bracket),
+            ),
             Span::styled(
                 pad_to_display_width(value, 12),
                 if is_active {
@@ -180,7 +189,10 @@ pub fn draw(frame: &mut Frame, state: &AdvancedSearchState, area: Rect, theme: &
                     Style::default().fg(theme.advanced_search.input_text)
                 },
             ),
-            Span::styled("]", Style::default().fg(theme.advanced_search.field_bracket)),
+            Span::styled(
+                "]",
+                Style::default().fg(theme.advanced_search.field_bracket),
+            ),
         ];
 
         if is_active {
@@ -200,7 +212,10 @@ pub fn draw(frame: &mut Frame, state: &AdvancedSearchState, area: Rect, theme: &
         let submit_key = kb.advanced_search_first_key(AdvancedSearchAction::Submit);
         let cancel_key = kb.advanced_search_first_key(AdvancedSearchAction::Cancel);
         lines.push(Line::from(Span::styled(
-            format!("[{}] Navigate  [{}] Search  [{}] Cancel", nav_key, submit_key, cancel_key),
+            format!(
+                "[{}] Navigate  [{}] Search  [{}] Cancel",
+                nav_key, submit_key, cancel_key
+            ),
             theme.dim_style(),
         )));
     }
@@ -220,7 +235,12 @@ pub fn handle_paste(state: &mut AdvancedSearchState, text: &str) {
     }
 }
 
-pub fn handle_input(state: &mut AdvancedSearchState, code: KeyCode, modifiers: KeyModifiers, kb: &crate::keybindings::Keybindings) -> Option<SearchCriteria> {
+pub fn handle_input(
+    state: &mut AdvancedSearchState,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    kb: &crate::keybindings::Keybindings,
+) -> Option<SearchCriteria> {
     use crate::keybindings::AdvancedSearchAction;
 
     if let Some(action) = kb.advanced_search_action(code, modifiers) {

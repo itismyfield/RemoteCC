@@ -20,7 +20,7 @@ pub enum FileOperationType {
 
 /// Progress message for file operations
 #[derive(Debug, Clone)]
-#[allow(dead_code)]  // Fields are used for debugging/logging, not always read
+#[allow(dead_code)] // Fields are used for debugging/logging, not always read
 pub enum ProgressMessage {
     /// Preparing operation (message)
     Preparing(String),
@@ -92,7 +92,10 @@ fn try_clonefile(_src: &Path, _dest: &Path) -> io::Result<bool> {
 }
 
 /// Calculate total size of files to be copied/moved
-pub fn calculate_total_size(files: &[PathBuf], cancel_flag: &Arc<AtomicBool>) -> io::Result<(u64, usize)> {
+pub fn calculate_total_size(
+    files: &[PathBuf],
+    cancel_flag: &Arc<AtomicBool>,
+) -> io::Result<(u64, usize)> {
     let mut total_size: u64 = 0;
     let mut total_files: usize = 0;
 
@@ -289,7 +292,8 @@ pub fn copy_dir_recursive_with_progress(
             )?;
         } else {
             // Regular file - copy with progress
-            let filename = src_path.file_name()
+            let filename = src_path
+                .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
 
@@ -298,11 +302,8 @@ pub fn copy_dir_recursive_with_progress(
             let file_size = metadata.len();
             let file_completed_bytes = *completed_bytes;
 
-            let result = copy_file_with_progress(
-                &src_path,
-                &dest_path,
-                cancel_flag,
-                |copied, total| {
+            let result =
+                copy_file_with_progress(&src_path, &dest_path, cancel_flag, |copied, total| {
                     let _ = progress_tx.send(ProgressMessage::FileProgress(copied, total));
                     let _ = progress_tx.send(ProgressMessage::TotalProgress(
                         *completed_files,
@@ -310,8 +311,7 @@ pub fn copy_dir_recursive_with_progress(
                         file_completed_bytes + copied,
                         total_bytes,
                     ));
-                },
-            );
+                });
 
             match result {
                 Ok(_) => {
@@ -348,13 +348,22 @@ pub fn copy_files_with_progress(
     let mut failure_count = 0;
 
     // Build full paths for size calculation (excluding skipped files)
-    let full_paths: Vec<PathBuf> = files.iter()
-        .map(|f| if f.is_absolute() { f.clone() } else { source_dir.join(f) })
+    let full_paths: Vec<PathBuf> = files
+        .iter()
+        .map(|f| {
+            if f.is_absolute() {
+                f.clone()
+            } else {
+                source_dir.join(f)
+            }
+        })
         .filter(|p| !files_to_skip.contains(p))
         .collect();
 
     // Send preparing message before calculating sizes
-    let _ = progress_tx.send(ProgressMessage::Preparing("Calculating file sizes...".to_string()));
+    let _ = progress_tx.send(ProgressMessage::Preparing(
+        "Calculating file sizes...".to_string(),
+    ));
 
     // Calculate total size
     let (total_bytes, total_files) = match calculate_total_size(&full_paths, &cancel_flag) {
@@ -383,7 +392,8 @@ pub fn copy_files_with_progress(
             source_dir.join(file_path)
         };
 
-        let filename = src.file_name()
+        let filename = src
+            .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
@@ -448,20 +458,15 @@ pub fn copy_files_with_progress(
             let file_size = fs::metadata(&src).map(|m| m.len()).unwrap_or(0);
             let file_completed_bytes = completed_bytes;
 
-            match copy_file_with_progress(
-                &src,
-                &dest,
-                &cancel_flag,
-                |copied, total| {
-                    let _ = progress_tx.send(ProgressMessage::FileProgress(copied, total));
-                    let _ = progress_tx.send(ProgressMessage::TotalProgress(
-                        completed_files,
-                        total_files,
-                        file_completed_bytes + copied,
-                        total_bytes,
-                    ));
-                },
-            ) {
+            match copy_file_with_progress(&src, &dest, &cancel_flag, |copied, total| {
+                let _ = progress_tx.send(ProgressMessage::FileProgress(copied, total));
+                let _ = progress_tx.send(ProgressMessage::TotalProgress(
+                    completed_files,
+                    total_files,
+                    file_completed_bytes + copied,
+                    total_bytes,
+                ));
+            }) {
                 Ok(_) => {
                     completed_bytes += file_size;
                     completed_files += 1;
@@ -498,13 +503,22 @@ pub fn move_files_with_progress(
     let mut failure_count = 0;
 
     // Build full paths for size calculation (excluding skipped files)
-    let full_paths: Vec<PathBuf> = files.iter()
-        .map(|f| if f.is_absolute() { f.clone() } else { source_dir.join(f) })
+    let full_paths: Vec<PathBuf> = files
+        .iter()
+        .map(|f| {
+            if f.is_absolute() {
+                f.clone()
+            } else {
+                source_dir.join(f)
+            }
+        })
         .filter(|p| !files_to_skip.contains(p))
         .collect();
 
     // Send preparing message before calculating sizes
-    let _ = progress_tx.send(ProgressMessage::Preparing("Calculating file sizes...".to_string()));
+    let _ = progress_tx.send(ProgressMessage::Preparing(
+        "Calculating file sizes...".to_string(),
+    ));
 
     // Calculate total size upfront for accurate progress
     let (total_bytes, total_files) = match calculate_total_size(&full_paths, &cancel_flag) {
@@ -523,7 +537,7 @@ pub fn move_files_with_progress(
     let mut completed_files: usize = 0;
 
     // First, try simple rename for each file (fast path for same filesystem)
-    let mut needs_copy: Vec<(PathBuf, PathBuf, u64)> = Vec::new();  // (src, dest, size)
+    let mut needs_copy: Vec<(PathBuf, PathBuf, u64)> = Vec::new(); // (src, dest, size)
 
     for file_path in &files {
         if cancel_flag.load(Ordering::Relaxed) {
@@ -536,7 +550,8 @@ pub fn move_files_with_progress(
             source_dir.join(file_path)
         };
 
-        let filename = src.file_name()
+        let filename = src
+            .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
@@ -612,7 +627,8 @@ pub fn move_files_with_progress(
                 break;
             }
 
-            let filename = src.file_name()
+            let filename = src
+                .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
 
@@ -633,20 +649,16 @@ pub fn move_files_with_progress(
                 let file_size = fs::metadata(&src).map(|m| m.len()).unwrap_or(0);
                 let file_completed_bytes = completed_bytes;
 
-                copy_file_with_progress(
-                    &src,
-                    &dest,
-                    &cancel_flag,
-                    |copied, total| {
-                        let _ = progress_tx.send(ProgressMessage::FileProgress(copied, total));
-                        let _ = progress_tx.send(ProgressMessage::TotalProgress(
-                            completed_files,
-                            total_files,
-                            file_completed_bytes + copied,
-                            total_bytes,
-                        ));
-                    },
-                ).map(|_| {
+                copy_file_with_progress(&src, &dest, &cancel_flag, |copied, total| {
+                    let _ = progress_tx.send(ProgressMessage::FileProgress(copied, total));
+                    let _ = progress_tx.send(ProgressMessage::TotalProgress(
+                        completed_files,
+                        total_files,
+                        file_completed_bytes + copied,
+                        total_bytes,
+                    ));
+                })
+                .map(|_| {
                     completed_bytes += file_size;
                     completed_files += 1;
                 })
@@ -753,9 +765,10 @@ fn copy_dir_recursive_inner(
 ) -> io::Result<()> {
     // Check maximum depth to prevent stack overflow
     if depth > MAX_COPY_DEPTH {
-        return Err(io::Error::other(
-            format!("Maximum directory depth ({}) exceeded - possible circular symlink", MAX_COPY_DEPTH),
-        ));
+        return Err(io::Error::other(format!(
+            "Maximum directory depth ({}) exceeded - possible circular symlink",
+            MAX_COPY_DEPTH
+        )));
     }
 
     // Get canonical path to detect symlink loops
@@ -763,9 +776,10 @@ fn copy_dir_recursive_inner(
 
     // Check for circular symlink
     if visited.contains(&canonical_src) {
-        return Err(io::Error::other(
-            format!("Circular symlink detected: {}", src.display()),
-        ));
+        return Err(io::Error::other(format!(
+            "Circular symlink detected: {}",
+            src.display()
+        )));
     }
     visited.insert(canonical_src);
 
@@ -780,10 +794,23 @@ fn copy_dir_recursive_inner(
         let metadata = fs::symlink_metadata(&src_path)?;
 
         if metadata.is_symlink() {
-            // Copy symlink as-is (don't follow it)
+            // Reject symlinks pointing to sensitive paths
             #[cfg(unix)]
             {
                 let link_target = fs::read_link(&src_path)?;
+                let target_str = link_target.to_string_lossy();
+                for sensitive in SENSITIVE_PATHS {
+                    if target_str.starts_with(sensitive) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            format!(
+                                "Symlink '{}' points to sensitive path '{}'",
+                                src_path.display(),
+                                target_str
+                            ),
+                        ));
+                    }
+                }
                 std::os::unix::fs::symlink(&link_target, &dest_path)?;
             }
             #[cfg(not(unix))]
@@ -929,8 +956,8 @@ pub fn is_valid_filename(name: &str) -> Result<(), &'static str> {
 
 /// Sensitive paths that symlinks should not point to
 const SENSITIVE_PATHS: &[&str] = &[
-    "/etc", "/sys", "/proc", "/boot", "/root", "/var/log",
-    "/home", "/dev", "/tmp", "/run", "/var/run",
+    "/etc", "/sys", "/proc", "/boot", "/root", "/var/log", "/home", "/dev", "/tmp", "/run",
+    "/var/run",
 ];
 
 /// Check symlinks in files to be archived for security
@@ -1081,7 +1108,13 @@ pub fn filter_symlinks_for_tar(base_dir: &Path, files: &[String]) -> (Vec<String
 
     for file in files {
         let file_path = base_dir.join(file);
-        collect_unsafe_symlinks(&file_path, base_dir, file, &mut excluded_paths, &mut visited);
+        collect_unsafe_symlinks(
+            &file_path,
+            base_dir,
+            file,
+            &mut excluded_paths,
+            &mut visited,
+        );
     }
 
     (files.to_vec(), excluded_paths)
@@ -1145,12 +1178,17 @@ fn collect_unsafe_symlinks(
             for entry in entries.filter_map(|e| e.ok()) {
                 let entry_name = entry.file_name().to_string_lossy().to_string();
                 let entry_relative = format!("{}/{}", relative_path, entry_name);
-                collect_unsafe_symlinks(&entry.path(), base_dir, &entry_relative, excluded, visited);
+                collect_unsafe_symlinks(
+                    &entry.path(),
+                    base_dir,
+                    &entry_relative,
+                    excluded,
+                    visited,
+                );
             }
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1166,7 +1204,7 @@ mod tests {
     fn create_temp_dir() -> PathBuf {
         let unique_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
         let temp_dir = std::env::temp_dir().join(format!(
-            "cokacdir_test_{}_{}",
+            "remotecc_test_{}_{}",
             std::process::id(),
             unique_id
         ));

@@ -143,7 +143,7 @@ class BuildExecutor:
         profile = "release" if self.config.release else "debug"
 
         # Determine binary name (could be different on Windows)
-        binary_name = "cokacdir"
+        binary_name = "remotecc"
 
         if target.is_native:
             binary_path = self.target_dir / profile / binary_name
@@ -165,7 +165,7 @@ class BuildExecutor:
                 continue
 
             # Determine destination name
-            dest_name = f"cokacdir-{result.target.friendly_name}"
+            dest_name = f"remotecc-{result.target.friendly_name}"
             dest_path = self.dist_dir / dest_name
 
             try:

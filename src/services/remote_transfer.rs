@@ -1,11 +1,11 @@
+use std::io::BufReader;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc::Sender, Arc};
-use std::io::BufReader;
 
-use tokio::runtime::Runtime;
 use russh::{client, ChannelMsg, Disconnect};
+use tokio::runtime::Runtime;
 
 use crate::services::file_ops::ProgressMessage;
 use crate::services::remote::{RemoteAuth, RemoteProfile, SshHandler};
@@ -54,8 +54,7 @@ struct SshExec {
 impl SshExec {
     /// Connect to remote server via russh and authenticate.
     fn connect(profile: &RemoteProfile) -> Result<Self, String> {
-        let runtime = Runtime::new()
-            .map_err(|e| format!("Failed to create runtime: {}", e))?;
+        let runtime = Runtime::new().map_err(|e| format!("Failed to create runtime: {}", e))?;
 
         let profile = profile.clone();
         let handle = runtime.block_on(async {
@@ -74,11 +73,10 @@ impl SshExec {
 
             // Authenticate
             let auth_result = match &profile.auth {
-                RemoteAuth::Password { password } => {
-                    ssh.authenticate_password(&profile.user, password)
-                        .await
-                        .map_err(|e| format!("Password auth failed: {}", e))?
-                }
+                RemoteAuth::Password { password } => ssh
+                    .authenticate_password(&profile.user, password)
+                    .await
+                    .map_err(|e| format!("Password auth failed: {}", e))?,
                 RemoteAuth::KeyFile { path, passphrase } => {
                     let key_path = if path.starts_with('~') {
                         if let Some(home) = dirs::home_dir() {
@@ -119,11 +117,14 @@ impl SshExec {
     fn exec(&self, cmd: &str) -> Result<(bool, String), String> {
         let cmd = cmd.to_string();
         self.runtime.block_on(async {
-            let mut channel = self.handle.channel_open_session()
+            let mut channel = self
+                .handle
+                .channel_open_session()
                 .await
                 .map_err(|e| format!("Failed to open channel: {}", e))?;
 
-            channel.exec(true, cmd)
+            channel
+                .exec(true, cmd)
                 .await
                 .map_err(|e| format!("Failed to exec command: {}", e))?;
 
@@ -199,7 +200,8 @@ fn build_ssh_option(profile: &RemoteProfile) -> String {
     }
 
     // Disable strict host key checking for convenience
-    ssh_cmd.push_str(" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR");
+    ssh_cmd
+        .push_str(" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR");
 
     ssh_cmd
 }
@@ -218,10 +220,9 @@ fn build_remote_spec(profile: &RemoteProfile, path: &str) -> String {
 fn create_askpass_script(password: &str) -> Result<PathBuf, String> {
     let tmp_dir = dirs::home_dir()
         .unwrap_or_else(std::env::temp_dir)
-        .join(".cokacdir")
+        .join(".remotecc")
         .join("tmp");
-    std::fs::create_dir_all(&tmp_dir)
-        .map_err(|e| format!("Failed to create tmp dir: {}", e))?;
+    std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("Failed to create tmp dir: {}", e))?;
 
     let script_path = tmp_dir.join(format!("askpass_{}", std::process::id()));
 
@@ -274,23 +275,30 @@ fn transfer_rsync(
 
     for source_file in &config.source_files {
         if cancel_flag.load(Ordering::Relaxed) {
-            if let Some(ref path) = askpass_script { cleanup_askpass_script(path); }
+            if let Some(ref path) = askpass_script {
+                cleanup_askpass_script(path);
+            }
             return Ok(());
         }
 
         let file_name = source_file.display().to_string();
         let _ = tx.send(ProgressMessage::FileStarted(file_name.clone()));
 
-        let source_full = format!("{}/{}", config.source_base.trim_end_matches('/'), source_file.display());
+        let source_full = format!(
+            "{}/{}",
+            config.source_base.trim_end_matches('/'),
+            source_file.display()
+        );
         let target = &config.target_path;
 
         let (src, dst) = match config.direction {
             TransferDirection::LocalToRemote => {
                 (source_full, build_remote_spec(&config.profile, target))
             }
-            TransferDirection::RemoteToLocal => {
-                (build_remote_spec(&config.profile, &source_full), target.clone())
-            }
+            TransferDirection::RemoteToLocal => (
+                build_remote_spec(&config.profile, &source_full),
+                target.clone(),
+            ),
         };
 
         // Build rsync command with --progress (compatible with all rsync versions)
@@ -310,7 +318,10 @@ fn transfer_rsync(
                 let mut sshpass_cmd = Command::new("sshpass");
                 sshpass_cmd.arg("-p").arg(password);
                 let program = cmd.get_program().to_string_lossy().to_string();
-                let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect();
+                let args: Vec<String> = cmd
+                    .get_args()
+                    .map(|a| a.to_string_lossy().to_string())
+                    .collect();
                 sshpass_cmd.arg(program);
                 for arg in args {
                     sshpass_cmd.arg(arg);
@@ -331,7 +342,9 @@ fn transfer_rsync(
         };
 
         let mut child = cmd.spawn().map_err(|e| {
-            if let Some(ref path) = askpass_script { cleanup_askpass_script(path); }
+            if let Some(ref path) = askpass_script {
+                cleanup_askpass_script(path);
+            }
             format!("Failed to start rsync: {}", e)
         })?;
 
@@ -346,7 +359,9 @@ fn transfer_rsync(
                 if cancel_flag.load(Ordering::Relaxed) {
                     let _ = child.kill();
                     let _ = child.wait();
-                    if let Some(ref path) = askpass_script { cleanup_askpass_script(path); }
+                    if let Some(ref path) = askpass_script {
+                        cleanup_askpass_script(path);
+                    }
                     return Ok(());
                 }
 
@@ -358,7 +373,9 @@ fn transfer_rsync(
                             if !line_buf.is_empty() {
                                 let line = String::from_utf8_lossy(&line_buf).to_string();
                                 if let Some(progress) = parse_rsync_progress(&line) {
-                                    let _ = tx.send(ProgressMessage::FileProgress(progress.0, progress.1));
+                                    let _ = tx.send(ProgressMessage::FileProgress(
+                                        progress.0, progress.1,
+                                    ));
                                 }
                                 line_buf.clear();
                             }
@@ -379,14 +396,21 @@ fn transfer_rsync(
         }
 
         let status = child.wait().map_err(|e| {
-            if let Some(ref path) = askpass_script { cleanup_askpass_script(path); }
+            if let Some(ref path) = askpass_script {
+                cleanup_askpass_script(path);
+            }
             format!("rsync wait failed: {}", e)
         })?;
 
         if status.success() {
             completed_files += 1;
             let _ = tx.send(ProgressMessage::FileCompleted(file_name));
-            let _ = tx.send(ProgressMessage::TotalProgress(completed_files, total_files, 0, 0));
+            let _ = tx.send(ProgressMessage::TotalProgress(
+                completed_files,
+                total_files,
+                0,
+                0,
+            ));
         } else {
             let stderr_msg = if let Some(mut stderr) = child.stderr.take() {
                 let mut buf = String::new();
@@ -396,13 +420,17 @@ fn transfer_rsync(
                 format!("rsync exited with code {}", status.code().unwrap_or(-1))
             };
             let _ = tx.send(ProgressMessage::Error(file_name, stderr_msg.clone()));
-            if let Some(ref path) = askpass_script { cleanup_askpass_script(path); }
+            if let Some(ref path) = askpass_script {
+                cleanup_askpass_script(path);
+            }
             return Err(stderr_msg);
         }
     }
 
     // Cleanup
-    if let Some(ref path) = askpass_script { cleanup_askpass_script(path); }
+    if let Some(ref path) = askpass_script {
+        cleanup_askpass_script(path);
+    }
 
     Ok(())
 }
@@ -620,9 +648,15 @@ fn transfer_same_server(
         if success {
             completed_files += 1;
             let _ = tx.send(ProgressMessage::FileCompleted(file_name));
-            let _ = tx.send(ProgressMessage::TotalProgress(completed_files, total_files, 0, 0));
+            let _ = tx.send(ProgressMessage::TotalProgress(
+                completed_files,
+                total_files,
+                0,
+                0,
+            ));
         } else {
-            let err_msg = format!("Failed to {} '{}': {}",
+            let err_msg = format!(
+                "Failed to {} '{}': {}",
                 if is_cut { "move" } else { "copy" },
                 file_name,
                 stderr.trim()
@@ -696,14 +730,14 @@ pub fn transfer_remote_to_remote_with_progress(
         return;
     }
 
-    // Create temp directory under ~/.cokacdir/tmp/
+    // Create temp directory under ~/.remotecc/tmp/
     let temp_id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     let base_tmp = dirs::home_dir()
         .unwrap_or_else(std::env::temp_dir)
-        .join(".cokacdir")
+        .join(".remotecc")
         .join("tmp");
     let temp_dir = base_tmp.join(format!("r2r_{}", temp_id));
     if let Err(e) = std::fs::create_dir_all(&temp_dir) {

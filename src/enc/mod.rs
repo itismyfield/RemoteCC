@@ -12,14 +12,14 @@ use std::sync::Arc;
 use base64::Engine;
 use md5::{Digest, Md5};
 use rand::RngCore;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
+use crate::services::file_ops::ProgressMessage;
 use crypto::{
-    derive_key, generate_iv, generate_salt, load_key_file, write_header, ChunkEncryptor,
-    decrypt_chunk_streaming, read_header,
+    decrypt_chunk_streaming, derive_key, generate_iv, generate_salt, load_key_file, read_header,
+    write_header, ChunkEncryptor,
 };
 use error::CokacencError;
-use crate::services::file_ops::ProgressMessage;
 
 const READ_BUF_SIZE: usize = 64 * 1024; // 64KB
 
@@ -64,7 +64,8 @@ fn gather_file_info(path: &Path, use_md5: bool) -> Result<FileInfo, CokacencErro
     let metadata = fs::metadata(path)?;
     let size = metadata.len();
 
-    let modified = metadata.modified()
+    let modified = metadata
+        .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
@@ -86,7 +87,9 @@ fn gather_file_info(path: &Path, use_md5: bool) -> Result<FileInfo, CokacencErro
         let mut buf = [0u8; READ_BUF_SIZE];
         loop {
             let n = reader.read(&mut buf)?;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             hasher.update(&buf[..n]);
         }
         format!("{:032x}", hasher.finalize())
@@ -94,7 +97,12 @@ fn gather_file_info(path: &Path, use_md5: bool) -> Result<FileInfo, CokacencErro
         String::new()
     };
 
-    Ok(FileInfo { size, md5, modified, permissions })
+    Ok(FileInfo {
+        size,
+        md5,
+        modified,
+        permissions,
+    })
 }
 
 // ─── MetadataSplitWriter (extracts metadata from decrypted stream) ─────
@@ -208,14 +216,13 @@ impl<W: Write> Write for TeeWriter<'_, W> {
 
 // ─── Key management ────────────────────────────────────────────────────
 
-/// Ensure the encryption key file exists at ~/.cokacdir/credential/cokacenc.key.
+/// Ensure the encryption key file exists at ~/.remotecc/credential/cokacenc.key.
 /// Creates the directory and key file if they don't exist.
 /// Returns the path to the key file.
 pub fn ensure_key() -> Result<PathBuf, CokacencError> {
-    let home = dirs::home_dir().ok_or_else(|| {
-        CokacencError::Other("Cannot determine home directory".to_string())
-    })?;
-    let cred_dir = home.join(".cokacdir").join("credential");
+    let home = dirs::home_dir()
+        .ok_or_else(|| CokacencError::Other("Cannot determine home directory".to_string()))?;
+    let cred_dir = home.join(".remotecc").join("credential");
 
     if !cred_dir.exists() {
         fs::create_dir_all(&cred_dir)?;
@@ -260,16 +267,24 @@ pub fn pack_directory_with_progress(
     let password = match load_key_file(key_path) {
         Ok(p) => p,
         Err(e) => {
-            let _ = tx.send(ProgressMessage::Error(String::new(), format!("Key file error: {}", e)));
+            let _ = tx.send(ProgressMessage::Error(
+                String::new(),
+                format!("Key file error: {}", e),
+            ));
             let _ = tx.send(ProgressMessage::Completed(0, 1));
             return;
         }
     };
 
-    let split_size = if split_size_mb == 0 { u64::MAX } else { split_size_mb * 1024 * 1024 };
+    let split_size = if split_size_mb == 0 {
+        u64::MAX
+    } else {
+        split_size_mb * 1024 * 1024
+    };
 
     let mut entries: Vec<_> = match fs::read_dir(dir) {
-        Ok(rd) => rd.filter_map(|e| e.ok())
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
             .filter(|e| {
                 let path = e.path();
                 if !path.is_file() {
@@ -280,7 +295,10 @@ pub fn pack_directory_with_progress(
             })
             .collect(),
         Err(e) => {
-            let _ = tx.send(ProgressMessage::Error(String::new(), format!("Read dir error: {}", e)));
+            let _ = tx.send(ProgressMessage::Error(
+                String::new(),
+                format!("Read dir error: {}", e),
+            ));
             let _ = tx.send(ProgressMessage::Completed(0, 1));
             return;
         }
@@ -416,7 +434,9 @@ fn pack_file(
             while remaining > 0 {
                 let to_read = (READ_BUF_SIZE as u64).min(remaining) as usize;
                 let n = reader.read(&mut read_buf[..to_read])?;
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 let encrypted = enc.update(&read_buf[..n]);
                 writer.write_all(encrypted)?;
                 remaining -= n as u64;
@@ -453,7 +473,10 @@ pub fn unpack_directory_with_progress(
     let password = match load_key_file(key_path) {
         Ok(p) => p,
         Err(e) => {
-            let _ = tx.send(ProgressMessage::Error(String::new(), format!("Key file error: {}", e)));
+            let _ = tx.send(ProgressMessage::Error(
+                String::new(),
+                format!("Key file error: {}", e),
+            ));
             let _ = tx.send(ProgressMessage::Completed(0, 1));
             return;
         }
@@ -462,7 +485,10 @@ pub fn unpack_directory_with_progress(
     let groups = match naming::group_enc_files(dir) {
         Ok(g) => g,
         Err(e) => {
-            let _ = tx.send(ProgressMessage::Error(String::new(), format!("Read dir error: {}", e)));
+            let _ = tx.send(ProgressMessage::Error(
+                String::new(),
+                format!("Read dir error: {}", e),
+            ));
             let _ = tx.send(ProgressMessage::Completed(0, 1));
             return;
         }
@@ -484,7 +510,10 @@ pub fn unpack_directory_with_progress(
             break;
         }
 
-        let _ = tx.send(ProgressMessage::FileStarted(format!("{}...", &group_id[..8.min(group_id.len())])));
+        let _ = tx.send(ProgressMessage::FileStarted(format!(
+            "{}...",
+            &group_id[..8.min(group_id.len())]
+        )));
 
         match unpack_file_group(dir, chunks, &password, &tx) {
             Ok(original_name) => {
@@ -523,7 +552,9 @@ fn unpack_file_group(
     for (i, chunk) in chunks.iter().enumerate() {
         if chunk.seq_index != i {
             let expected_label = naming::seq_label(i)?;
-            return Err(CokacencError::MissingChunk { expected: expected_label });
+            return Err(CokacencError::MissingChunk {
+                expected: expected_label,
+            });
         }
     }
 
@@ -565,9 +596,10 @@ fn unpack_file_group(
         // Validate chunk metadata
         if meta.chunk_index != i {
             let _ = fs::remove_file(&temp_path);
-            return Err(CokacencError::MetadataParse(
-                format!("Chunk index mismatch: expected {}, got {}", i, meta.chunk_index),
-            ));
+            return Err(CokacencError::MetadataParse(format!(
+                "Chunk index mismatch: expected {}, got {}",
+                i, meta.chunk_index
+            )));
         }
 
         if i == 0 {
@@ -580,7 +612,9 @@ fn unpack_file_group(
             let _ = tx.send(ProgressMessage::FileStarted(original_name.clone()));
         } else {
             // Cross-check metadata consistency across chunks
-            if meta.filename != original_name || (!expected_md5.is_empty() && meta.file_md5 != expected_md5) {
+            if meta.filename != original_name
+                || (!expected_md5.is_empty() && meta.file_md5 != expected_md5)
+            {
                 let _ = fs::remove_file(&temp_path);
                 return Err(CokacencError::MetadataParse(
                     "Inconsistent metadata across chunks".to_string(),
@@ -606,19 +640,24 @@ fn unpack_file_group(
     let actual_size = fs::metadata(&temp_path).map(|m| m.len()).unwrap_or(0);
     if actual_size != file_size {
         let _ = fs::remove_file(&temp_path);
-        return Err(CokacencError::Other(
-            format!("Size mismatch: expected {}, got {}", file_size, actual_size),
-        ));
+        return Err(CokacencError::Other(format!(
+            "Size mismatch: expected {}, got {}",
+            file_size, actual_size
+        )));
     }
 
     // Rename to original filename (sanitize to prevent path traversal)
-    let safe_name = match Path::new(&original_name).file_name().and_then(|n| n.to_str()) {
+    let safe_name = match Path::new(&original_name)
+        .file_name()
+        .and_then(|n| n.to_str())
+    {
         Some(name) => name,
         None => {
             let _ = fs::remove_file(&temp_path);
-            return Err(CokacencError::MetadataParse(
-                format!("Invalid filename in metadata: {}", original_name),
-            ));
+            return Err(CokacencError::MetadataParse(format!(
+                "Invalid filename in metadata: {}",
+                original_name
+            )));
         }
     };
     let out_path = dir.join(safe_name);
@@ -638,8 +677,14 @@ fn unpack_file_group(
         use std::os::unix::ffi::OsStrExt;
         if let Ok(cpath) = CString::new(out_path.as_os_str().as_bytes()) {
             let times = [
-                libc::timespec { tv_sec: modified as libc::time_t, tv_nsec: 0 }, // atime
-                libc::timespec { tv_sec: modified as libc::time_t, tv_nsec: 0 }, // mtime
+                libc::timespec {
+                    tv_sec: modified as libc::time_t,
+                    tv_nsec: 0,
+                }, // atime
+                libc::timespec {
+                    tv_sec: modified as libc::time_t,
+                    tv_nsec: 0,
+                }, // mtime
             ];
             #[allow(unsafe_code)]
             unsafe {

@@ -217,11 +217,7 @@ impl ViewerState {
             let hex_str = if hex.len() <= 8 {
                 format!("{:<24}", hex.join(" "))
             } else {
-                format!(
-                    "{} {}",
-                    hex[..8].join(" "),
-                    hex[8..].join(" ")
-                )
+                format!("{} {}", hex[..8].join(" "), hex[8..].join(" "))
             };
 
             let ascii: String = chunk
@@ -235,12 +231,7 @@ impl ViewerState {
                 })
                 .collect();
 
-            lines.push(format!(
-                "{:08X}  {:<48}  |{}|",
-                offset,
-                hex_str,
-                ascii
-            ));
+            lines.push(format!("{:08X}  {:<48}  |{}|", offset, hex_str, ascii));
         }
 
         lines
@@ -430,7 +421,13 @@ impl ViewerState {
     }
 }
 
-pub fn draw(frame: &mut Frame, state: &mut ViewerState, area: Rect, theme: &Theme, kb: &crate::keybindings::Keybindings) {
+pub fn draw(
+    frame: &mut Frame,
+    state: &mut ViewerState,
+    area: Rect,
+    theme: &Theme,
+    kb: &crate::keybindings::Keybindings,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.viewer.border));
@@ -542,16 +539,15 @@ pub fn draw(frame: &mut Frame, state: &mut ViewerState, area: Rect, theme: &Them
 
             // 줄 번호 (첫 줄만 표시)
             let line_num_style = if is_bookmarked {
-                Style::default().fg(theme.viewer.bookmark_indicator).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(theme.viewer.bookmark_indicator)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(theme.viewer.line_number)
             };
 
             let line_num_span = if *is_first {
-                Span::styled(
-                    format!("{:4} ", orig_line_num + 1),
-                    line_num_style,
-                )
+                Span::styled(format!("{:4} ", orig_line_num + 1), line_num_style)
             } else {
                 Span::styled("     ", theme.dim_style()) // 연속 줄은 빈 줄번호
             };
@@ -593,7 +589,12 @@ pub fn draw(frame: &mut Frame, state: &mut ViewerState, area: Rect, theme: &Them
                 )
             } else if !state.match_positions.is_empty() {
                 // 검색어 하이라이트 (wrapped 텍스트에 대해)
-                highlight_search_in_wrapped_line(display_text, &state.search_term, line_bg_style, theme)
+                highlight_search_in_wrapped_line(
+                    display_text,
+                    &state.search_term,
+                    line_bg_style,
+                    theme,
+                )
             } else {
                 vec![Span::styled(display_text.clone(), line_bg_style)]
             };
@@ -608,7 +609,13 @@ pub fn draw(frame: &mut Frame, state: &mut ViewerState, area: Rect, theme: &Them
         }
     } else {
         // 일반 모드 (word wrap 없음)
-        for (i, original_line) in state.lines.iter().skip(state.scroll).take(content_height).enumerate() {
+        for (i, original_line) in state
+            .lines
+            .iter()
+            .skip(state.scroll)
+            .take(content_height)
+            .enumerate()
+        {
             // TAB을 4칸 스페이스로 변환 (잔상 방지)
             let line = original_line.replace('\t', "    ");
             let line_num = state.scroll + i;
@@ -616,15 +623,14 @@ pub fn draw(frame: &mut Frame, state: &mut ViewerState, area: Rect, theme: &Them
 
             // 줄 번호
             let line_num_style = if is_bookmarked {
-                Style::default().fg(theme.viewer.bookmark_indicator).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(theme.viewer.bookmark_indicator)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(theme.viewer.line_number)
             };
 
-            let line_num_span = Span::styled(
-                format!("{:4} ", line_num + 1),
-                line_num_style,
-            );
+            let line_num_span = Span::styled(format!("{:4} ", line_num + 1), line_num_style);
 
             // 라인 배경 스타일 (에디터와 동일하게 매치된 텍스트만 하이라이트)
             let line_bg_style = theme.normal_style();
@@ -644,7 +650,14 @@ pub fn draw(frame: &mut Frame, state: &mut ViewerState, area: Rect, theme: &Them
                     theme,
                 )
             } else if !state.match_positions.is_empty() {
-                highlight_search_in_line(&line, &state.match_positions, line_num, state.current_match, line_bg_style, theme)
+                highlight_search_in_line(
+                    &line,
+                    &state.match_positions,
+                    line_num,
+                    state.current_match,
+                    line_bg_style,
+                    theme,
+                )
             } else {
                 vec![Span::styled(line.clone(), line_bg_style)]
             };
@@ -714,8 +727,7 @@ pub fn draw(frame: &mut Frame, state: &mut ViewerState, area: Rect, theme: &Them
             .end_symbol(Some("▼"));
 
         let max_scroll = total_lines.saturating_sub(content_height);
-        let mut scrollbar_state = ScrollbarState::new(max_scroll + 1)
-            .position(state.scroll);
+        let mut scrollbar_state = ScrollbarState::new(max_scroll + 1).position(state.scroll);
 
         let scrollbar_area = Rect::new(
             inner.x + inner.width - 1,
@@ -743,9 +755,21 @@ pub fn draw(frame: &mut Frame, state: &mut ViewerState, area: Rect, theme: &Them
     } else if state.search_mode {
         let search_opts = format!(
             "[{}{}{}]",
-            if state.search_options.case_sensitive { "Aa" } else { "aa" },
-            if state.search_options.use_regex { " Re" } else { "" },
-            if state.search_options.whole_word { " W" } else { "" }
+            if state.search_options.case_sensitive {
+                "Aa"
+            } else {
+                "aa"
+            },
+            if state.search_options.use_regex {
+                " Re"
+            } else {
+                ""
+            },
+            if state.search_options.whole_word {
+                " W"
+            } else {
+                ""
+            }
         );
 
         let cursor_style = Style::default()
@@ -772,12 +796,15 @@ pub fn draw(frame: &mut Frame, state: &mut ViewerState, area: Rect, theme: &Them
         // 매치 정보
         let (match_info, match_info_style) = if !state.match_positions.is_empty() {
             let count = state.match_positions.len();
-            (format!(
-                " {}/{} ({} matches) ",
-                state.current_match + 1,
-                count,
-                count
-            ), theme.dim_style())
+            (
+                format!(
+                    " {}/{} ({} matches) ",
+                    state.current_match + 1,
+                    count,
+                    count
+                ),
+                theme.dim_style(),
+            )
         } else if !state.search_term.is_empty() {
             (" No matches ".to_string(), theme.dim_style())
         } else {
@@ -817,20 +844,45 @@ pub fn draw(frame: &mut Frame, state: &mut ViewerState, area: Rect, theme: &Them
         let mut footer_spans = vec![];
 
         if !wrap_indicator.is_empty() {
-            footer_spans.push(Span::styled(wrap_indicator, Style::default().fg(theme.viewer.wrap_indicator)));
+            footer_spans.push(Span::styled(
+                wrap_indicator,
+                Style::default().fg(theme.viewer.wrap_indicator),
+            ));
         }
 
         // 단축키 표시: keybindings에서 동적으로
         use crate::keybindings::ViewerAction;
         let vkb = kb;
         let shortcuts: Vec<(String, &str)> = vec![
-            (vkb.viewer_first_key(ViewerAction::Quit).to_string(), "quit "),
-            (vkb.viewer_first_key(ViewerAction::Find).to_string(), "find "),
-            (vkb.viewer_first_key(ViewerAction::GotoLine).to_string(), "goto "),
-            (vkb.viewer_first_key(ViewerAction::Edit).to_string(), "edit "),
-            (vkb.viewer_first_key(ViewerAction::ToggleWrap).to_string(), "wrap "),
-            (vkb.viewer_first_key(ViewerAction::ToggleHex).to_string(), "hex "),
-            (vkb.viewer_first_key(ViewerAction::ToggleBookmark).to_string(), "bmark"),
+            (
+                vkb.viewer_first_key(ViewerAction::Quit).to_string(),
+                "quit ",
+            ),
+            (
+                vkb.viewer_first_key(ViewerAction::Find).to_string(),
+                "find ",
+            ),
+            (
+                vkb.viewer_first_key(ViewerAction::GotoLine).to_string(),
+                "goto ",
+            ),
+            (
+                vkb.viewer_first_key(ViewerAction::Edit).to_string(),
+                "edit ",
+            ),
+            (
+                vkb.viewer_first_key(ViewerAction::ToggleWrap).to_string(),
+                "wrap ",
+            ),
+            (
+                vkb.viewer_first_key(ViewerAction::ToggleHex).to_string(),
+                "hex ",
+            ),
+            (
+                vkb.viewer_first_key(ViewerAction::ToggleBookmark)
+                    .to_string(),
+                "bmark",
+            ),
         ];
 
         for (key, rest) in &shortcuts {
@@ -964,7 +1016,10 @@ fn case_insensitive_find_all(line: &str, term: &str) -> Vec<(usize, usize)> {
         let mut ti = 0;
         let mut ci = start_idx;
         while ti < term_lower.len() {
-            if ci >= chars.len() { matched = false; break; }
+            if ci >= chars.len() {
+                matched = false;
+                break;
+            }
             let lc: Vec<char> = chars[ci].1.to_lowercase().collect();
             if lc.len() == 1 && lc[0] == term_lower[ti] {
                 ci += 1;
@@ -976,7 +1031,11 @@ fn case_insensitive_find_all(line: &str, term: &str) -> Vec<(usize, usize)> {
         }
         if matched && ti == term_lower.len() {
             let byte_start = chars[start_idx].0;
-            let byte_end = if ci < chars.len() { chars[ci].0 } else { line.len() };
+            let byte_end = if ci < chars.len() {
+                chars[ci].0
+            } else {
+                line.len()
+            };
             results.push((byte_start, byte_end));
         }
     }
@@ -1022,10 +1081,7 @@ fn highlight_search_in_wrapped_line(
     }
 
     if last_end < line.len() {
-        spans.push(Span::styled(
-            line[last_end..].to_string(),
-            base_style,
-        ));
+        spans.push(Span::styled(line[last_end..].to_string(), base_style));
     }
 
     if spans.is_empty() {
@@ -1090,9 +1146,13 @@ fn render_line_with_syntax_and_search(
                 if char_idx >= start && char_idx < end {
                     // 매치된 부분: 배경색 적용, 문법 강조의 modifier(이탤릭 등) 유지
                     if match_idx == current_match {
-                        style = style.bg(theme.viewer.search_match_current_bg).fg(theme.viewer.search_match_current_fg);
+                        style = style
+                            .bg(theme.viewer.search_match_current_bg)
+                            .fg(theme.viewer.search_match_current_fg);
                     } else {
-                        style = style.bg(theme.viewer.search_match_other_bg).fg(theme.viewer.search_match_other_fg);
+                        style = style
+                            .bg(theme.viewer.search_match_other_bg)
+                            .fg(theme.viewer.search_match_other_fg);
                     }
                     break;
                 }
@@ -1111,9 +1171,13 @@ fn render_line_with_syntax_and_search(
             for &(match_idx, start, end) in &line_matches {
                 if i >= start && i < end {
                     if match_idx == current_match {
-                        style = style.bg(theme.viewer.search_match_current_bg).fg(theme.viewer.search_match_current_fg);
+                        style = style
+                            .bg(theme.viewer.search_match_current_bg)
+                            .fg(theme.viewer.search_match_current_fg);
                     } else {
-                        style = style.bg(theme.viewer.search_match_other_bg).fg(theme.viewer.search_match_other_fg);
+                        style = style
+                            .bg(theme.viewer.search_match_other_bg)
+                            .fg(theme.viewer.search_match_other_fg);
                     }
                     break;
                 }
@@ -1203,7 +1267,9 @@ fn render_wrapped_line_with_syntax_and_search(
             for &(start, end) in &match_ranges {
                 if char_idx >= start && char_idx < end {
                     // 매치된 부분: 배경색 적용, 문법 강조의 modifier(이탤릭 등) 유지
-                    style = style.bg(theme.viewer.search_match_other_bg).fg(theme.viewer.search_match_other_fg);
+                    style = style
+                        .bg(theme.viewer.search_match_other_bg)
+                        .fg(theme.viewer.search_match_other_fg);
                     break;
                 }
             }
@@ -1220,7 +1286,9 @@ fn render_wrapped_line_with_syntax_and_search(
 
             for &(start, end) in &match_ranges {
                 if i >= start && i < end {
-                    style = style.bg(theme.viewer.search_match_other_bg).fg(theme.viewer.search_match_other_fg);
+                    style = style
+                        .bg(theme.viewer.search_match_other_bg)
+                        .fg(theme.viewer.search_match_other_fg);
                     break;
                 }
             }
@@ -1338,19 +1406,29 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
             KeyCode::End => {
                 state.search_cursor_pos = state.search_input.chars().count();
             }
-            KeyCode::Char('c') | KeyCode::Char('C') if modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('c') | KeyCode::Char('C')
+                if modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 state.search_options.case_sensitive = !state.search_options.case_sensitive;
             }
-            KeyCode::Char('r') | KeyCode::Char('R') if modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('r') | KeyCode::Char('R')
+                if modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 state.search_options.use_regex = !state.search_options.use_regex;
             }
-            KeyCode::Char('w') | KeyCode::Char('W') if modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('w') | KeyCode::Char('W')
+                if modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 state.search_options.whole_word = !state.search_options.whole_word;
             }
-            KeyCode::Char('n') | KeyCode::Char('N') if modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('n') | KeyCode::Char('N')
+                if modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 state.next_match();
             }
-            KeyCode::Char('p') | KeyCode::Char('P') if modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('p') | KeyCode::Char('P')
+                if modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 state.prev_match();
             }
             KeyCode::Down => {
@@ -1456,4 +1534,3 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
         }
     }
 }
-

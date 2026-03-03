@@ -50,7 +50,10 @@ fn is_protected_pid(pid: i32, command: Option<&str>) -> Result<(), String> {
 
     // Warn about low PIDs (likely kernel threads)
     if pid < MIN_SAFE_PID {
-        return Err(format!("Cannot kill low PID ({}) - likely a kernel thread", pid));
+        return Err(format!(
+            "Cannot kill low PID ({}) - likely a kernel thread",
+            pid
+        ));
     }
 
     // Check if command indicates kernel thread
@@ -92,7 +95,9 @@ pub fn get_process_list_result() -> ProcessListResult {
 
     // Sort by CPU usage descending by default
     processes.sort_by(|a, b| {
-        b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal)
+        b.cpu
+            .partial_cmp(&a.cpu)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
 
     Ok(processes)
@@ -204,7 +209,10 @@ pub fn force_kill_process(pid: i32) -> Result<(), String> {
 }
 
 /// Force kill a process by PID (SIGKILL) with optional starttime verification
-pub fn force_kill_process_with_verification(pid: i32, starttime: Option<u64>) -> Result<(), String> {
+pub fn force_kill_process_with_verification(
+    pid: i32,
+    starttime: Option<u64>,
+) -> Result<(), String> {
     if !is_valid_pid(pid) {
         return Err("Invalid PID".to_string());
     }

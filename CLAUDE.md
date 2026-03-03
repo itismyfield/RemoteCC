@@ -35,6 +35,6 @@ You can get Rust build methods from build_manual.md file
 ### Theme File Locations
 
 - **Source of truth**: `src/ui/theme.rs` - 테마 색상 값과 JSON 주석 모두 이 파일에서 정의
-- **Generated files**: `~/.cokacdir/themes/*.json` - 프로그램 실행 시 생성되는 사용자 설정 파일
+- **Generated files**: `~/.remotecc/themes/*.json` - 프로그램 실행 시 생성되는 사용자 설정 파일
 - 테마 수정 시 반드시 `src/ui/theme.rs`를 수정해야 함 (생성된 JSON 파일 직접 수정 금지)
 - JSON 주석 형식: `"__field__": "설명"` - 이 주석들도 theme.rs의 `to_json()` 함수 내에 정의됨

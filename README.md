@@ -1,14 +1,15 @@
-# COKACDIR
+# RemoteCC
 
-Multi-panel terminal file manager with AI-powered natural language commands.
+Multi-panel terminal file manager with AI-powered natural language commands and remote execution capabilities.
 
-**Terminal File Manager for Vibe Coders** - An easy terminal explorer for vibe coders who are scared of the terminal.
+Based on [cokacdir](https://github.com/kstost/cokacdir) by kstost.
 
 ## Features
 
 - **Blazing Fast**: Written in Rust for maximum performance. ~10ms startup, ~5MB memory usage, ~4MB static binary with zero runtime dependencies.
 - **AI-Powered Commands**: Natural language file operations powered by Claude AI. Press `.` and describe what you want.
 - **Multi-Panel Navigation**: Dynamic multi-panel interface for efficient file management
+- **Remote Execution**: Run commands on remote servers via SSH or Discord bot
 - **Keyboard Driven**: Full keyboard navigation designed for power users
 - **Built-in Editor**: Edit files with syntax highlighting for 20+ languages
 - **Image Viewer**: View images directly in terminal with zoom and pan support
@@ -19,39 +20,40 @@ Multi-panel terminal file manager with AI-powered natural language commands.
 - **Remote SSH/SFTP**: Browse remote servers via SSH/SFTP with saved profiles
 - **File Encryption**: AES-256 encryption with configurable chunk splitting
 - **Customizable Themes**: Light/Dark themes with full color customization
+- **Web UI**: Browser-based interface for remote access
 
 ## Installation
 
 ### Quick Install (Recommended)
 
 ```bash
-/bin/bash -c "$(curl -fsSL https://cokacdir.cokac.com/install.sh)"
+/bin/bash -c "$(curl -fsSL https://github.com/itismyfield/RemoteCC/releases/latest/download/install.sh)"
 ```
 
 Then run:
 
 ```bash
-cokacdir [PATH...]
+remotecc [PATH...]
 ```
 
 You can open multiple panels by passing paths:
 
 ```bash
-cokacdir ~/projects ~/downloads ~/documents
+remotecc ~/projects ~/downloads ~/documents
 ```
 
 ### From Source
 
 ```bash
 # Clone the repository
-git clone https://github.com/kstost/cokacdir.git
-cd cokacdir
+git clone https://github.com/itismyfield/RemoteCC.git
+cd RemoteCC
 
 # Build release version
 cargo build --release
 
 # Run
-./target/release/cokacdir
+./target/release/remotecc
 ```
 
 See [build_manual.md](build_manual.md) for detailed build instructions.
@@ -66,12 +68,6 @@ npm install -g @anthropic-ai/claude-code
 
 Learn more at [docs.anthropic.com](https://docs.anthropic.com/en/docs/claude-code)
 
-## Documentation
-
-For detailed usage guide, keyboard shortcuts, and tutorials:
-
-**[https://cokacdir.cokac.com/#/tutorial](https://cokacdir.cokac.com/#/tutorial)**
-
 ## Supported Platforms
 
 - macOS (Apple Silicon & Intel)
@@ -81,11 +77,9 @@ For detailed usage guide, keyboard shortcuts, and tutorials:
 
 MIT License
 
-## Author
+## Credits
 
-cokac <monogatree@gmail.com>
-
-Homepage: https://cokacdir.cokac.com
+- Original project: [cokacdir](https://github.com/kstost/cokacdir) by kstost (cokac <monogatree@gmail.com>)
 
 ## Disclaimer
 

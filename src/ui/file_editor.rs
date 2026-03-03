@@ -1,8 +1,4 @@
-use std::fs;
-use std::path::PathBuf;
-use std::collections::VecDeque;
 use crossterm::event::{KeyCode, KeyModifiers};
-use unicode_width::UnicodeWidthChar;
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -11,6 +7,10 @@ use ratatui::{
     Frame,
 };
 use regex::Regex;
+use std::collections::VecDeque;
+use std::fs;
+use std::path::PathBuf;
+use unicode_width::UnicodeWidthChar;
 
 use super::{
     app::{App, Screen},
@@ -105,7 +105,12 @@ impl Selection {
         } else {
             // 역방향 (위로 선택): cursor <- anchor
             // cursor 위치 문자와 anchor 위치 문자 모두 포함
-            (self.end_line, self.end_col.saturating_sub(1), self.start_line, self.start_col + 1)
+            (
+                self.end_line,
+                self.end_col.saturating_sub(1),
+                self.start_line,
+                self.start_col + 1,
+            )
         }
     }
 
@@ -169,7 +174,7 @@ pub struct EditorState {
     pub find_options: FindReplaceOptions,
     pub match_positions: Vec<(usize, usize, usize)>,
     pub current_match: usize,
-    pub input_focus: usize, // 0: find, 1: replace
+    pub input_focus: usize,         // 0: find, 1: replace
     pub find_error: Option<String>, // 정규식 에러 메시지
 
     // Goto
@@ -192,8 +197,8 @@ pub struct EditorState {
     pub matching_bracket: Option<(usize, usize)>,
 
     // 다중 커서 (Ctrl+D)
-    pub cursors: Vec<(usize, usize)>,  // (line, col) 추가 커서들
-    pub last_word_selection: Option<String>,  // 마지막 선택된 단어 (Ctrl+D용)
+    pub cursors: Vec<(usize, usize)>, // (line, col) 추가 커서들
+    pub last_word_selection: Option<String>, // 마지막 선택된 단어 (Ctrl+D용)
 
     // Esc 두 번 누르기 상태
     pub pending_exit: bool,
@@ -223,12 +228,18 @@ impl EditorState {
             EditAction::DeleteLine { content, .. } => content.len() + 24,
             EditAction::MergeLine { .. } => 24,
             EditAction::SplitLine { .. } => 24,
-            EditAction::Replace { old_content, new_content, .. } => {
-                old_content.len() + new_content.len() + 32
-            }
+            EditAction::Replace {
+                old_content,
+                new_content,
+                ..
+            } => old_content.len() + new_content.len() + 32,
             EditAction::SwapLines { .. } => 24,
             EditAction::Batch { actions } => {
-                actions.iter().map(Self::estimate_action_size).sum::<usize>() + 24
+                actions
+                    .iter()
+                    .map(Self::estimate_action_size)
+                    .sum::<usize>()
+                    + 24
             }
         }
     }
@@ -276,8 +287,8 @@ impl EditorState {
             last_word_selection: None,
             pending_exit: false,
             word_wrap: false,
-            visible_height: 20,  // 기본값, 렌더링 시 업데이트됨
-            visible_width: 80,   // 기본값, 렌더링 시 업데이트됨
+            visible_height: 20, // 기본값, 렌더링 시 업데이트됨
+            visible_width: 80,  // 기본값, 렌더링 시 업데이트됨
             message: None,
             message_timer: 0,
             remote_origin: None,
@@ -464,18 +475,15 @@ impl EditorState {
             .unwrap_or(false);
 
         let actual_path = if is_symlink {
-            fs::canonicalize(&self.file_path).map_err(|e| {
-                format!("Failed to resolve symlink: {}", e)
-            })?
+            fs::canonicalize(&self.file_path)
+                .map_err(|e| format!("Failed to resolve symlink: {}", e))?
         } else {
             self.file_path.clone()
         };
 
         // Save original permissions before writing
         #[cfg(unix)]
-        let original_perms = fs::metadata(&actual_path)
-            .map(|m| m.permissions())
-            .ok();
+        let original_perms = fs::metadata(&actual_path).map(|m| m.permissions()).ok();
 
         let content = self.lines.join("\n");
 
@@ -483,9 +491,8 @@ impl EditorState {
         let temp_path = actual_path.with_extension("tmp");
 
         // Write to temporary file
-        fs::write(&temp_path, &content).map_err(|e| {
-            format!("Failed to write temporary file: {}", e)
-        })?;
+        fs::write(&temp_path, &content)
+            .map_err(|e| format!("Failed to write temporary file: {}", e))?;
 
         // Restore original permissions on temp file before rename
         #[cfg(unix)]
@@ -523,7 +530,8 @@ impl EditorState {
             && !self.undo_stack.is_empty()
         {
             if let Some(old_action) = self.undo_stack.pop_front() {
-                self.undo_memory_usage = self.undo_memory_usage
+                self.undo_memory_usage = self
+                    .undo_memory_usage
                     .saturating_sub(Self::estimate_action_size(&old_action));
             }
         }
@@ -531,7 +539,8 @@ impl EditorState {
         // Also enforce count limit
         while self.undo_stack.len() >= self.max_undo_size {
             if let Some(old_action) = self.undo_stack.pop_front() {
-                self.undo_memory_usage = self.undo_memory_usage
+                self.undo_memory_usage = self
+                    .undo_memory_usage
                     .saturating_sub(Self::estimate_action_size(&old_action));
             }
         }
@@ -613,7 +622,11 @@ impl EditorState {
                 line2: *line2,
             },
             EditAction::Batch { actions } => EditAction::Batch {
-                actions: actions.iter().rev().map(|a| self.reverse_action(a)).collect(),
+                actions: actions
+                    .iter()
+                    .rev()
+                    .map(|a| self.reverse_action(a))
+                    .collect(),
             },
         }
     }
@@ -672,9 +685,7 @@ impl EditorState {
                 }
             }
             EditAction::Replace {
-                line,
-                new_content,
-                ..
+                line, new_content, ..
             } => {
                 if *line < self.lines.len() {
                     self.lines[*line] = new_content.clone();
@@ -770,18 +781,22 @@ impl EditorState {
             // 마지막 줄 (마지막 삽입 텍스트 + 원래 커서 이후 부분)
             let last_idx = parts.len() - 1;
             let last_line = format!("{}{}", parts[last_idx], after);
-            self.lines.insert(self.cursor_line + last_idx, last_line.clone());
+            self.lines
+                .insert(self.cursor_line + last_idx, last_line.clone());
             actions.push(EditAction::InsertLine {
                 line: self.cursor_line + last_idx,
                 content: last_line,
             });
 
             // 첫 줄 수정 기록
-            actions.insert(0, EditAction::Replace {
-                line: start_line,
-                old_content: format!("{}{}", before, after),
-                new_content: format!("{}{}", before, parts[0]),
-            });
+            actions.insert(
+                0,
+                EditAction::Replace {
+                    line: start_line,
+                    old_content: format!("{}{}", before, after),
+                    new_content: format!("{}{}", before, parts[0]),
+                },
+            );
 
             // 커서 위치 업데이트
             self.cursor_line = start_line + last_idx;
@@ -826,7 +841,8 @@ impl EditorState {
         };
 
         self.lines[self.cursor_line] = before;
-        self.lines.insert(self.cursor_line + 1, format!("{}{}", indent, after));
+        self.lines
+            .insert(self.cursor_line + 1, format!("{}{}", indent, after));
         self.cursor_line += 1;
         self.cursor_col = indent.len();
 
@@ -1060,7 +1076,8 @@ impl EditorState {
     /// 줄 복제
     pub fn duplicate_line(&mut self) {
         let line_content = self.lines[self.cursor_line].clone();
-        self.lines.insert(self.cursor_line + 1, line_content.clone());
+        self.lines
+            .insert(self.cursor_line + 1, line_content.clone());
         self.cursor_line += 1;
 
         self.push_undo(EditAction::InsertLine {
@@ -1085,7 +1102,9 @@ impl EditorState {
             if self.cursor_line >= self.lines.len() {
                 self.cursor_line = self.lines.len() - 1;
             }
-            self.cursor_col = self.cursor_col.min(self.lines[self.cursor_line].chars().count());
+            self.cursor_col = self
+                .cursor_col
+                .min(self.lines[self.cursor_line].chars().count());
             self.selection = None;
             self.modified = true;
             self.update_scroll();
@@ -1185,7 +1204,11 @@ impl EditorState {
             let first_non_ws = line.chars().position(|c| !c.is_whitespace()).unwrap_or(0);
 
             if self.cursor_col == first_non_ws || self.cursor_col == 0 {
-                self.cursor_col = if self.cursor_col == 0 { first_non_ws } else { 0 };
+                self.cursor_col = if self.cursor_col == 0 {
+                    first_non_ws
+                } else {
+                    0
+                };
             } else {
                 self.cursor_col = first_non_ws;
             }
@@ -1523,7 +1546,9 @@ impl EditorState {
 
             for (line_idx, line) in self.lines.iter_mut().enumerate() {
                 let old_content = line.clone();
-                let new_content = re.replace_all(line, self.replace_input.as_str()).to_string();
+                let new_content = re
+                    .replace_all(line, self.replace_input.as_str())
+                    .to_string();
 
                 if old_content != new_content {
                     actions.push(EditAction::Replace {
@@ -1708,7 +1733,10 @@ impl EditorState {
         }
 
         let deleted_text: String = chars[col..start_col].iter().collect();
-        let new_line: String = chars[..col].iter().chain(chars[start_col..].iter()).collect();
+        let new_line: String = chars[..col]
+            .iter()
+            .chain(chars[start_col..].iter())
+            .collect();
 
         self.push_undo(EditAction::Delete {
             line: self.cursor_line,
@@ -1753,7 +1781,10 @@ impl EditorState {
         }
 
         let deleted_text: String = chars[start_col..col].iter().collect();
-        let new_line: String = chars[..start_col].iter().chain(chars[col..].iter()).collect();
+        let new_line: String = chars[..start_col]
+            .iter()
+            .chain(chars[col..].iter())
+            .collect();
 
         self.push_undo(EditAction::Delete {
             line: self.cursor_line,
@@ -1831,10 +1862,18 @@ impl EditorState {
 
         for line_idx in search_start_line..self.lines.len() {
             let line = &self.lines[line_idx];
-            let start_char_col = if line_idx == search_start_line { search_start_col } else { 0 };
+            let start_char_col = if line_idx == search_start_line {
+                search_start_col
+            } else {
+                0
+            };
 
             // 문자 인덱스를 바이트 인덱스로 변환
-            let start_byte: usize = line.chars().take(start_char_col).map(|c| c.len_utf8()).sum();
+            let start_byte: usize = line
+                .chars()
+                .take(start_char_col)
+                .map(|c| c.len_utf8())
+                .sum();
 
             // 이 줄에서 단어 찾기
             if let Some(byte_pos) = line[start_byte..].find(&word) {
@@ -1932,7 +1971,9 @@ impl EditorState {
         // 현재 줄의 들여쓰기 가져오기
         let indent = if self.auto_indent {
             let line = &self.lines[self.cursor_line];
-            line.chars().take_while(|c| c.is_whitespace()).collect::<String>()
+            line.chars()
+                .take_while(|c| c.is_whitespace())
+                .collect::<String>()
         } else {
             String::new()
         };
@@ -1953,7 +1994,9 @@ impl EditorState {
         // 현재 줄의 들여쓰기 가져오기
         let indent = if self.auto_indent {
             let line = &self.lines[self.cursor_line];
-            line.chars().take_while(|c| c.is_whitespace()).collect::<String>()
+            line.chars()
+                .take_while(|c| c.is_whitespace())
+                .collect::<String>()
         } else {
             String::new()
         };
@@ -1983,7 +2026,8 @@ impl EditorState {
     /// 줄 복사 아래로 (Shift+Alt+Down)
     pub fn copy_line_down(&mut self) {
         let line_content = self.lines[self.cursor_line].clone();
-        self.lines.insert(self.cursor_line + 1, line_content.clone());
+        self.lines
+            .insert(self.cursor_line + 1, line_content.clone());
         self.cursor_line += 1;
 
         self.push_undo(EditAction::InsertLine {
@@ -2013,7 +2057,9 @@ impl EditorState {
                 if self.cursor_line >= self.lines.len() {
                     self.cursor_line = self.lines.len() - 1;
                 }
-                self.cursor_col = self.cursor_col.min(self.lines[self.cursor_line].chars().count());
+                self.cursor_col = self
+                    .cursor_col
+                    .min(self.lines[self.cursor_line].chars().count());
             } else {
                 // 유일한 줄이면 내용만 잘라내기
                 self.clipboard = self.lines[0].clone() + "\n";
@@ -2077,7 +2123,11 @@ impl EditorState {
             if chars.first() == Some(&'\t') {
                 (chars[1..].iter().collect(), 1)
             } else {
-                let spaces_to_remove = chars.iter().take(tab_size).take_while(|c| **c == ' ').count();
+                let spaces_to_remove = chars
+                    .iter()
+                    .take(tab_size)
+                    .take_while(|c| **c == ' ')
+                    .count();
                 (chars[spaces_to_remove..].iter().collect(), spaces_to_remove)
             }
         };
@@ -2115,12 +2165,21 @@ impl EditorState {
     /// 언어별 주석 문자 가져오기
     fn get_comment_string(&self) -> Option<&'static str> {
         match self.language {
-            Language::Rust | Language::C | Language::Cpp |
-            Language::Java | Language::JavaScript | Language::TypeScript |
-            Language::Go | Language::Swift | Language::Kotlin => Some("//"),
+            Language::Rust
+            | Language::C
+            | Language::Cpp
+            | Language::Java
+            | Language::JavaScript
+            | Language::TypeScript
+            | Language::Go
+            | Language::Swift
+            | Language::Kotlin => Some("//"),
 
-            Language::Python | Language::Shell | Language::Ruby |
-            Language::Yaml | Language::Toml => Some("#"),
+            Language::Python
+            | Language::Shell
+            | Language::Ruby
+            | Language::Yaml
+            | Language::Toml => Some("#"),
 
             Language::Sql => Some("--"),
 
@@ -2204,7 +2263,13 @@ impl EditorState {
     }
 }
 
-pub fn draw(frame: &mut Frame, state: &mut EditorState, area: Rect, theme: &Theme, kb: &crate::keybindings::Keybindings) {
+pub fn draw(
+    frame: &mut Frame,
+    state: &mut EditorState,
+    area: Rect,
+    theme: &Theme,
+    kb: &crate::keybindings::Keybindings,
+) {
     let border_color = if state.modified {
         theme.editor.modified_mark
     } else {
@@ -2224,7 +2289,7 @@ pub fn draw(frame: &mut Frame, state: &mut EditorState, area: Rect, theme: &Them
 
     // 화면 크기 업데이트 (스크롤 계산에 사용)
     state.visible_height = inner.height.saturating_sub(2) as usize; // 헤더와 푸터 제외
-    // visible_width는 Content 섹션에서 동적 줄 번호 폭 기준으로 설정됨
+                                                                    // visible_width는 Content 섹션에서 동적 줄 번호 폭 기준으로 설정됨
 
     // Header
     let file_name = state
@@ -2249,17 +2314,15 @@ pub fn draw(frame: &mut Frame, state: &mut EditorState, area: Rect, theme: &Them
         } else {
             Span::raw("")
         },
-        Span::styled(
-            format!("{} ", file_name),
-            theme.header_style(),
-        ),
+        Span::styled(format!("{} ", file_name), theme.header_style()),
         remote_span,
+        Span::styled(format!("[{}] ", state.language.name()), theme.dim_style()),
         Span::styled(
-            format!("[{}] ", state.language.name()),
-            theme.dim_style(),
-        ),
-        Span::styled(
-            format!("Ln {}, Col {} ", state.cursor_line + 1, state.cursor_visual_col() + 1),
+            format!(
+                "Ln {}, Col {} ",
+                state.cursor_line + 1,
+                state.cursor_visual_col() + 1
+            ),
             theme.dim_style(),
         ),
         if !state.undo_stack.is_empty() {
@@ -2285,7 +2348,8 @@ pub fn draw(frame: &mut Frame, state: &mut EditorState, area: Rect, theme: &Them
         1
     } else {
         ((total_lines as f64).log10().floor() as usize) + 1
-    }.max(4); // 최소 4자리
+    }
+    .max(4); // 최소 4자리
     let line_num_col_width = line_num_width + 1; // 공백 포함
 
     // visible_width 업데이트
@@ -2399,7 +2463,13 @@ pub fn draw(frame: &mut Frame, state: &mut EditorState, area: Rect, theme: &Them
             line_idx += 1;
         }
     } else {
-        for (i, original_line) in state.lines.iter().skip(state.scroll).take(content_height).enumerate() {
+        for (i, original_line) in state
+            .lines
+            .iter()
+            .skip(state.scroll)
+            .take(content_height)
+            .enumerate()
+        {
             // TAB을 visual column 기반으로 스페이스로 확장 (매핑 정보 포함)
             let (expanded_line, visual_to_orig) = state.expand_tabs_with_mapping(original_line);
             let line_num = state.scroll + i;
@@ -2456,8 +2526,7 @@ pub fn draw(frame: &mut Frame, state: &mut EditorState, area: Rect, theme: &Them
             .end_symbol(Some("▼"));
 
         let max_scroll = total_lines.saturating_sub(content_height);
-        let mut scrollbar_state = ScrollbarState::new(max_scroll + 1)
-            .position(state.scroll);
+        let mut scrollbar_state = ScrollbarState::new(max_scroll + 1).position(state.scroll);
 
         let scrollbar_area = Rect::new(
             inner.x + inner.width - 1,
@@ -2489,19 +2558,42 @@ pub fn draw(frame: &mut Frame, state: &mut EditorState, area: Rect, theme: &Them
 
                 // Word wrap 표시자
                 if state.word_wrap {
-                    footer_spans.push(Span::styled("Wrap ", Style::default().fg(theme.editor.wrap_indicator)));
+                    footer_spans.push(Span::styled(
+                        "Wrap ",
+                        Style::default().fg(theme.editor.wrap_indicator),
+                    ));
                 }
 
                 // 단축키 안내 (keybindings에서 동적으로)
                 let shortcuts: Vec<(String, &str)> = vec![
                     (kb.editor_first_key(EditorAction::Save).to_string(), "save "),
-                    (kb.editor_first_key(EditorAction::DeleteLine).to_string(), "del "),
-                    (kb.editor_first_key(EditorAction::DuplicateLine).to_string(), "dup "),
-                    (kb.editor_first_key(EditorAction::ToggleComment).to_string(), "comment "),
-                    (kb.editor_first_key(EditorAction::SelectNextOccurrence).to_string(), "select "),
+                    (
+                        kb.editor_first_key(EditorAction::DeleteLine).to_string(),
+                        "del ",
+                    ),
+                    (
+                        kb.editor_first_key(EditorAction::DuplicateLine).to_string(),
+                        "dup ",
+                    ),
+                    (
+                        kb.editor_first_key(EditorAction::ToggleComment).to_string(),
+                        "comment ",
+                    ),
+                    (
+                        kb.editor_first_key(EditorAction::SelectNextOccurrence)
+                            .to_string(),
+                        "select ",
+                    ),
                     (kb.editor_first_key(EditorAction::Find).to_string(), "find "),
-                    (kb.editor_first_key(EditorAction::GotoLine).to_string(), "goto "),
-                    (kb.editor_first_key(EditorAction::ToggleWordWrap).to_string(), "wrap "),
+                    (
+                        kb.editor_first_key(EditorAction::GotoLine).to_string(),
+                        "goto ",
+                    ),
+                    (
+                        kb.editor_first_key(EditorAction::ToggleWordWrap)
+                            .to_string(),
+                        "wrap ",
+                    ),
                     (kb.editor_first_key(EditorAction::Exit).to_string(), "exit"),
                 ];
 
@@ -2521,9 +2613,21 @@ pub fn draw(frame: &mut Frame, state: &mut EditorState, area: Rect, theme: &Them
         FindReplaceMode::Find | FindReplaceMode::Replace => {
             let find_opts = format!(
                 "[{}{}{}]",
-                if state.find_options.case_sensitive { "Aa" } else { "aa" },
-                if state.find_options.use_regex { " Re" } else { "" },
-                if state.find_options.whole_word { " W" } else { "" }
+                if state.find_options.case_sensitive {
+                    "Aa"
+                } else {
+                    "aa"
+                },
+                if state.find_options.use_regex {
+                    " Re"
+                } else {
+                    ""
+                },
+                if state.find_options.whole_word {
+                    " W"
+                } else {
+                    ""
+                }
             );
 
             let (match_info, match_info_style) = if let Some(ref err) = state.find_error {
@@ -2536,12 +2640,15 @@ pub fn draw(frame: &mut Frame, state: &mut EditorState, area: Rect, theme: &Them
                 (truncated, Style::default().fg(Color::Red))
             } else if !state.match_positions.is_empty() {
                 let count = state.match_positions.len();
-                (format!(
-                    " {}/{} ({} matches) ",
-                    state.current_match + 1,
-                    count,
-                    count
-                ), theme.dim_style())
+                (
+                    format!(
+                        " {}/{} ({} matches) ",
+                        state.current_match + 1,
+                        count,
+                        count
+                    ),
+                    theme.dim_style(),
+                )
             } else if !state.find_term.is_empty() {
                 (" No matches ".to_string(), theme.dim_style())
             } else {
@@ -2577,7 +2684,10 @@ pub fn draw(frame: &mut Frame, state: &mut EditorState, area: Rect, theme: &Them
                 spans.push(Span::styled(find_cursor_char, cursor_style));
                 spans.push(Span::styled(find_after, input_style));
             } else {
-                spans.push(Span::styled(format!("{} ", &state.find_input), theme.dim_style()));
+                spans.push(Span::styled(
+                    format!("{} ", &state.find_input),
+                    theme.dim_style(),
+                ));
             }
 
             // Replace 입력 필드
@@ -2604,7 +2714,10 @@ pub fn draw(frame: &mut Frame, state: &mut EditorState, area: Rect, theme: &Them
                     spans.push(Span::styled(replace_cursor_char, cursor_style));
                     spans.push(Span::styled(replace_after, input_style));
                 } else {
-                    spans.push(Span::styled(format!("{} ", &state.replace_input), theme.dim_style()));
+                    spans.push(Span::styled(
+                        format!("{} ", &state.replace_input),
+                        theme.dim_style(),
+                    ));
                 }
             }
 
@@ -2691,7 +2804,11 @@ fn render_editor_line(
     let line_selection = if let Some((sl, sc, el, ec)) = selection {
         if *sl <= line_num && line_num <= *el {
             let start = if line_num == *sl { *sc } else { 0 };
-            let end = if line_num == *el { *ec } else { orig_chars.len() };
+            let end = if line_num == *el {
+                *ec
+            } else {
+                orig_chars.len()
+            };
             Some((start, end))
         } else {
             None
@@ -2735,7 +2852,7 @@ fn render_editor_line(
 
     // 문자를 순회하면서 visual column 누적 — CJK 전각 문자 올바르게 처리
     let mut visual_col = 0; // 현재 문자의 visual column 시작 위치
-    let mut vis_idx = 0;    // visual_to_orig 인덱스
+    let mut vis_idx = 0; // visual_to_orig 인덱스
 
     for (_char_idx, c) in chars.iter().enumerate() {
         let char_width = UnicodeWidthChar::width(*c).unwrap_or(1);
@@ -2766,7 +2883,9 @@ fn render_editor_line(
             // 선택 영역 하이라이트 (원본 인덱스 기준)
             if let Some((sel_start, sel_end)) = line_selection {
                 if orig_idx >= sel_start && orig_idx < sel_end {
-                    style = style.bg(theme.editor.selection_bg).fg(theme.editor.selection_text);
+                    style = style
+                        .bg(theme.editor.selection_bg)
+                        .fg(theme.editor.selection_text);
                 }
             }
 
@@ -2791,7 +2910,9 @@ fn render_editor_line(
             // 커서 하이라이트 (visual column 기준)
             if is_cursor_line && char_visual_start == cursor_visual && state.selection.is_none() {
                 if in_find_mode {
-                    style = Style::default().fg(theme.editor.text).bg(theme.editor.footer_bg);
+                    style = Style::default()
+                        .fg(theme.editor.text)
+                        .bg(theme.editor.footer_bg);
                 } else {
                     style = theme.selected_style();
                 }
@@ -2817,7 +2938,9 @@ fn render_editor_line(
     if is_cursor_line && state.cursor_col >= orig_chars.len() && state.selection.is_none() {
         if cursor_visual >= view_start && cursor_visual < view_end {
             let cursor_style = if in_find_mode {
-                Style::default().fg(theme.editor.text).bg(theme.editor.footer_bg)
+                Style::default()
+                    .fg(theme.editor.text)
+                    .bg(theme.editor.footer_bg)
             } else {
                 theme.selected_style()
             };
@@ -2829,7 +2952,9 @@ fn render_editor_line(
         // 빈 줄에 커서 표시 (수평 스크롤이 0일 때만)
         if is_cursor_line && state.selection.is_none() && horizontal_scroll == 0 {
             let cursor_style = if in_find_mode {
-                Style::default().fg(theme.editor.text).bg(theme.status_bar.bg)
+                Style::default()
+                    .fg(theme.editor.text)
+                    .bg(theme.status_bar.bg)
             } else {
                 theme.selected_style()
             };
@@ -2975,22 +3100,30 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                     state.replace_cursor_pos = state.replace_input.chars().count();
                 }
             }
-            KeyCode::Char('c') | KeyCode::Char('C') if modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('c') | KeyCode::Char('C')
+                if modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 state.find_options.case_sensitive = !state.find_options.case_sensitive;
                 state.find_term = state.find_input.clone();
                 state.perform_find();
             }
-            KeyCode::Char('r') | KeyCode::Char('R') if modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('r') | KeyCode::Char('R')
+                if modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 state.find_options.use_regex = !state.find_options.use_regex;
                 state.find_term = state.find_input.clone();
                 state.perform_find();
             }
-            KeyCode::Char('w') | KeyCode::Char('W') if modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('w') | KeyCode::Char('W')
+                if modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 state.find_options.whole_word = !state.find_options.whole_word;
                 state.find_term = state.find_input.clone();
                 state.perform_find();
             }
-            KeyCode::Char('a') | KeyCode::Char('A') if modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('a') | KeyCode::Char('A')
+                if modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 // 모두 바꾸기
                 if state.find_mode == FindReplaceMode::Replace {
                     state.find_term = state.find_input.clone();
@@ -3038,9 +3171,10 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
             EditorAction::Save => {
                 let save_result = state.save_file();
                 let is_settings = App::is_settings_file(&state.file_path);
-                let remote_info = state.remote_origin.as_ref().map(|o| {
-                    (o.panel_index, o.remote_path.clone())
-                });
+                let remote_info = state
+                    .remote_origin
+                    .as_ref()
+                    .map(|o| (o.panel_index, o.remote_path.clone()));
                 let local_path = state.file_path.display().to_string();
                 match save_result {
                     Ok(_) => {
@@ -3064,9 +3198,16 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                             editor.set_message("Saved locally, remote upload busy".to_string(), 50);
                         }
                     } else {
-                        let is_connected = app.panels.get(panel_idx)
+                        let is_connected = app
+                            .panels
+                            .get(panel_idx)
                             .and_then(|p| p.remote_ctx.as_ref())
-                            .map(|ctx| matches!(ctx.status, crate::services::remote::ConnectionStatus::Connected))
+                            .map(|ctx| {
+                                matches!(
+                                    ctx.status,
+                                    crate::services::remote::ConnectionStatus::Connected
+                                )
+                            })
                             .unwrap_or(false);
 
                         if is_connected {
@@ -3074,9 +3215,15 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                                 Some(ctx) => ctx,
                                 None => {
                                     if let Some(ref mut editor) = app.editor_state {
-                                        editor.set_message("Saved locally, remote connection was disconnected".to_string(), 50);
+                                        editor.set_message(
+                                            "Saved locally, remote connection was disconnected"
+                                                .to_string(),
+                                            50,
+                                        );
                                     }
-                                    if is_settings { app.reload_settings(); }
+                                    if is_settings {
+                                        app.reload_settings();
+                                    }
                                     app.refresh_panels();
                                     return;
                                 }
@@ -3105,7 +3252,12 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                                 receiver: rx,
                             });
                         } else {
-                            let msg = if app.panels.get(panel_idx).and_then(|p| p.remote_ctx.as_ref()).is_some() {
+                            let msg = if app
+                                .panels
+                                .get(panel_idx)
+                                .and_then(|p| p.remote_ctx.as_ref())
+                                .is_some()
+                            {
                                 "Saved locally, remote connection lost".to_string()
                             } else {
                                 "Saved locally, remote connection was disconnected".to_string()
@@ -3262,7 +3414,13 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                         state.pending_exit = true;
                         let exit_key = app.keybindings.editor_first_key(EditorAction::Exit);
                         let save_key = app.keybindings.editor_first_key(EditorAction::Save);
-                        state.set_message(format!("Unsaved changes! Press {} again to discard, {} to save", exit_key, save_key), 60);
+                        state.set_message(
+                            format!(
+                                "Unsaved changes! Press {} again to discard, {} to save",
+                                exit_key, save_key
+                            ),
+                            60,
+                        );
                     }
                 } else {
                     // 변경사항 없으면 바로 종료

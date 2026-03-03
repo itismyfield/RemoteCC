@@ -1,35 +1,35 @@
-mod ui;
-mod services;
-mod utils;
 mod config;
-mod keybindings;
 mod enc;
+mod keybindings;
+mod services;
+mod ui;
+mod utils;
 
-use std::io;
-use std::env;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyModifiers,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use ratatui::{backend::CrosstermBackend, Terminal};
+use std::env;
+use std::io;
 use std::time::Duration;
-use ratatui::{
-    backend::CrosstermBackend,
-    Terminal,
-};
 
-use crate::ui::app::{App, Screen};
-use crate::services::claude;
-use crate::utils::markdown::{render_markdown, MarkdownTheme, is_line_empty};
 use crate::keybindings::PanelAction;
+use crate::services::claude;
+use crate::ui::app::{App, Screen};
+use crate::utils::markdown::{is_line_empty, render_markdown, MarkdownTheme};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn print_help() {
-    println!("cokacdir {} - Multi-panel terminal file manager", VERSION);
+    println!("RemoteCC {} - Multi-panel terminal file manager", VERSION);
     println!();
     println!("USAGE:");
-    println!("    cokacdir [OPTIONS] [PATH...]");
+    println!("    remotecc [OPTIONS] [PATH...]");
     println!();
     println!("ARGS:");
     println!("    [PATH...]               Open panels at given paths (max 10)");
@@ -40,22 +40,21 @@ fn print_help() {
     println!("    --prompt <TEXT>         Send prompt to AI and print rendered response");
     println!("    --design                Enable theme hot-reload (for theme development)");
     println!("    --base64 <TEXT>         Decode base64 and print (internal use)");
-    println!("    --ccserver <TOKEN>...   Start Telegram bot server(s)");
-    println!("    --sendfile <PATH> --chat <ID> --key <HASH>");
-    println!("                            Send file via Telegram bot (internal use, HASH = token hash)");
-    println!("    --dcserver <TOKEN> [--webui PORT]");
-    println!("                            Start Discord bot server (optionally with web UI)");
+    println!("    --dcserver <TOKEN>      Start Discord bot server");
     println!("    --discord-sendfile <PATH> --channel <ID> --key <HASH>");
-    println!("                            Send file via Discord bot (internal use, HASH = token hash)");
-    println!("    --webui [PORT]          Start web UI server (default port: 3333)");
+    println!(
+        "                            Send file via Discord bot (internal use, HASH = token hash)"
+    );
     println!("    --ismcptool <TOOL>...    Check if MCP tool(s) are registered in .claude/settings.json (CWD)");
-    println!("    --addmcptool <TOOL>...   Add MCP tool permission(s) to .claude/settings.json (CWD)");
+    println!(
+        "    --addmcptool <TOOL>...   Add MCP tool permission(s) to .claude/settings.json (CWD)"
+    );
     println!();
-    println!("HOMEPAGE: https://cokacdir.cokac.com");
+    println!("HOMEPAGE: https://github.com/itismyfield/RemoteCC");
 }
 
 fn handle_base64(encoded: &str) {
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
     match BASE64.decode(encoded) {
         Ok(decoded) => {
             if let Ok(text) = String::from_utf8(decoded) {
@@ -70,72 +69,23 @@ fn handle_base64(encoded: &str) {
     }
 }
 
-fn handle_sendfile(path: &str, chat_id: i64, hash_key: &str) {
-    use md5::{Md5, Digest};
-
-    let file_path = std::path::Path::new(path);
-    if !file_path.exists() {
-        eprintln!("Error: file not found: {}", path);
-        std::process::exit(1);
-    }
-
-    let abs_path = match file_path.canonicalize() {
-        Ok(p) => p.to_string_lossy().to_string(),
-        Err(e) => {
-            eprintln!("Error: failed to resolve path: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    // Create upload queue directory
-    let queue_dir = match dirs::home_dir() {
-        Some(h) => h.join(".cokacdir").join("upload_queue"),
-        None => {
-            eprintln!("Error: cannot determine home directory");
-            std::process::exit(1);
-        }
-    };
-    if let Err(e) = std::fs::create_dir_all(&queue_dir) {
-        eprintln!("Error: failed to create queue directory: {}", e);
-        std::process::exit(1);
-    }
-
-    // Generate queue filename: YYYY-MM-DD-hh-mm-ii-ss-mmm.{MD5}.queue
-    let now = chrono::Local::now();
-    let timestamp = now.format("%Y-%m-%d-%H-%M-%S").to_string();
-    let millis = now.format("%3f").to_string();
-    let md5_hash = format!("{:x}", Md5::digest(abs_path.as_bytes()));
-    let filename = format!("{}-{}.{}.queue", timestamp, millis, md5_hash);
-
-    // Write queue file
-    let queue_content = serde_json::json!({
-        "path": abs_path,
-        "chat_id": chat_id,
-        "key": hash_key,
-    });
-    let queue_path = queue_dir.join(&filename);
-    match std::fs::write(&queue_path, queue_content.to_string()) {
-        Ok(_) => println!("Queued for upload: {}", abs_path),
-        Err(e) => {
-            eprintln!("Error: failed to write queue file: {}", e);
-            std::process::exit(1);
-        }
-    }
-}
-
 fn handle_ismcptool(tool_names: &[String]) {
     let cwd = std::env::current_dir().expect("Cannot determine current directory");
     let settings_path = cwd.join(".claude").join("settings.json");
 
     let allow_list: Vec<String> = if settings_path.exists() {
-        let content = std::fs::read_to_string(&settings_path)
-            .expect("Failed to read .claude/settings.json");
-        let json: serde_json::Value = serde_json::from_str(&content)
-            .expect("Failed to parse .claude/settings.json");
+        let content =
+            std::fs::read_to_string(&settings_path).expect("Failed to read .claude/settings.json");
+        let json: serde_json::Value =
+            serde_json::from_str(&content).expect("Failed to parse .claude/settings.json");
         json.get("permissions")
             .and_then(|p| p.get("allow"))
             .and_then(|a| a.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default()
     } else {
         Vec::new()
@@ -156,21 +106,24 @@ fn handle_addmcptool(tool_names: &[String]) {
 
     // Read existing file or start with empty object
     let mut json: serde_json::Value = if settings_path.exists() {
-        let content = std::fs::read_to_string(&settings_path)
-            .expect("Failed to read .claude/settings.json");
-        serde_json::from_str(&content)
-            .expect("Failed to parse .claude/settings.json")
+        let content =
+            std::fs::read_to_string(&settings_path).expect("Failed to read .claude/settings.json");
+        serde_json::from_str(&content).expect("Failed to parse .claude/settings.json")
     } else {
         let _ = std::fs::create_dir_all(settings_path.parent().unwrap());
         serde_json::json!({})
     };
 
-    let obj = json.as_object_mut().expect("settings.json is not a JSON object");
+    let obj = json
+        .as_object_mut()
+        .expect("settings.json is not a JSON object");
 
     // Add tool to permissions.allow array
-    let permissions = obj.entry("permissions")
+    let permissions = obj
+        .entry("permissions")
         .or_insert_with(|| serde_json::json!({}));
-    let allow = permissions.as_object_mut()
+    let allow = permissions
+        .as_object_mut()
         .expect("permissions is not an object")
         .entry("allow")
         .or_insert_with(|| serde_json::json!([]));
@@ -180,7 +133,9 @@ fn handle_addmcptool(tool_names: &[String]) {
     let mut added = Vec::new();
     let mut skipped = Vec::new();
     for tool_name in tool_names {
-        let already_exists = allow_arr.iter().any(|v| v.as_str() == Some(tool_name.as_str()));
+        let already_exists = allow_arr
+            .iter()
+            .any(|v| v.as_str() == Some(tool_name.as_str()));
         if already_exists {
             skipped.push(tool_name.as_str());
         } else {
@@ -202,26 +157,13 @@ fn handle_addmcptool(tool_names: &[String]) {
 }
 
 fn print_version() {
-    println!("cokacdir {}", VERSION);
+    println!("RemoteCC {}", VERSION);
 }
 
-fn handle_webui(port: u16) {
+fn handle_dcserver(token: String) {
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 
-    let title = format!("  cokacdir v{}  |  Web UI Server  ", VERSION);
-    let width = title.chars().count();
-    println!();
-    println!("  ┌{}┐", "─".repeat(width));
-    println!("  │{}│", title);
-    println!("  └{}┘", "─".repeat(width));
-    println!();
-    rt.block_on(services::webui::run_webui(port));
-}
-
-fn handle_dcserver(token: String, webui_port: Option<u16>) {
-    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
-
-    let title = format!("  cokacdir v{}  |  Discord Bot Server  ", VERSION);
+    let title = format!("  RemoteCC v{}  |  Discord Bot Server  ", VERSION);
     let width = title.chars().count();
     println!();
     println!("  ┌{}┐", "─".repeat(width));
@@ -231,10 +173,6 @@ fn handle_dcserver(token: String, webui_port: Option<u16>) {
     println!("  ▸ Status : Connecting...");
 
     rt.block_on(async {
-        // Start web UI as background task if requested
-        if let Some(port) = webui_port {
-            tokio::spawn(services::webui::run_webui(port));
-        }
         println!();
         services::discord::run_bot(&token).await;
     });
@@ -245,7 +183,10 @@ fn handle_discord_sendfile(path: &str, channel_id: u64, hash_key: &str) {
     let token = match resolve_discord_token_by_hash(hash_key) {
         Some(t) => t,
         None => {
-            eprintln!("Error: no Discord bot token found for hash key: {}", hash_key);
+            eprintln!(
+                "Error: no Discord bot token found for hash key: {}",
+                hash_key
+            );
             std::process::exit(1);
         }
     };
@@ -259,41 +200,6 @@ fn handle_discord_sendfile(path: &str, channel_id: u64, hash_key: &str) {
             }
         }
     });
-}
-
-fn handle_ccserver(tokens: Vec<String>) {
-    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
-
-    let title = format!("  cokacdir v{}  |  Telegram Bot Server  ", VERSION);
-    let width = title.chars().count();
-    println!();
-    println!("  ┌{}┐", "─".repeat(width));
-    println!("  │{}│", title);
-    println!("  └{}┘", "─".repeat(width));
-    println!();
-
-    if tokens.len() == 1 {
-        println!("  ▸ Bot instance : 1");
-        println!("  ▸ Status       : Connecting...");
-        println!();
-        rt.block_on(services::telegram::run_bot(&tokens[0]));
-    } else {
-        println!("  ▸ Bot instances : {}", tokens.len());
-        println!("  ▸ Status        : Connecting...");
-        println!();
-        rt.block_on(async {
-            let mut handles = Vec::new();
-            for (i, token) in tokens.into_iter().enumerate() {
-                handles.push(tokio::spawn(async move {
-                    println!("  ✓ Bot #{} connected", i + 1);
-                    services::telegram::run_bot(&token).await;
-                }));
-            }
-            for handle in handles {
-                let _ = handle.await;
-            }
-        });
-    }
 }
 
 fn handle_prompt(prompt: &str) {
@@ -313,7 +219,12 @@ fn handle_prompt(prompt: &str) {
     let response = claude::execute_command(prompt, None, &current_dir, None);
 
     if !response.success {
-        eprintln!("Error: {}", response.error.unwrap_or_else(|| "Unknown error".to_string()));
+        eprintln!(
+            "Error: {}",
+            response
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string())
+        );
         return;
     }
 
@@ -337,9 +248,7 @@ fn handle_prompt(prompt: &str) {
             }
             prev_was_empty = true;
         } else {
-            let content: String = line.spans.iter()
-                .map(|s| s.content.as_ref())
-                .collect();
+            let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
             println!("{}", content);
             prev_was_empty = false;
         }
@@ -368,7 +277,25 @@ fn normalize_consecutive_empty_lines(text: &str) -> String {
     result_lines.join("\n")
 }
 
+fn migrate_config_dir() {
+    if let Some(home) = dirs::home_dir() {
+        let old_dir = home.join(".cokacdir");
+        let new_dir = home.join(".remotecc");
+        if old_dir.exists() && !new_dir.exists() {
+            if let Err(e) = std::fs::rename(&old_dir, &new_dir) {
+                eprintln!(
+                    "Warning: failed to migrate ~/.cokacdir to ~/.remotecc: {}",
+                    e
+                );
+            }
+        }
+    }
+}
+
 fn main() -> io::Result<()> {
+    // Migrate config directory from old name
+    migrate_config_dir();
+
     // Handle command line arguments
     let args: Vec<String> = env::args().collect();
     let mut design_mode = false;
@@ -388,7 +315,7 @@ fn main() -> io::Result<()> {
             "--prompt" => {
                 if i + 1 >= args.len() {
                     eprintln!("Error: --prompt requires a text argument");
-                    eprintln!("Usage: cokacdir --prompt \"your question\"");
+                    eprintln!("Usage: remotecc --prompt \"your question\"");
                     return Ok(());
                 }
                 handle_prompt(&args[i + 1]);
@@ -401,44 +328,14 @@ fn main() -> io::Result<()> {
                 handle_base64(&args[i + 1]);
                 return Ok(());
             }
-            "--ccserver" => {
-                let tokens: Vec<String> = args[i + 1..].iter()
-                    .filter(|a| !a.starts_with('-'))
-                    .cloned()
-                    .collect();
-                if tokens.is_empty() {
-                    eprintln!("Error: --ccserver requires at least one token argument");
-                    eprintln!("Usage: cokacdir --ccserver <TOKEN> [TOKEN2] ...");
-                    return Ok(());
-                }
-                handle_ccserver(tokens);
-                return Ok(());
-            }
-            "--webui" => {
-                let port = if i + 1 < args.len() && !args[i + 1].starts_with('-') {
-                    args[i + 1].parse::<u16>().unwrap_or(3333)
-                } else {
-                    3333
-                };
-                handle_webui(port);
-                return Ok(());
-            }
             "--dcserver" => {
                 if i + 1 >= args.len() {
                     eprintln!("Error: --dcserver requires a token argument");
-                    eprintln!("Usage: cokacdir --dcserver <TOKEN> [--webui PORT]");
+                    eprintln!("Usage: remotecc --dcserver <TOKEN>");
                     return Ok(());
                 }
                 let token = args[i + 1].clone();
-                // Check for --webui flag after token
-                let webui_port = args.iter().position(|a| a == "--webui").and_then(|idx| {
-                    if idx + 1 < args.len() && !args[idx + 1].starts_with('-') {
-                        args[idx + 1].parse::<u16>().ok()
-                    } else {
-                        Some(3333)
-                    }
-                });
-                handle_dcserver(token, webui_port);
+                handle_dcserver(token);
                 return Ok(());
             }
             "--discord-sendfile" => {
@@ -469,7 +366,9 @@ fn main() -> io::Result<()> {
                             file_path = Some(args[j].clone());
                             j += 1;
                         }
-                        _ => { j += 1; }
+                        _ => {
+                            j += 1;
+                        }
                     }
                 }
                 match (file_path, channel_id, key) {
@@ -478,77 +377,92 @@ fn main() -> io::Result<()> {
                     }
                     _ => {
                         eprintln!("Error: --discord-sendfile requires <PATH>, --channel <ID>, and --key <HASH>");
-                        eprintln!("Usage: cokacdir --discord-sendfile <PATH> --channel <ID> --key <HASH>");
-                    }
-                }
-                return Ok(());
-            }
-            "--sendfile" => {
-                // Parse: --sendfile <PATH> --chat <ID> --key <TOKEN>
-                let mut file_path: Option<String> = None;
-                let mut chat_id: Option<i64> = None;
-                let mut key: Option<String> = None;
-                let mut j = i + 1;
-                while j < args.len() {
-                    match args[j].as_str() {
-                        "--chat" => {
-                            if j + 1 < args.len() {
-                                chat_id = args[j + 1].parse().ok();
-                                j += 2;
-                            } else {
-                                j += 1;
-                            }
-                        }
-                        "--key" => {
-                            if j + 1 < args.len() {
-                                key = Some(args[j + 1].clone());
-                                j += 2;
-                            } else {
-                                j += 1;
-                            }
-                        }
-                        _ if file_path.is_none() && !args[j].starts_with("--") => {
-                            file_path = Some(args[j].clone());
-                            j += 1;
-                        }
-                        _ => { j += 1; }
-                    }
-                }
-                match (file_path, chat_id, key) {
-                    (Some(fp), Some(cid), Some(k)) => {
-                        handle_sendfile(&fp, cid, &k);
-                    }
-                    _ => {
-                        eprintln!("Error: --sendfile requires <PATH>, --chat <ID>, and --key <HASH>");
-                        eprintln!("Usage: cokacdir --sendfile <PATH> --chat <ID> --key <HASH>");
+                        eprintln!(
+                            "Usage: remotecc --discord-sendfile <PATH> --channel <ID> --key <HASH>"
+                        );
                     }
                 }
                 return Ok(());
             }
             "--ismcptool" => {
-                let tool_names: Vec<String> = args[i + 1..].iter()
+                let tool_names: Vec<String> = args[i + 1..]
+                    .iter()
                     .take_while(|a| !a.starts_with('-'))
                     .cloned()
                     .collect();
                 if tool_names.is_empty() {
                     eprintln!("Error: --ismcptool requires at least one tool name");
-                    eprintln!("Usage: cokacdir --ismcptool \"TOOL1\" \"TOOL2\" ...");
+                    eprintln!("Usage: remotecc --ismcptool \"TOOL1\" \"TOOL2\" ...");
                     return Ok(());
                 }
                 handle_ismcptool(&tool_names);
                 return Ok(());
             }
             "--addmcptool" => {
-                let tool_names: Vec<String> = args[i + 1..].iter()
+                let tool_names: Vec<String> = args[i + 1..]
+                    .iter()
                     .take_while(|a| !a.starts_with('-'))
                     .cloned()
                     .collect();
                 if tool_names.is_empty() {
                     eprintln!("Error: --addmcptool requires at least one tool name");
-                    eprintln!("Usage: cokacdir --addmcptool \"TOOL1\" \"TOOL2\" ...");
+                    eprintln!("Usage: remotecc --addmcptool \"TOOL1\" \"TOOL2\" ...");
                     return Ok(());
                 }
                 handle_addmcptool(&tool_names);
+                return Ok(());
+            }
+            "--tmux-wrapper" => {
+                // Internal: runs inside tmux session as bidirectional Claude wrapper
+                // Usage: remotecc --tmux-wrapper --output-file <PATH> --input-fifo <PATH> --prompt-file <PATH> --cwd <PATH> -- <claude-cmd...>
+                let mut output_file: Option<String> = None;
+                let mut input_fifo: Option<String> = None;
+                let mut prompt_file: Option<String> = None;
+                let mut cwd: Option<String> = None;
+                let mut claude_cmd: Vec<String> = Vec::new();
+                let mut j = i + 1;
+                let mut after_separator = false;
+                while j < args.len() {
+                    if after_separator {
+                        claude_cmd.push(args[j].clone());
+                        j += 1;
+                        continue;
+                    }
+                    match args[j].as_str() {
+                        "--" => {
+                            after_separator = true;
+                            j += 1;
+                        }
+                        "--output-file" => {
+                            output_file = args.get(j + 1).cloned();
+                            j += 2;
+                        }
+                        "--input-fifo" => {
+                            input_fifo = args.get(j + 1).cloned();
+                            j += 2;
+                        }
+                        "--prompt-file" => {
+                            prompt_file = args.get(j + 1).cloned();
+                            j += 2;
+                        }
+                        "--cwd" => {
+                            cwd = args.get(j + 1).cloned();
+                            j += 2;
+                        }
+                        _ => {
+                            j += 1;
+                        }
+                    }
+                }
+                match (output_file, input_fifo, prompt_file) {
+                    (Some(of), Some(inf), Some(pf)) => {
+                        let wd = cwd.unwrap_or_else(|| ".".to_string());
+                        services::tmux_wrapper::run(&of, &inf, &pf, &wd, &claude_cmd);
+                    }
+                    _ => {
+                        eprintln!("Error: --tmux-wrapper requires --output-file, --input-fifo, and --prompt-file");
+                    }
+                }
                 return Ok(());
             }
             "--design" => {
@@ -565,7 +479,9 @@ fn main() -> io::Result<()> {
                 let resolved = if p.is_absolute() {
                     p
                 } else {
-                    env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/")).join(p)
+                    env::current_dir()
+                        .unwrap_or_else(|_| std::path::PathBuf::from("/"))
+                        .join(p)
                 };
                 start_paths.push(resolved);
             }
@@ -676,11 +592,11 @@ fn print_goodbye_message() {
     // Check for updates
     check_for_updates();
 
-    println!("Thank you for using COKACDIR! 🙏");
+    println!("Thank you for using RemoteCC! 🙏");
     println!();
     println!("If you found this useful, consider checking out my other content:");
     println!("  📺 YouTube: https://www.youtube.com/@코드깎는노인");
-    println!("  📚 Classes: https://cokac.com/");
+    println!("  📚 Classes: https://github.com/itismyfield/RemoteCC");
     println!();
     println!("Happy coding!");
 }
@@ -692,8 +608,9 @@ fn check_for_updates() {
     let output = std::process::Command::new("curl")
         .args([
             "-fsSL",
-            "--max-time", "3",
-            "https://raw.githubusercontent.com/kstost/cokacdir/refs/heads/main/Cargo.toml"
+            "--max-time",
+            "3",
+            "https://raw.githubusercontent.com/itismyfield/RemoteCC/refs/heads/main/Cargo.toml",
         ])
         .output();
 
@@ -707,12 +624,23 @@ fn check_for_updates() {
 
     if let Some(latest) = latest_version {
         if is_newer_version(&latest, current_version) {
-            println!("┌──────────────────────────────────────────────────────────────────────────┐");
-            println!("│  🚀 New version available: v{} (current: v{})                            ", latest, current_version);
-            println!("│                                                                          │");
-            println!("│  Update with:                                                            │");
-            println!("│  /bin/bash -c \"$(curl -fsSL https://cokacdir.cokac.com/install.sh)\"      │");
-            println!("└──────────────────────────────────────────────────────────────────────────┘");
+            println!(
+                "┌──────────────────────────────────────────────────────────────────────────┐"
+            );
+            println!(
+                "│  🚀 New version available: v{} (current: v{})                            ",
+                latest, current_version
+            );
+            println!(
+                "│                                                                          │"
+            );
+            println!(
+                "│  Update with:                                                            │"
+            );
+            println!("│  /bin/bash -c \"$(curl -fsSL https://github.com/itismyfield/RemoteCC/releases/latest/download/install.sh)\"      │");
+            println!(
+                "└──────────────────────────────────────────────────────────────────────────┘"
+            );
             println!();
         }
     }
@@ -736,11 +664,7 @@ fn parse_version_from_cargo_toml(content: &str) -> Option<String> {
 }
 
 fn is_newer_version(latest: &str, current: &str) -> bool {
-    let parse = |v: &str| -> Vec<u32> {
-        v.split('.')
-            .filter_map(|s| s.parse().ok())
-            .collect()
-    };
+    let parse = |v: &str| -> Vec<u32> { v.split('.').filter_map(|s| s.parse().ok()).collect() };
 
     let latest_parts = parse(latest);
     let current_parts = parse(current);
@@ -772,14 +696,31 @@ fn run_app<B: ratatui::backend::Backend>(
 
         // For AI screen, FileInfo with calculation, ImageViewer loading, diff comparing, file operation progress, or remote spinner, use fast polling
         let is_file_info_calculating = app.current_screen == Screen::FileInfo
-            && app.file_info_state.as_ref().map(|s| s.is_calculating).unwrap_or(false);
+            && app
+                .file_info_state
+                .as_ref()
+                .map(|s| s.is_calculating)
+                .unwrap_or(false);
         let is_image_loading = app.current_screen == Screen::ImageViewer
-            && app.image_viewer_state.as_ref().map(|s| s.is_loading).unwrap_or(false);
+            && app
+                .image_viewer_state
+                .as_ref()
+                .map(|s| s.is_loading)
+                .unwrap_or(false);
         let is_diff_comparing = app.current_screen == Screen::DiffScreen
-            && app.diff_state.as_ref().map(|s| s.is_comparing).unwrap_or(false);
+            && app
+                .diff_state
+                .as_ref()
+                .map(|s| s.is_comparing)
+                .unwrap_or(false);
         let is_dedup_active = app.current_screen == Screen::DedupScreen
-            && app.dedup_screen_state.as_ref().map(|s| !s.is_complete).unwrap_or(false);
-        let is_progress_active = app.file_operation_progress
+            && app
+                .dedup_screen_state
+                .as_ref()
+                .map(|s| !s.is_complete)
+                .unwrap_or(false);
+        let is_progress_active = app
+            .file_operation_progress
             .as_ref()
             .map(|p| p.is_active)
             .unwrap_or(false);
@@ -789,7 +730,12 @@ fn run_app<B: ratatui::backend::Backend>(
             Duration::from_millis(16) // ~60fps for smooth real-time updates
         } else if is_remote_spinner {
             Duration::from_millis(100) // Fast polling for spinner animation
-        } else if app.current_screen == Screen::AIScreen || app.is_ai_mode() || is_file_info_calculating || is_image_loading || is_diff_comparing {
+        } else if app.current_screen == Screen::AIScreen
+            || app.is_ai_mode()
+            || is_file_info_calculating
+            || is_image_loading
+            || is_diff_comparing
+        {
             Duration::from_millis(100) // Fast polling for spinner animation
         } else {
             Duration::from_millis(250)
@@ -852,13 +798,16 @@ fn run_app<B: ratatui::backend::Backend>(
         }
 
         // Poll for file operation progress
-        let progress_message: Option<String> = if let Some(ref mut progress) = app.file_operation_progress {
+        let progress_message: Option<String> = if let Some(ref mut progress) =
+            app.file_operation_progress
+        {
             let still_active = progress.poll();
             if !still_active {
                 // Operation completed - extract result info before releasing borrow
                 let msg = if let Some(ref result) = progress.result {
                     // Special handling for Tar - show archive name
-                    if progress.operation_type == crate::services::file_ops::FileOperationType::Tar {
+                    if progress.operation_type == crate::services::file_ops::FileOperationType::Tar
+                    {
                         if result.failure_count == 0 {
                             if let Some(ref archive_name) = app.pending_tar_archive {
                                 Some(format!("Created: {}", archive_name))
@@ -866,9 +815,14 @@ fn run_app<B: ratatui::backend::Backend>(
                                 Some(format!("Archived {} file(s)", result.success_count))
                             }
                         } else {
-                            Some(format!("Error: {}", result.last_error.as_deref().unwrap_or("Archive failed")))
+                            Some(format!(
+                                "Error: {}",
+                                result.last_error.as_deref().unwrap_or("Archive failed")
+                            ))
                         }
-                    } else if progress.operation_type == crate::services::file_ops::FileOperationType::Untar {
+                    } else if progress.operation_type
+                        == crate::services::file_ops::FileOperationType::Untar
+                    {
                         if result.failure_count == 0 {
                             if let Some(ref extract_dir) = app.pending_extract_dir {
                                 Some(format!("Extracted to: {}", extract_dir))
@@ -876,7 +830,10 @@ fn run_app<B: ratatui::backend::Backend>(
                                 Some(format!("Extracted {} file(s)", result.success_count))
                             }
                         } else {
-                            Some(format!("Error: {}", result.last_error.as_deref().unwrap_or("Extract failed")))
+                            Some(format!(
+                                "Error: {}",
+                                result.last_error.as_deref().unwrap_or("Extract failed")
+                            ))
                         }
                     } else {
                         let op_name = match progress.operation_type {
@@ -892,7 +849,8 @@ fn run_app<B: ratatui::backend::Backend>(
                         if result.failure_count == 0 {
                             Some(format!("{} {} file(s)", op_name, result.success_count))
                         } else {
-                            Some(format!("{} {}/{}. Error: {}",
+                            Some(format!(
+                                "{} {}/{}. Error: {}",
                                 op_name,
                                 result.success_count,
                                 total,
@@ -921,7 +879,9 @@ fn run_app<B: ratatui::backend::Backend>(
                 // tmp 파일 존재 확인으로 성공/실패 판단
                 let tmp_exists = match &pending {
                     crate::ui::app::PendingRemoteOpen::Editor { tmp_path, .. } => tmp_path.exists(),
-                    crate::ui::app::PendingRemoteOpen::ImageViewer { tmp_path } => tmp_path.exists(),
+                    crate::ui::app::PendingRemoteOpen::ImageViewer { tmp_path } => {
+                        tmp_path.exists()
+                    }
                 };
 
                 if !tmp_exists {
@@ -932,15 +892,20 @@ fn run_app<B: ratatui::backend::Backend>(
                     }
                 } else {
                     match pending {
-                        crate::ui::app::PendingRemoteOpen::Editor { tmp_path, panel_index, remote_path } => {
+                        crate::ui::app::PendingRemoteOpen::Editor {
+                            tmp_path,
+                            panel_index,
+                            remote_path,
+                        } => {
                             let mut editor = crate::ui::file_editor::EditorState::new();
                             editor.set_syntax_colors(app.theme.syntax);
                             match editor.load_file(&tmp_path) {
                                 Ok(_) => {
-                                    editor.remote_origin = Some(crate::ui::file_editor::RemoteEditOrigin {
-                                        panel_index,
-                                        remote_path,
-                                    });
+                                    editor.remote_origin =
+                                        Some(crate::ui::file_editor::RemoteEditOrigin {
+                                            panel_index,
+                                            remote_path,
+                                        });
                                     app.editor_state = Some(editor);
                                     app.current_screen = Screen::FileEditor;
                                 }
@@ -956,16 +921,16 @@ fn run_app<B: ratatui::backend::Backend>(
                                     dialog_type: crate::ui::app::DialogType::TrueColorWarning,
                                     input: String::new(),
                                     cursor_pos: 0,
-                                    message: "Terminal doesn't support true color. Open anyway?".to_string(),
+                                    message: "Terminal doesn't support true color. Open anyway?"
+                                        .to_string(),
                                     completion: None,
                                     selected_button: 1,
                                     selection: None,
                                     use_md5: false,
                                 });
                             } else {
-                                app.image_viewer_state = Some(
-                                    crate::ui::image_viewer::ImageViewerState::new(&tmp_path)
-                                );
+                                app.image_viewer_state =
+                                    Some(crate::ui::image_viewer::ImageViewerState::new(&tmp_path));
                                 app.current_screen = Screen::ImageViewer;
                             }
                         }
@@ -978,20 +943,35 @@ fn run_app<B: ratatui::backend::Backend>(
                 // Focus on created tar archive if applicable
                 if let Some(archive_name) = app.pending_tar_archive.take() {
                     app.refresh_panels();
-                    if let Some(idx) = app.active_panel().files.iter().position(|f| f.name == archive_name) {
+                    if let Some(idx) = app
+                        .active_panel()
+                        .files
+                        .iter()
+                        .position(|f| f.name == archive_name)
+                    {
                         app.active_panel_mut().selected_index = idx;
                     }
                 // Focus on extracted directory if applicable
                 } else if let Some(extract_dir) = app.pending_extract_dir.take() {
                     app.refresh_panels();
-                    if let Some(idx) = app.active_panel().files.iter().position(|f| f.name == extract_dir) {
+                    if let Some(idx) = app
+                        .active_panel()
+                        .files
+                        .iter()
+                        .position(|f| f.name == extract_dir)
+                    {
                         app.active_panel_mut().selected_index = idx;
                     }
                 // Focus on first pasted file (by panel's sorted order) if applicable
                 } else if let Some(paste_names) = app.pending_paste_focus.take() {
                     app.refresh_panels();
                     // Find the first file in the panel's sorted list that matches any pasted name
-                    if let Some(idx) = app.active_panel().files.iter().position(|f| paste_names.contains(&f.name)) {
+                    if let Some(idx) = app
+                        .active_panel()
+                        .files
+                        .iter()
+                        .position(|f| paste_names.contains(&f.name))
+                    {
                         app.active_panel_mut().selected_index = idx;
                     }
                 } else {
@@ -1042,7 +1022,12 @@ fn run_app<B: ratatui::backend::Backend>(
                         }
                         Screen::AIScreen => {
                             if let Some(ref mut state) = app.ai_state {
-                                if ui::ai_screen::handle_input(state, key.code, key.modifiers, &app.keybindings) {
+                                if ui::ai_screen::handle_input(
+                                    state,
+                                    key.code,
+                                    key.modifiers,
+                                    &app.keybindings,
+                                ) {
                                     // Save session to file before leaving
                                     state.save_session_to_file();
                                     app.current_screen = Screen::FilePanel;
@@ -1053,7 +1038,12 @@ fn run_app<B: ratatui::backend::Backend>(
                             }
                         }
                         Screen::SystemInfo => {
-                            if ui::system_info::handle_input(&mut app.system_info_state, key.code, key.modifiers, &app.keybindings) {
+                            if ui::system_info::handle_input(
+                                &mut app.system_info_state,
+                                key.code,
+                                key.modifiers,
+                                &app.keybindings,
+                            ) {
                                 app.current_screen = Screen::FilePanel;
                             }
                         }
@@ -1112,14 +1102,19 @@ fn run_app<B: ratatui::backend::Backend>(
                         }
                         Screen::FilePanel => {
                             // AI mode with focus on AI panel
-                            if app.is_ai_mode() && app.ai_panel_index == Some(app.active_panel_index) {
+                            if app.is_ai_mode()
+                                && app.ai_panel_index == Some(app.active_panel_index)
+                            {
                                 if let Some(ref mut state) = app.ai_state {
                                     ui::ai_screen::handle_paste(state, &text);
                                 }
                             } else if app.dialog.is_some() {
                                 ui::dialogs::handle_paste(app, &text);
                             } else if app.advanced_search_state.active {
-                                ui::advanced_search::handle_paste(&mut app.advanced_search_state, &text);
+                                ui::advanced_search::handle_paste(
+                                    &mut app.advanced_search_state,
+                                    &text,
+                                );
                             }
                         }
                         Screen::FileEditor => {
@@ -1170,7 +1165,12 @@ fn handle_panel_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> 
 
     // Handle advanced search dialog first
     if app.advanced_search_state.active {
-        if let Some(criteria) = ui::advanced_search::handle_input(&mut app.advanced_search_state, code, modifiers, &app.keybindings) {
+        if let Some(criteria) = ui::advanced_search::handle_input(
+            &mut app.advanced_search_state,
+            code,
+            modifiers,
+            &app.keybindings,
+        ) {
             app.execute_advanced_search(&criteria);
         }
         return false;
@@ -1180,7 +1180,6 @@ fn handle_panel_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> 
     if app.dialog.is_some() {
         return ui::dialogs::handle_dialog_input(app, code, modifiers);
     }
-
 
     // Look up action from keybindings
     if let Some(action) = app.keybindings.panel_action(code, modifiers) {
