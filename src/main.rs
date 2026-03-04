@@ -40,11 +40,13 @@ fn print_help() {
     println!("    --prompt <TEXT>         Send prompt to AI and print rendered response");
     println!("    --design                Enable theme hot-reload (for theme development)");
     println!("    --base64 <TEXT>         Decode base64 and print (internal use)");
-    println!("    --dcserver <TOKEN>      Start Discord bot server");
+    println!("    --dcserver [TOKEN]      Start Discord bot server (or set REMOTECC_TOKEN env)");
+    println!("    --restart-dcserver       Restart Discord bot (reads token from bot_settings.json)");
     println!("    --discord-sendfile <PATH> --channel <ID> --key <HASH>");
     println!(
         "                            Send file via Discord bot (internal use, HASH = token hash)"
     );
+    println!("    --reset-tmux             Kill all remoteCC-* tmux sessions (local + remote profiles)");
     println!("    --ismcptool <TOOL>...    Check if MCP tool(s) are registered in .claude/settings.json (CWD)");
     println!(
         "    --addmcptool <TOOL>...   Add MCP tool permission(s) to .claude/settings.json (CWD)"
@@ -160,7 +162,274 @@ fn print_version() {
     println!("RemoteCC {}", VERSION);
 }
 
+fn handle_reset_tmux() {
+    let hostname = std::process::Command::new("hostname")
+        .arg("-s")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "local".to_string());
+
+    // Kill local remoteCC-* sessions
+    println!("🧹 [{}] Cleaning remoteCC-* tmux sessions...", hostname);
+    let killed = kill_remotecc_tmux_sessions_local();
+    if killed == 0 {
+        println!("   No remoteCC-* sessions found.");
+    } else {
+        println!("   Killed {} session(s).", killed);
+    }
+
+    // Also clean /tmp/remotecc-* temp files
+    let cleaned = clean_remotecc_tmp_files();
+    if cleaned > 0 {
+        println!("   Cleaned {} temp file(s).", cleaned);
+    }
+
+    // Kill on remote profiles
+    let settings = config::Settings::load();
+    for profile in &settings.remote_profiles {
+        println!("🧹 [{}] Cleaning remoteCC-* tmux sessions...", profile.name);
+        let killed = kill_remotecc_tmux_sessions_remote(profile);
+        if killed == 0 {
+            println!("   No remoteCC-* sessions found.");
+        } else {
+            println!("   Killed {} session(s).", killed);
+        }
+    }
+
+    println!("✅ Done.");
+}
+
+fn kill_remotecc_tmux_sessions_local() -> usize {
+    let output = match std::process::Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return 0,
+    };
+
+    let mut count = 0;
+    for line in output.lines() {
+        let name = line.trim();
+        if name.starts_with("remoteCC-") {
+            if std::process::Command::new("tmux")
+                .args(["kill-session", "-t", name])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+            {
+                println!("   killed: {}", name);
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+fn clean_remotecc_tmp_files() -> usize {
+    let mut count = 0;
+    if let Ok(entries) = std::fs::read_dir("/tmp") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with("remotecc-") && (name_str.ends_with(".jsonl") || name_str.ends_with(".input") || name_str.ends_with(".prompt")) {
+                if std::fs::remove_file(entry.path()).is_ok() {
+                    count += 1;
+                }
+            }
+        }
+    }
+    count
+}
+
+fn kill_remotecc_tmux_sessions_remote(profile: &services::remote::RemoteProfile) -> usize {
+    let ssh_cmd = format!(
+        "tmux list-sessions -F '#{{session_name}}' 2>/dev/null | grep '^remoteCC-' | while read s; do tmux kill-session -t \"$s\" && echo \"killed:$s\"; done; rm -f /tmp/remotecc-*.jsonl /tmp/remotecc-*.input /tmp/remotecc-*.prompt 2>/dev/null; true"
+    );
+
+    let mut cmd = std::process::Command::new("ssh");
+    cmd.arg("-o").arg("ConnectTimeout=5")
+        .arg("-o").arg("StrictHostKeyChecking=no")
+        .arg("-p").arg(profile.port.to_string())
+        .arg(format!("{}@{}", profile.user, profile.host))
+        .arg(&ssh_cmd);
+
+    match cmd.output() {
+        Ok(o) if o.status.success() => {
+            let out = String::from_utf8_lossy(&o.stdout);
+            let mut count = 0;
+            for line in out.lines() {
+                if let Some(name) = line.strip_prefix("killed:") {
+                    println!("   killed: {}", name);
+                    count += 1;
+                }
+            }
+            count
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            if !stderr.trim().is_empty() {
+                eprintln!("   SSH error: {}", stderr.trim());
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("   SSH failed: {}", e);
+            0
+        }
+    }
+}
+
+fn handle_restart_dcserver() {
+    use services::discord::resolve_discord_token_by_hash;
+
+    // Read bot_settings.json to find stored token(s)
+    let settings_path = dirs::home_dir()
+        .map(|h| h.join(".remotecc").join("bot_settings.json"))
+        .expect("Cannot determine home directory");
+
+    let content = match std::fs::read_to_string(&settings_path) {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("Error: ~/.remotecc/bot_settings.json not found.");
+            eprintln!("Run 'remotecc --dcserver <TOKEN>' at least once first.");
+            return;
+        }
+    };
+    let json: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error parsing bot_settings.json: {}", e);
+            return;
+        }
+    };
+
+    // Find first hash key with a token
+    let obj = match json.as_object() {
+        Some(o) => o,
+        None => {
+            eprintln!("Error: bot_settings.json is not a JSON object");
+            return;
+        }
+    };
+
+    let (hash_key, token) = match obj.iter().find_map(|(k, v)| {
+        v.get("token")
+            .and_then(|t| t.as_str())
+            .map(|t| (k.clone(), t.to_string()))
+    }) {
+        Some(pair) => pair,
+        None => {
+            eprintln!("Error: no token found in bot_settings.json");
+            return;
+        }
+    };
+
+    println!("🔄 Restarting Discord bot server...");
+    println!("   Token key: {}", hash_key);
+
+    // Kill existing dcserver processes (match any binary name with --dcserver arg)
+    let pgrep_output = std::process::Command::new("pgrep")
+        .args(["-f", " --dcserver"])
+        .output();
+
+    if let Ok(output) = pgrep_output {
+        if output.status.success() {
+            let pids = String::from_utf8_lossy(&output.stdout);
+            let my_pid = std::process::id();
+            for pid_str in pids.lines() {
+                if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                    if pid != my_pid {
+                        println!("   Killing existing dcserver (PID {})", pid);
+                        let _ = std::process::Command::new("kill")
+                            .arg(pid.to_string())
+                            .status();
+                    }
+                }
+            }
+            // Wait for old process to die
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+    }
+
+    // Clean up tmux sessions
+    println!("   Cleaning remoteCC-* tmux sessions...");
+    let killed = kill_remotecc_tmux_sessions_local();
+    let cleaned = clean_remotecc_tmp_files();
+    if killed > 0 || cleaned > 0 {
+        println!("   Killed {} session(s), cleaned {} temp file(s)", killed, cleaned);
+    }
+
+    // Launch new dcserver inside tmux session "remoteCC"
+    // Write a launcher script to avoid token exposure in ps aux
+    let launcher_path = dirs::home_dir()
+        .map(|h| h.join(".remotecc").join("_launch_dcserver.sh"))
+        .expect("Cannot determine home directory");
+
+    // Use the project binary (target/release) to avoid macOS SIGKILL on ~/bin copy
+    let project_exe = std::path::PathBuf::from("/Users/itismyfield/remotecc/target/release/remotecc");
+    let exe = if project_exe.exists() {
+        project_exe.display().to_string()
+    } else {
+        std::env::current_exe()
+            .expect("Cannot determine executable path")
+            .display()
+            .to_string()
+    };
+
+    let script = format!(
+        "#!/bin/bash\nexport REMOTECC_TOKEN='{}'\nunset CLAUDECODE\nexec {} --dcserver\n",
+        token.replace('\'', "'\\''"),
+        exe
+    );
+    std::fs::write(&launcher_path, &script).expect("Failed to write launcher script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&launcher_path, std::fs::Permissions::from_mode(0o700))
+            .expect("Failed to set script permissions");
+    }
+
+    let tmux_session = "remoteCC";
+
+    // Kill existing tmux session if it exists
+    let _ = std::process::Command::new("tmux")
+        .args(["kill-session", "-t", tmux_session])
+        .output();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let child = std::process::Command::new("tmux")
+        .args(["new-session", "-d", "-s", tmux_session, launcher_path.to_str().unwrap()])
+        .spawn();
+
+    // Clean up launcher script after tmux reads it
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let _ = std::fs::remove_file(&launcher_path);
+
+    match child {
+        Ok(_) => {
+            // Verify the session exists
+            let check = std::process::Command::new("tmux")
+                .args(["has-session", "-t", tmux_session])
+                .status();
+            if check.map(|s| s.success()).unwrap_or(false) {
+                println!("✅ Discord bot started in tmux session '{}'", tmux_session);
+            } else {
+                eprintln!("❌ tmux session '{}' failed to start. Check with: tmux a -t {}", tmux_session, tmux_session);
+            }
+        }
+        Err(e) => {
+            eprintln!("❌ Failed to start tmux session: {}", e);
+        }
+    }
+}
+
 fn handle_dcserver(token: String) {
+    // Prevent CLAUDECODE from leaking into child tmux sessions
+    std::env::remove_var("CLAUDECODE");
+
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 
     let title = format!("  RemoteCC v{}  |  Discord Bot Server  ", VERSION);
@@ -329,13 +598,20 @@ fn main() -> io::Result<()> {
                 return Ok(());
             }
             "--dcserver" => {
-                if i + 1 >= args.len() {
-                    eprintln!("Error: --dcserver requires a token argument");
+                let token = if i + 1 < args.len() {
+                    args[i + 1].clone()
+                } else if let Ok(t) = std::env::var("REMOTECC_TOKEN") {
+                    t
+                } else {
+                    eprintln!("Error: --dcserver requires a token (argument or REMOTECC_TOKEN env)");
                     eprintln!("Usage: remotecc --dcserver <TOKEN>");
                     return Ok(());
-                }
-                let token = args[i + 1].clone();
+                };
                 handle_dcserver(token);
+                return Ok(());
+            }
+            "--restart-dcserver" => {
+                handle_restart_dcserver();
                 return Ok(());
             }
             "--discord-sendfile" => {
@@ -410,6 +686,10 @@ fn main() -> io::Result<()> {
                     return Ok(());
                 }
                 handle_addmcptool(&tool_names);
+                return Ok(());
+            }
+            "--reset-tmux" => {
+                handle_reset_tmux();
                 return Ok(());
             }
             "--tmux-wrapper" => {

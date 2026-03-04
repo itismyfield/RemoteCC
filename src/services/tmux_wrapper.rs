@@ -261,6 +261,55 @@ pub fn run(
     eprintln!("\x1b[90m--- Session ended ---\x1b[0m");
 }
 
+/// Extract a short human-readable detail from a tool_use content block.
+fn format_tool_detail(name: &str, item: &serde_json::Value) -> String {
+    let input = match item.get("input") {
+        Some(v) => v,
+        None => return String::new(),
+    };
+    match name {
+        "Bash" => {
+            let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            let desc = input.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            if !desc.is_empty() {
+                let truncated = if cmd.len() > 120 { &cmd[..120] } else { cmd };
+                format!("{}: `{}`", desc, truncated)
+            } else if !cmd.is_empty() {
+                let truncated = if cmd.len() > 150 { &cmd[..150] } else { cmd };
+                format!("`{}`", truncated)
+            } else {
+                String::new()
+            }
+        }
+        "Read" => input.get("file_path").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        "Write" => {
+            let fp = input.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+            let lines = input.get("content").and_then(|v| v.as_str()).map(|c| c.lines().count()).unwrap_or(0);
+            if lines > 0 { format!("{} ({} lines)", fp, lines) } else { fp.to_string() }
+        }
+        "Edit" => input.get("file_path").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        "Glob" => {
+            let pattern = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            if !path.is_empty() { format!("{} in {}", pattern, path) } else { pattern.to_string() }
+        }
+        "Grep" => {
+            let pattern = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            if !path.is_empty() { format!("\"{}\" in {}", pattern, path) } else { format!("\"{}\"", pattern) }
+        }
+        "WebSearch" => input.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        "WebFetch" => input.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        "Agent" => {
+            let desc = input.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            let agent_type = input.get("subagent_type").and_then(|v| v.as_str()).unwrap_or("");
+            if !agent_type.is_empty() { format!("[{}] {}", agent_type, desc) } else { desc.to_string() }
+        }
+        "Skill" => input.get("skill").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        _ => String::new(),
+    }
+}
+
 /// Render a stream-json line as human-readable terminal output.
 fn render_for_terminal(json_line: &str) {
     let json: serde_json::Value = match serde_json::from_str(json_line) {
@@ -295,7 +344,12 @@ fn render_for_terminal(json_line: &str) {
                         }
                         "tool_use" => {
                             let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                            eprintln!("\x1b[36m[{}]\x1b[0m", name);
+                            let detail = format_tool_detail(name, item);
+                            if detail.is_empty() {
+                                eprintln!("\x1b[36m[{}]\x1b[0m", name);
+                            } else {
+                                eprintln!("\x1b[36m[{}]\x1b[0m \x1b[90m{}\x1b[0m", name, detail);
+                            }
                         }
                         _ => {}
                     }

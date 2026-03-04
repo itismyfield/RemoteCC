@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
@@ -20,6 +20,8 @@ const DISCORD_MSG_LIMIT: usize = 2000;
 const MAX_INTERVENTIONS_PER_CHANNEL: usize = 3;
 const INTERVENTION_TTL: Duration = Duration::from_secs(10 * 60);
 const INTERVENTION_DEDUP_WINDOW: Duration = Duration::from_secs(10);
+const UPLOAD_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const UPLOAD_MAX_AGE: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 
 /// Per-channel session state
 struct DiscordSession {
@@ -131,6 +133,72 @@ fn discord_token_hash(token: &str) -> String {
 /// Path to bot settings file: ~/.remotecc/bot_settings.json
 fn bot_settings_path() -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|h| h.join(".remotecc").join("bot_settings.json"))
+}
+
+fn discord_uploads_root() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".openclaw").join("remotecc_uploads").join("discord"))
+}
+
+fn channel_upload_dir(channel_id: ChannelId) -> Option<std::path::PathBuf> {
+    discord_uploads_root().map(|p| p.join(channel_id.get().to_string()))
+}
+
+fn cleanup_old_uploads(max_age: Duration) {
+    let Some(root) = discord_uploads_root() else {
+        return;
+    };
+    if !root.exists() {
+        return;
+    }
+
+    let now = SystemTime::now();
+    let Ok(channels) = fs::read_dir(&root) else {
+        return;
+    };
+
+    for ch in channels.filter_map(|e| e.ok()) {
+        let ch_path = ch.path();
+        if !ch_path.is_dir() {
+            continue;
+        }
+
+        let Ok(files) = fs::read_dir(&ch_path) else {
+            continue;
+        };
+
+        for f in files.filter_map(|e| e.ok()) {
+            let f_path = f.path();
+            if !f_path.is_file() {
+                continue;
+            }
+
+            let should_delete = fs::metadata(&f_path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|mtime| now.duration_since(mtime).ok())
+                .map(|age| age >= max_age)
+                .unwrap_or(false);
+
+            if should_delete {
+                let _ = fs::remove_file(&f_path);
+            }
+        }
+
+        // Remove empty channel dir
+        if fs::read_dir(&ch_path)
+            .ok()
+            .map(|mut it| it.next().is_none())
+            .unwrap_or(false)
+        {
+            let _ = fs::remove_dir(&ch_path);
+        }
+    }
+}
+
+fn cleanup_channel_uploads(channel_id: ChannelId) {
+    if let Some(dir) = channel_upload_dir(channel_id) {
+        let _ = fs::remove_dir_all(dir);
+    }
 }
 
 /// Load Discord bot settings from bot_settings.json
@@ -503,6 +571,9 @@ pub async fn run_bot(token: &str) {
     let skill_count = initial_skills.len();
     println!("  ✓ Skills loaded: {skill_count}");
 
+    // Cleanup stale Discord uploads on process start
+    cleanup_old_uploads(UPLOAD_MAX_AGE);
+
     let shared = Arc::new(Mutex::new(SharedData {
         sessions: HashMap::new(),
         settings: bot_settings,
@@ -571,6 +642,14 @@ pub async fn run_bot(token: &str) {
                 let shared_for_tmux2 = shared_for_tmux.clone();
                 tokio::spawn(async move {
                     restore_tmux_watchers(&http_for_tmux, &shared_for_tmux2).await;
+                });
+
+                // Background: periodic cleanup for stale Discord upload files
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(UPLOAD_CLEANUP_INTERVAL).await;
+                        cleanup_old_uploads(UPLOAD_MAX_AGE);
+                    }
                 });
 
                 Ok(Data {
@@ -691,6 +770,15 @@ async fn handle_event(
                 return Ok(());
             }
 
+            // Ignore messages that mention other users (not directed at the bot)
+            if !new_message.mentions.is_empty() {
+                let bot_id = ctx.cache.current_user().id;
+                let mentions_others = new_message.mentions.iter().any(|u| u.id != bot_id);
+                if mentions_others {
+                    return Ok(());
+                }
+            }
+
             let user_id = new_message.author.id;
             let user_name = &new_message.author.name;
             let channel_id = new_message.channel_id;
@@ -700,7 +788,7 @@ async fn handle_event(
                 return Ok(());
             }
 
-            // Handle file attachments
+            // Handle file attachments first, then continue to text (if any)
             if !new_message.attachments.is_empty() {
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 println!(
@@ -708,7 +796,6 @@ async fn handle_event(
                     new_message.attachments.len()
                 );
                 handle_file_upload(ctx, new_message, &data.shared).await?;
-                return Ok(());
             }
 
             let text = new_message.content.trim();
@@ -1201,10 +1288,11 @@ async fn cmd_clear(ctx: Context<'_>) -> Result<(), Error> {
     {
         let mut data = ctx.data().shared.lock().await;
         if let Some(session) = data.sessions.get_mut(&channel_id) {
-            // Clean up session files on disk before clearing in-memory state
+            // Clean up ALL session files on disk (including current) when clearing
             if let Some(ref path) = session.current_path {
-                cleanup_session_files(path, session.session_id.as_deref());
+                cleanup_session_files(path, None);
             }
+            cleanup_channel_uploads(channel_id);
             session.session_id = None;
             session.history.clear();
             session.pending_uploads.clear();
@@ -1756,6 +1844,7 @@ async fn cmd_cc(
                     session.pending_interventions.clear();
                     session.cleared = true;
                 }
+                cleanup_channel_uploads(channel_id);
                 data.cancel_tokens.remove(&channel_id);
                 data.active_request_owner.remove(&channel_id);
                 data.intervention_queue.remove(&channel_id);
@@ -2113,25 +2202,47 @@ async fn handle_text_message(
 
     // Run Claude in a blocking thread
     tokio::task::spawn_blocking(move || {
-        let result = claude::execute_command_streaming(
-            &context_prompt,
-            session_id_clone.as_deref(),
-            &current_path_clone,
-            tx.clone(),
-            Some(&system_prompt_owned),
-            Some(&allowed_tools),
-            Some(cancel_token_clone),
-            remote_profile.as_ref(),
-            tmux_session_name.as_deref(),
-        );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            claude::execute_command_streaming(
+                &context_prompt,
+                session_id_clone.as_deref(),
+                &current_path_clone,
+                tx.clone(),
+                Some(&system_prompt_owned),
+                Some(&allowed_tools),
+                Some(cancel_token_clone),
+                remote_profile.as_ref(),
+                tmux_session_name.as_deref(),
+            )
+        }));
 
-        if let Err(e) = result {
-            let _ = tx.send(StreamMessage::Error {
-                message: e,
-                stdout: String::new(),
-                stderr: String::new(),
-                exit_code: None,
-            });
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                eprintln!("  [streaming] Error: {}", e);
+                let _ = tx.send(StreamMessage::Error {
+                    message: e,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: None,
+                });
+            }
+            Err(panic_info) => {
+                let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
+                    s.clone()
+                } else if let Some(s) = panic_info.downcast_ref::<&str>() {
+                    s.to_string()
+                } else {
+                    "unknown panic".to_string()
+                };
+                eprintln!("  [streaming] PANIC: {}", msg);
+                let _ = tx.send(StreamMessage::Error {
+                    message: format!("Internal error (panic): {}", msg),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: None,
+                });
+            }
         }
     });
 
@@ -2152,6 +2263,9 @@ async fn handle_text_message(
         let mut last_edit_text = String::new();
         let mut done = false;
         let mut cancelled = false;
+        let mut current_tool_line: Option<String> = None;
+        let mut last_tool_name: Option<String> = None;
+        let mut accumulated_tokens: u64 = 0;
         let mut new_session_id: Option<String> = None;
         let mut tmux_last_offset: Option<u64> = None;
         let mut spin_idx: usize = 0;
@@ -2181,13 +2295,17 @@ async fn handle_text_message(
                             }
                             StreamMessage::Text { content } => {
                                 full_response.push_str(&content);
+                                current_tool_line = None;
+                                last_tool_name = None;
                             }
                             StreamMessage::ToolUse { name, input } => {
+                                let summary = format_tool_input(&name, &input);
                                 if !is_silent {
-                                    let summary = format_tool_input(&name, &input);
                                     let ts = chrono::Local::now().format("%H:%M:%S");
                                     println!("  [{ts}]   ⚙ {name}: {}", truncate_str(&summary, 80));
                                 }
+                                current_tool_line = Some(format!("⚙ {}: {}", name, truncate_str(&summary, 120)));
+                                last_tool_name = Some(name.clone());
                                 // Ensure paragraph break between text blocks separated by tool calls
                                 if !full_response.is_empty() {
                                     let trimmed = full_response.trim_end();
@@ -2200,8 +2318,13 @@ async fn handle_text_message(
                                     let ts = chrono::Local::now().format("%H:%M:%S");
                                     println!("  [{ts}]   ✗ Error: {}", truncate_str(&content, 80));
                                 }
+                                // Keep showing last tool as "done" until next text arrives
+                                if let Some(ref tn) = last_tool_name {
+                                    let status = if is_error { "✗" } else { "✓" };
+                                    current_tool_line = Some(format!("{} {}", status, tn));
+                                }
                                 // Tool results (including errors) are only logged to console, not sent to Discord
-                                let _ = (content, is_error);
+                                let _ = content;
                             }
                             StreamMessage::TaskNotification { summary, .. } => {
                                 if !summary.is_empty() {
@@ -2234,8 +2357,11 @@ async fn handle_text_message(
                                 }
                                 done = true;
                             }
-                            StreamMessage::StatusUpdate { .. } => {
-                                // Status updates handled by external dashboard
+                            StreamMessage::StatusUpdate { input_tokens, output_tokens, .. } => {
+                                // Accumulate tokens for PCD XP reporting
+                                if let (Some(it), Some(ot)) = (input_tokens, output_tokens) {
+                                    accumulated_tokens += it + ot;
+                                }
                             }
                             StreamMessage::TmuxReady {
                                 output_path,
@@ -2295,12 +2421,14 @@ async fn handle_text_message(
             let indicator = SPINNER[spin_idx % SPINNER.len()];
             spin_idx += 1;
 
+            let tool_status = current_tool_line.as_deref().unwrap_or("Processing...");
             let display_text = if full_response.is_empty() {
-                format!("{} Processing...", indicator)
+                format!("{} {}", indicator, tool_status)
             } else {
                 let normalized = normalize_empty_lines(&full_response);
-                let truncated = truncate_str(&normalized, DISCORD_MSG_LIMIT - 30);
-                format!("{}\n\n{}", truncated, indicator)
+                let footer = format!("\n\n{} {}", indicator, tool_status);
+                let truncated = truncate_str(&normalized, DISCORD_MSG_LIMIT - footer.len() - 10);
+                format!("{}{}", truncated, footer)
             };
 
             if display_text != last_edit_text && !done {
@@ -2353,6 +2481,31 @@ async fn handle_text_message(
             if let Some(watcher) = data.tmux_watchers.get(&channel_id) {
                 *watcher.resume_offset.lock().unwrap() = Some(offset);
                 watcher.paused.store(false, Ordering::Relaxed);
+            }
+        }
+
+        // Report accumulated tokens to PCD for XP tracking
+        // Key matches hook: hostname:remoteCC-{channel_name}
+        if accumulated_tokens > 0 {
+            let tmux_name = {
+                let data = shared_owned.lock().await;
+                data.sessions.get(&channel_id)
+                    .and_then(|s| s.channel_name.as_ref())
+                    .map(|name| claude::sanitize_tmux_session_name(name))
+            };
+            if let Some(tmux_name) = tmux_name {
+                let hostname = std::process::Command::new("hostname").arg("-s").output()
+                    .ok().and_then(|o| String::from_utf8(o.stdout).ok())
+                    .map(|s| s.trim().to_string()).unwrap_or_else(|| "unknown".to_string());
+                let session_key = format!("{}:{}", hostname, tmux_name);
+                let body = format!(
+                    r#"{{"session_key":"{}","status":"idle","tokens":{}}}"#,
+                    session_key.replace('\\', "\\\\").replace('"', "\\\""),
+                    accumulated_tokens
+                );
+                let _ = reqwest::Client::new().post("http://127.0.0.1:8791/api/hook/session")
+                    .header("Content-Type", "application/json")
+                    .body(body).send().await;
             }
         }
 
@@ -2542,20 +2695,34 @@ async fn handle_file_upload(
 ) -> Result<(), Error> {
     let channel_id = msg.channel_id;
 
-    let current_path = {
+    let has_session = {
         let data = shared.lock().await;
-        data.sessions
-            .get(&channel_id)
-            .and_then(|s| s.current_path.clone())
+        data.sessions.get(&channel_id).is_some()
     };
 
-    let Some(save_dir) = current_path else {
+    if !has_session {
         rate_limit_wait(shared, channel_id).await;
         let _ = channel_id
             .say(&ctx.http, "No active session. Use `/start <path>` first.")
             .await;
         return Ok(());
+    }
+
+    let Some(save_dir) = channel_upload_dir(channel_id) else {
+        rate_limit_wait(shared, channel_id).await;
+        let _ = channel_id
+            .say(&ctx.http, "Cannot resolve upload directory.")
+            .await;
+        return Ok(());
     };
+
+    if let Err(e) = fs::create_dir_all(&save_dir) {
+        rate_limit_wait(shared, channel_id).await;
+        let _ = channel_id
+            .say(&ctx.http, format!("Failed to prepare upload directory: {}", e))
+            .await;
+        return Ok(());
+    }
 
     for attachment in &msg.attachments {
         let file_name = &attachment.filename;
@@ -2585,7 +2752,9 @@ async fn handle_file_upload(
         let safe_name = Path::new(file_name)
             .file_name()
             .unwrap_or_else(|| std::ffi::OsStr::new("uploaded_file"));
-        let dest = Path::new(&save_dir).join(safe_name);
+        let ts = chrono::Utc::now().timestamp_millis();
+        let stamped_name = format!("{}_{}", ts, safe_name.to_string_lossy());
+        let dest = save_dir.join(stamped_name);
         let file_size = buf.len();
 
         match fs::write(&dest, &buf) {
