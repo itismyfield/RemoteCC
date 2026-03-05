@@ -317,18 +317,13 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
     let mut pending: Vec<PendingWatcher> = Vec::new();
 
     for session_name in &remotecc_sessions {
-        if shared.tmux_watchers.contains_key(
-            &name_to_channel
-                .get(*session_name)
-                .map(|(id, _)| *id)
-                .unwrap_or(ChannelId::new(0)),
-        ) {
-            continue;
-        }
-
         let Some((channel_id, channel_name)) = name_to_channel.get(*session_name) else {
             continue;
         };
+
+        if shared.tmux_watchers.contains_key(channel_id) {
+            continue;
+        }
 
         let output_path = format!("/tmp/remotecc-{}.jsonl", session_name);
         if std::fs::metadata(&output_path).is_err() {
