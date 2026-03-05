@@ -179,6 +179,17 @@ pub enum StreamMessage {
     },
 }
 
+/// Result from reading a tmux output file until completion or session death.
+pub enum ReadOutputResult {
+    /// Normal completion (result event received)
+    Completed { offset: u64 },
+    /// Session died without producing a result
+    #[allow(dead_code)]
+    SessionDied { offset: u64 },
+    /// User cancelled the operation
+    Cancelled { offset: u64 },
+}
+
 /// Token for cooperative cancellation of streaming requests.
 /// Holds a flag and the child process PID so the caller can kill it externally.
 pub struct CancelToken {
@@ -1589,24 +1600,105 @@ fn execute_streaming_local_tmux(
         *token.tmux_session.lock().unwrap() = Some(tmux_session_name.to_string());
     }
 
-    // Read output file from beginning (new session)
-    let last_offset = read_output_file_until_result(
-        &output_path,
-        0,
-        sender.clone(),
-        cancel_token,
-        tmux_session_name,
-    )?;
+    // Read output file from beginning (new session), with retry on session death
+    const MAX_RETRIES: u32 = 2;
+    let mut attempt = 0u32;
 
-    // Notify caller that tmux session is ready for background monitoring
-    let _ = sender.send(StreamMessage::TmuxReady {
-        output_path,
-        input_fifo_path,
-        tmux_session_name: tmux_session_name.to_string(),
-        last_offset,
-    });
+    loop {
+        let read_result = read_output_file_until_result(
+            &output_path,
+            0,
+            sender.clone(),
+            cancel_token.clone(),
+            tmux_session_name,
+        )?;
 
-    Ok(())
+        match read_result {
+            ReadOutputResult::Completed { offset } | ReadOutputResult::Cancelled { offset } => {
+                // Normal completion or user cancel — notify caller
+                let _ = sender.send(StreamMessage::TmuxReady {
+                    output_path,
+                    input_fifo_path,
+                    tmux_session_name: tmux_session_name.to_string(),
+                    last_offset: offset,
+                });
+                return Ok(());
+            }
+            ReadOutputResult::SessionDied { .. } => {
+                attempt += 1;
+                if attempt > MAX_RETRIES {
+                    debug_log(&format!(
+                        "tmux session died {} times, giving up",
+                        attempt
+                    ));
+                    let _ = sender.send(StreamMessage::Done {
+                        result: "⚠ tmux 세션이 반복 종료되었습니다. 다시 시도해 주세요."
+                            .to_string(),
+                        session_id: None,
+                    });
+                    return Ok(());
+                }
+
+                debug_log(&format!(
+                    "tmux session died, retrying ({}/{})",
+                    attempt, MAX_RETRIES
+                ));
+
+                // Wait before retry
+                std::thread::sleep(std::time::Duration::from_secs(2));
+
+                // Kill stale session if lingering
+                let _ = Command::new("tmux")
+                    .args(["kill-session", "-t", tmux_session_name])
+                    .output();
+
+                // Clean up and recreate temp files
+                let _ = std::fs::remove_file(&output_path);
+                let _ = std::fs::remove_file(&input_fifo_path);
+                let _ = std::fs::remove_file(&prompt_path);
+
+                std::fs::write(&output_path, "")
+                    .map_err(|e| format!("Failed to recreate output file: {}", e))?;
+
+                let mkfifo = Command::new("mkfifo")
+                    .arg(&input_fifo_path)
+                    .output()
+                    .map_err(|e| format!("Failed to recreate input FIFO: {}", e))?;
+                if !mkfifo.status.success() {
+                    return Err(format!(
+                        "mkfifo failed on retry: {}",
+                        String::from_utf8_lossy(&mkfifo.stderr)
+                    ));
+                }
+
+                std::fs::write(&prompt_path, prompt)
+                    .map_err(|e| format!("Failed to rewrite prompt file: {}", e))?;
+
+                // Re-launch tmux session
+                let wrapper_cmd_retry = format!("env -u CLAUDECODE {}", wrapper_cmd);
+                let tmux_retry = Command::new("tmux")
+                    .args([
+                        "new-session",
+                        "-d",
+                        "-s",
+                        tmux_session_name,
+                        "-c",
+                        working_dir,
+                        &wrapper_cmd_retry,
+                    ])
+                    .env_remove("CLAUDECODE")
+                    .output()
+                    .map_err(|e| format!("Failed to recreate tmux session: {}", e))?;
+
+                if !tmux_retry.status.success() {
+                    let stderr = String::from_utf8_lossy(&tmux_retry.stderr);
+                    return Err(format!("tmux retry error: {}", stderr));
+                }
+
+                debug_log("tmux session re-created, retrying read...");
+            }
+        }
+    }
 }
 
 /// Send a follow-up message to an existing tmux Claude session.
@@ -1658,7 +1750,7 @@ fn send_followup_to_tmux(
     }
 
     // Read output file from the offset
-    let last_offset = read_output_file_until_result(
+    let read_result = read_output_file_until_result(
         output_path,
         start_offset,
         sender.clone(),
@@ -1666,27 +1758,39 @@ fn send_followup_to_tmux(
         tmux_session_name,
     )?;
 
-    // Notify caller that tmux session is ready for background monitoring
-    let _ = sender.send(StreamMessage::TmuxReady {
-        output_path: output_path.to_string(),
-        input_fifo_path: input_fifo_path.to_string(),
-        tmux_session_name: tmux_session_name.to_string(),
-        last_offset,
-    });
+    match read_result {
+        ReadOutputResult::Completed { offset } | ReadOutputResult::Cancelled { offset } => {
+            // Notify caller that tmux session is ready for background monitoring
+            let _ = sender.send(StreamMessage::TmuxReady {
+                output_path: output_path.to_string(),
+                input_fifo_path: input_fifo_path.to_string(),
+                tmux_session_name: tmux_session_name.to_string(),
+                last_offset: offset,
+            });
+        }
+        ReadOutputResult::SessionDied { .. } => {
+            debug_log("tmux session died during follow-up");
+            let _ = sender.send(StreamMessage::Done {
+                result: "⚠ 세션이 종료되었습니다. 새 메시지를 보내면 새 세션이 시작됩니다."
+                    .to_string(),
+                session_id: None,
+            });
+        }
+    }
 
     Ok(())
 }
 
 /// Poll-read the output file from a given offset until a "result" event is received.
 /// Uses raw File::read to handle growing file (not BufReader which caches EOF).
-/// Returns the file offset after the last read on success.
+/// Returns ReadOutputResult indicating how the read ended.
 fn read_output_file_until_result(
     output_path: &str,
     start_offset: u64,
     sender: Sender<StreamMessage>,
     cancel_token: Option<std::sync::Arc<CancelToken>>,
     tmux_session_name: &str,
-) -> Result<u64, String> {
+) -> Result<ReadOutputResult, String> {
     use std::io::{Read, Seek, SeekFrom};
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -1707,7 +1811,7 @@ fn read_output_file_until_result(
         }
         if let Some(ref token) = cancel_token {
             if token.cancelled.load(Ordering::Relaxed) {
-                return Ok(start_offset);
+                return Ok(ReadOutputResult::Cancelled { offset: start_offset });
             }
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -1729,7 +1833,7 @@ fn read_output_file_until_result(
         if let Some(ref token) = cancel_token {
             if token.cancelled.load(Ordering::Relaxed) {
                 debug_log("Cancel detected during output file read");
-                break;
+                return Ok(ReadOutputResult::Cancelled { offset: current_offset });
             }
         }
 
@@ -1766,13 +1870,13 @@ fn read_output_file_until_result(
 
                     if !process_stream_line(trimmed, &sender, &mut state) {
                         debug_log("Channel disconnected during output file read");
-                        return Ok(current_offset);
+                        return Ok(ReadOutputResult::Cancelled { offset: current_offset });
                     }
 
                     // Check if we got a result (turn complete)
                     if state.final_result.is_some() {
                         debug_log("Result received — returning from output file read");
-                        return Ok(current_offset);
+                        return Ok(ReadOutputResult::Completed { offset: current_offset });
                     }
                 }
             }
@@ -1791,15 +1895,10 @@ fn read_output_file_until_result(
             stderr: String::new(),
             exit_code: None,
         });
-    } else if state.final_result.is_none() {
-        let _ = sender.send(StreamMessage::Done {
-            result: String::new(),
-            session_id: state.last_session_id,
-        });
     }
 
-    debug_log("=== read_output_file_until_result END ===");
-    Ok(current_offset)
+    debug_log("=== read_output_file_until_result END (session died) ===");
+    Ok(ReadOutputResult::SessionDied { offset: current_offset })
 }
 
 /// Execute Claude inside a tmux session on a remote host via SSH.
