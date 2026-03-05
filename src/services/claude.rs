@@ -447,6 +447,47 @@ pub fn is_ai_supported() -> bool {
     cfg!(unix)
 }
 
+/// Execute a simple Claude CLI call with `--print` flag (no tools, text-only response).
+/// Used for short synchronous tasks like meeting participant selection.
+/// This is a blocking function — call from tokio::task::spawn_blocking.
+pub fn execute_command_simple(prompt: &str) -> Result<String, String> {
+    let claude_bin = get_claude_path().ok_or("Claude CLI not found")?;
+
+    let mut child = Command::new(claude_bin)
+        .args(["-p", "--output-format", "text"])
+        .env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "4096")
+        .env_remove("CLAUDECODE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to start Claude: {}", e))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(prompt.as_bytes());
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("Failed to read output: {}", e))?;
+
+    if output.status.success() {
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if text.is_empty() {
+            Err("Empty response from Claude".to_string())
+        } else {
+            Ok(text)
+        }
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        Err(if stderr.is_empty() {
+            format!("Process exited with code {:?}", output.status.code())
+        } else {
+            stderr
+        })
+    }
+}
+
 /// Execute a command using Claude CLI with streaming output
 /// If `system_prompt` is None, uses the default file manager system prompt.
 /// If `system_prompt` is Some(""), no system prompt is appended.
@@ -2048,9 +2089,19 @@ fn execute_streaming_remote_tmux(
 
             // Setup command: check tmux, create session if needed, report status.
             // The wrapper command is written as a script file to avoid nested shell-escaping.
+            // First block: detect and clean up stale sessions (dead pane or auth failure).
+            // Second block: proceed with FOLLOWUP or NEW as before.
             let setup_cmd = format!(
                 r#"{{ [ -f ~/.zshrc ] && source ~/.zshrc; [ -f ~/.bashrc ] && source ~/.bashrc; }} 2>/dev/null; \
                 {cd}if tmux has-session -t {name} 2>/dev/null; then \
+                    _PANE_DEAD=$(tmux list-panes -t {name} -F '#{{pane_dead}}' 2>/dev/null | head -1); \
+                    if [ "$_PANE_DEAD" = "1" ] || grep -q '"error":"authentication_failed"' {output} 2>/dev/null; then \
+                        tmux kill-session -t {name} 2>/dev/null; \
+                        pkill -f 'tail -f {output}' 2>/dev/null; \
+                        rm -f {output} {input_fifo} {script} 2>/dev/null; \
+                    fi; \
+                fi; \
+                if tmux has-session -t {name} 2>/dev/null; then \
                     echo 'FOLLOWUP'; \
                     OFFSET=$(wc -c < {output} 2>/dev/null || echo 0); \
                     echo "$OFFSET"; \

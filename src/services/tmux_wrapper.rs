@@ -158,6 +158,15 @@ pub fn run(
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
                 if json.get("type").and_then(|v| v.as_str()) == Some("result") {
                     ready_t1.store(true, Ordering::Relaxed);
+                    // Detect fatal startup errors (e.g. auth failure).
+                    // If Claude reports is_error with zero cost, it failed before
+                    // making any API call — no point keeping the session alive.
+                    let is_error = json.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let cost = json.get("total_cost_usd").and_then(|v| v.as_f64()).unwrap_or(1.0);
+                    if is_error && cost == 0.0 {
+                        eprintln!("\x1b[31m[fatal startup error — session will exit]\x1b[0m");
+                        break;
+                    }
                 }
             }
 
@@ -260,10 +269,12 @@ pub fn run(
         }
     });
 
-    // Wait for output thread (which blocks until Claude exits)
+    // Wait for output thread (which blocks until Claude exits or detects fatal error)
     let _ = output_thread.join();
 
-    // Wait for Claude process to fully exit
+    // Kill Claude if still running (handles case where output thread exited early
+    // due to fatal error while Claude is still waiting for stdin input)
+    let _ = child.kill();
     let _ = child.wait();
 
     // Clean up
