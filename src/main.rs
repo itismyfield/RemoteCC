@@ -1,5 +1,6 @@
 mod config;
 mod enc;
+mod error;
 mod keybindings;
 mod services;
 mod ui;
@@ -354,13 +355,9 @@ fn handle_restart_dcserver() {
         }
     }
 
-    // Clean up tmux sessions
-    println!("   Cleaning remoteCC-* tmux sessions...");
-    let killed = kill_remotecc_tmux_sessions_local();
-    let cleaned = clean_remotecc_tmp_files();
-    if killed > 0 || cleaned > 0 {
-        println!("   Killed {} session(s), cleaned {} temp file(s)", killed, cleaned);
-    }
+    // NOTE: We intentionally do NOT kill remoteCC-* Claude work sessions here.
+    // They will be reconnected by restore_tmux_watchers() after the new dcserver starts.
+    // Orphan sessions (channels renamed/deleted) are cleaned up inside the bot event loop.
 
     // Launch new dcserver inside tmux session "remoteCC"
     // Write a launcher script to avoid token exposure in ps aux
@@ -368,15 +365,26 @@ fn handle_restart_dcserver() {
         .map(|h| h.join(".remotecc").join("_launch_dcserver.sh"))
         .expect("Cannot determine home directory");
 
-    // Use the project binary (target/release) to avoid macOS SIGKILL on ~/bin copy
-    let project_exe = std::path::PathBuf::from("/Users/itismyfield/remotecc/target/release/remotecc");
-    let exe = if project_exe.exists() {
-        project_exe.display().to_string()
+    // Use production binary at ~/.remotecc/bin/remotecc (trunk-based: separate from build output)
+    let prod_bin = dirs::home_dir()
+        .map(|h| h.join(".remotecc").join("bin").join("remotecc"))
+        .expect("Cannot determine home directory");
+    let exe = if prod_bin.exists() {
+        prod_bin.display().to_string()
     } else {
-        std::env::current_exe()
-            .expect("Cannot determine executable path")
-            .display()
-            .to_string()
+        // Fallback: project build output or current exe
+        let project_exe = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("release")
+            .join("remotecc");
+        if project_exe.exists() {
+            project_exe.display().to_string()
+        } else {
+            std::env::current_exe()
+                .expect("Cannot determine executable path")
+                .display()
+                .to_string()
+        }
     };
 
     let script = format!(

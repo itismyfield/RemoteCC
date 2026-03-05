@@ -1,5 +1,14 @@
 You can get Rust build methods from build_manual.md file
 
+## Trunk-Based Development
+
+- **`dev` branch** = 개발 브랜치. 코드 수정은 여기서.
+- **`main` branch** = 릴리즈 트렁크. 항상 배포 가능 상태.
+- **dev 브랜치에서는 빌드/재시작 절대 금지** — 코드 수정만 한다
+- 릴리즈 플로우: `dev` → `main` 머지 → 빌드 → `~/.remotecc/bin/remotecc`에 배포 → dcserver 재시작
+- 프로덕션 바이너리: `~/.remotecc/bin/remotecc` (빌드 아웃풋 `target/release/`와 분리)
+- dcserver 재시작 시 Claude 작업 세션(remoteCC-*)은 건드리지 않음 (자동 재연결됨)
+
 ## CRITICAL: Do Not Change Design Without Permission
 
 - **NEVER change product design/UX without explicit user request**

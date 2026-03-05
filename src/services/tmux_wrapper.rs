@@ -48,10 +48,23 @@ pub fn run(
     let claude_bin = &claude_cmd[0];
     let claude_args = &claude_cmd[1..];
 
+    // Expand ~ in working_dir (Rust's current_dir doesn't handle tilde)
+    let expanded_dir = if working_dir.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            home.join(&working_dir[2..]).to_string_lossy().to_string()
+        } else {
+            working_dir.to_string()
+        }
+    } else if working_dir == "~" {
+        dirs::home_dir().map(|h| h.to_string_lossy().to_string()).unwrap_or_else(|| working_dir.to_string())
+    } else {
+        working_dir.to_string()
+    };
+
     // Spawn Claude with piped stdin (kept open for multi-turn)
     let mut child = match Command::new(claude_bin)
         .args(claude_args)
-        .current_dir(working_dir)
+        .current_dir(&expanded_dir)
         .env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "64000")
         .env("BASH_DEFAULT_TIMEOUT_MS", "86400000")
         .env("BASH_MAX_TIMEOUT_MS", "86400000")

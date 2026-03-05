@@ -1895,10 +1895,7 @@ fn execute_streaming_remote_tmux(
         }
 
         debug_log("SSH authenticated for tmux, opening channel...");
-
-        let mut channel = ssh.channel_open_session()
-            .await
-            .map_err(|e| format!("Failed to open channel: {}", e))?;
+        eprintln!("  [remote-tmux] SSH authenticated");
 
         let claude_bin = profile.claude_path.as_deref().unwrap_or("claude");
         let escaped_args: Vec<String> = args.iter().map(|a| shell_escape(a)).collect();
@@ -1915,67 +1912,110 @@ fn execute_streaming_remote_tmux(
         let input_fifo_path = format!("/tmp/remotecc-{}.input", tmux_name);
         let prompt_path = format!("/tmp/remotecc-{}.prompt", tmux_name);
 
-        // Remote command: check if tmux session exists, then create or follow-up
-        // For new sessions: create files, launch tmux, tail output file
-        // For follow-ups: get offset, write to input FIFO, tail from offset
-        let wrapper_args = format!(
-            "remotecc --tmux-wrapper --output-file {} --input-fifo {} --prompt-file {} --cwd {} -- {} {}",
-            shell_escape(&output_path),
-            shell_escape(&input_fifo_path),
-            shell_escape(&prompt_path),
-            shell_escape(&working_dir),
-            claude_bin,
-            escaped_args.join(" "),
-        );
+        // Build wrapper command parts for the launch script.
+        // We write a shell script to avoid nested shell-escaping issues with tmux.
+        let escaped_args: Vec<String> = args.iter().map(|a| shell_escape(a)).collect();
+        let script_path = format!("/tmp/remotecc-{}.sh", tmux_name);
 
-        // Build a script that handles both new and follow-up cases
-        let cmd = format!(
-            r#"{{ [ -f ~/.zshrc ] && source ~/.zshrc; [ -f ~/.bashrc ] && source ~/.bashrc; }} 2>/dev/null; \
-            {cd}if tmux has-session -t {name} 2>/dev/null; then \
-                OFFSET=$(wc -c < {output} 2>/dev/null || echo 0); \
-                cat > {input_fifo}; \
-                tail -c +$((OFFSET + 1)) -f {output} & TAIL_PID=$!; \
-                while tmux has-session -t {name} 2>/dev/null; do \
-                    if grep -q '"type":"result"' {output} 2>/dev/null; then break; fi; \
-                    sleep 0.5; \
-                done; \
-                kill $TAIL_PID 2>/dev/null; \
-            else \
-                cat > {prompt} && \
-                rm -f {output} {input_fifo} && touch {output} && mkfifo {input_fifo} && \
-                CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000 BASH_DEFAULT_TIMEOUT_MS=86400000 BASH_MAX_TIMEOUT_MS=86400000 \
-                tmux new-session -d -s {name} -c {wd} {wrapper} && \
-                tail -f {output} & TAIL_PID=$!; \
-                while tmux has-session -t {name} 2>/dev/null && ! grep -q '"type":"result"' {output} 2>/dev/null; do \
-                    sleep 0.5; \
-                done; \
-                sleep 1; \
-                kill $TAIL_PID 2>/dev/null; \
-            fi"#,
-            cd = cd_part,
-            name = shell_escape(&tmux_name),
+        // Script content: source profile for PATH, then exec the wrapper
+        let script_content = format!(
+            "#!/bin/bash\n\
+            {{ [ -f ~/.zshrc ] && source ~/.zshrc; [ -f ~/.bashrc ] && source ~/.bashrc; }} 2>/dev/null\n\
+            exec remotecc --tmux-wrapper \\\n  \
+            --output-file {output} \\\n  \
+            --input-fifo {input_fifo} \\\n  \
+            --prompt-file {prompt} \\\n  \
+            --cwd {wd} \\\n  \
+            -- {claude_bin} {claude_args}\n",
             output = shell_escape(&output_path),
             input_fifo = shell_escape(&input_fifo_path),
             prompt = shell_escape(&prompt_path),
             wd = shell_escape(&working_dir),
-            wrapper = shell_escape(&wrapper_args),
+            claude_bin = claude_bin,
+            claude_args = escaped_args.join(" "),
         );
 
-        debug_log(&format!("Remote tmux command: {}", &cmd[..cmd.len().min(500)]));
+        // Encode prompt and script as base64 to embed in command (avoids stdin/escaping issues)
+        use base64::Engine;
+        let prompt_b64 = base64::engine::general_purpose::STANDARD.encode(prompt.as_bytes());
+        let script_b64 = base64::engine::general_purpose::STANDARD.encode(script_content.as_bytes());
 
-        channel.exec(true, cmd)
-            .await
-            .map_err(|e| format!("Failed to exec command: {}", e))?;
+        // === PHASE 1: Setup channel — create/resume tmux session ===
+        let is_followup;
+        {
+            let mut setup_channel = ssh.channel_open_session()
+                .await
+                .map_err(|e| format!("Failed to open setup channel: {}", e))?;
 
-        // Send prompt to stdin
-        channel.data(&prompt.into_bytes()[..])
-            .await
-            .map_err(|e| format!("Failed to send stdin: {}", e))?;
-        channel.eof()
-            .await
-            .map_err(|e| format!("Failed to close stdin: {}", e))?;
+            // Setup command: check tmux, create session if needed, report status.
+            // The wrapper command is written as a script file to avoid nested shell-escaping.
+            let setup_cmd = format!(
+                r#"{{ [ -f ~/.zshrc ] && source ~/.zshrc; [ -f ~/.bashrc ] && source ~/.bashrc; }} 2>/dev/null; \
+                {cd}if tmux has-session -t {name} 2>/dev/null; then \
+                    echo 'FOLLOWUP'; \
+                    OFFSET=$(wc -c < {output} 2>/dev/null || echo 0); \
+                    echo "$OFFSET"; \
+                    echo '{prompt_b64}' | base64 -d > {input_fifo}; \
+                else \
+                    echo '{prompt_b64}' | base64 -d > {prompt} && \
+                    rm -f {output} {input_fifo} && touch {output} && mkfifo {input_fifo} && \
+                    echo '{script_b64}' | base64 -d > {script} && chmod +x {script} && \
+                    tmux new-session -d -s {name} {script} && \
+                    echo 'NEW' || echo 'FAILED'; \
+                fi"#,
+                cd = cd_part,
+                name = shell_escape(&tmux_name),
+                output = shell_escape(&output_path),
+                input_fifo = shell_escape(&input_fifo_path),
+                prompt = shell_escape(&prompt_path),
+                prompt_b64 = prompt_b64,
+                script_b64 = script_b64,
+                script = shell_escape(&script_path),
+            );
 
-        debug_log("Prompt sent to remote, reading output via SSH...");
+            eprintln!("  [remote-tmux] Phase 1: setup ({} bytes)...", setup_cmd.len());
+            setup_channel.exec(true, setup_cmd)
+                .await
+                .map_err(|e| format!("Failed to exec setup: {}", e))?;
+            // Close stdin immediately (not needed)
+            let _ = setup_channel.eof().await;
+
+            // Read setup response
+            let mut setup_output = Vec::new();
+            while let Some(msg) = setup_channel.wait().await {
+                if let russh::ChannelMsg::Data { ref data } = msg {
+                    setup_output.extend_from_slice(data);
+                }
+            }
+            let setup_str = String::from_utf8_lossy(&setup_output).to_string();
+            let setup_lines: Vec<&str> = setup_str.trim().lines().collect();
+            eprintln!("  [remote-tmux] Setup result: {:?}", setup_lines);
+
+            is_followup = setup_lines.first().map_or(false, |l| *l == "FOLLOWUP");
+            if setup_lines.first().map_or(true, |l| *l == "FAILED") && !is_followup {
+                return Err("Failed to create tmux session on remote".to_string());
+            }
+        }
+
+        // === PHASE 2: Streaming channel — read output via Claude directly ===
+        // Use the same proven pattern as execute_streaming_remote:
+        // run a single long-lived process whose stdout IS the data stream.
+        let mut stream_channel = ssh.channel_open_session()
+            .await
+            .map_err(|e| format!("Failed to open stream channel: {}", e))?;
+
+        // Use a simple script: source profile for PATH, then exec tail -f
+        // The 'exec' replaces the shell with tail, so tail's stdout goes directly to SSH channel.
+        let stream_cmd = format!(
+            r#"{{ [ -f ~/.zshrc ] && source ~/.zshrc; [ -f ~/.bashrc ] && source ~/.bashrc; }} 2>/dev/null; exec tail -f {output}"#,
+            output = shell_escape(&output_path),
+        );
+
+        eprintln!("  [remote-tmux] Phase 2: streaming tail -f ...");
+        stream_channel.exec(true, stream_cmd)
+            .await
+            .map_err(|e| format!("Failed to exec stream: {}", e))?;
+        let _ = stream_channel.eof().await;
 
         // Read output (same pattern as execute_streaming_remote)
         let mut line_buf = Vec::new();
@@ -1983,12 +2023,12 @@ fn execute_streaming_remote_tmux(
         let mut exit_status: Option<u32> = None;
         let mut line_state = StreamLineState::new();
 
-        while let Some(msg) = channel.wait().await {
+        while let Some(msg) = stream_channel.wait().await {
             if let Some(ref token) = cancel_token_inner {
                 if token.cancelled.load(Ordering::Relaxed) {
                     debug_log("Cancel detected — closing SSH channel");
                     ssh_cancel.store(true, Ordering::Relaxed);
-                    let _ = channel.close().await;
+                    let _ = stream_channel.close().await;
                     return Ok(());
                 }
             }
@@ -2001,13 +2041,11 @@ fn execute_streaming_remote_tmux(
                         if let Ok(line) = String::from_utf8(line_bytes) {
                             let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
                             if !process_stream_line(trimmed, &sender, &mut line_state) {
-                                debug_log("Channel disconnected, stopping remote tmux read");
-                                let _ = channel.close().await;
+                                let _ = stream_channel.close().await;
                                 return Ok(());
                             }
-                            // Stop reading after result event (turn complete)
                             if line_state.final_result.is_some() {
-                                let _ = channel.close().await;
+                                let _ = stream_channel.close().await;
                                 return Ok(());
                             }
                         }
@@ -2034,9 +2072,14 @@ fn execute_streaming_remote_tmux(
         }
 
         // Handle errors
-        let success = exit_status.map_or(true, |s| s == 0); // Allow no exit status (tail killed)
+        let stderr_msg = String::from_utf8_lossy(&stderr_buf).to_string();
+        eprintln!("  [remote-tmux] Stream ended. exit_status={:?}, stderr_len={}, tokens_in={}, has_result={}",
+            exit_status, stderr_msg.len(), line_state.accum_input_tokens, line_state.final_result.is_some());
+        if !stderr_msg.is_empty() {
+            eprintln!("  [remote-tmux] stderr: {}", &stderr_msg[..stderr_msg.len().min(500)]);
+        }
+        let success = exit_status.map_or(true, |s| s == 0);
         if line_state.stdout_error.is_some() || (!success && line_state.final_result.is_none()) {
-            let stderr_msg = String::from_utf8_lossy(&stderr_buf).to_string();
             let (message, stdout_raw) = if let Some((msg, raw)) = line_state.stdout_error {
                 (msg, raw)
             } else {
@@ -2052,6 +2095,7 @@ fn execute_streaming_remote_tmux(
         }
 
         if line_state.final_result.is_none() {
+            eprintln!("  [remote-tmux] No result received, sending empty Done");
             let _ = sender.send(StreamMessage::Done {
                 result: String::new(),
                 session_id: line_state.last_session_id,

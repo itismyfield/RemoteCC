@@ -7,27 +7,108 @@ use russh::keys::*;
 use russh::*;
 use russh_sftp::client::SftpSession as RusshSftpSession;
 
-// Obfuscation key for password storage (NOT real encryption — prevents casual viewing only)
+use crate::error::{AppError, AppResult};
+
+// Legacy XOR obfuscation key (kept for backward-compatible reading of "enc:" values)
 const OBFUSCATION_KEY: &[u8] = b"remotecc_remote_v1_key";
 
-/// Obfuscate a string for storage (XOR + base64, prefixed with "enc:")
+// Fixed app-specific salt for password storage key derivation (AES-256)
+const PASSWORD_STORAGE_SALT: &[u8; 16] = b"rmtcc_pwd_store!";
+// Fixed app-specific passphrase for password storage key derivation
+const PASSWORD_STORAGE_PASSPHRASE: &[u8] = b"remotecc_aes256_password_storage_v1";
+
+/// Encrypt a string for storage using AES-256-CBC (prefixed with "aes:")
 pub fn obfuscate(plaintext: &str) -> String {
-    let xored: Vec<u8> = plaintext
-        .as_bytes()
-        .iter()
-        .enumerate()
-        .map(|(i, b)| b ^ OBFUSCATION_KEY[i % OBFUSCATION_KEY.len()])
-        .collect();
+    use aes::Aes256;
     use base64::Engine;
+    use cbc::cipher::{BlockEncryptMut, KeyIvInit};
+    use rand::RngCore;
+
+    let key = crate::enc::crypto::derive_key(PASSWORD_STORAGE_PASSPHRASE, PASSWORD_STORAGE_SALT);
+    let mut iv = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut iv);
+
+    type Aes256CbcEnc = cbc::Encryptor<Aes256>;
+    let mut encryptor = Aes256CbcEnc::new(&key.into(), &iv.into());
+
+    let plaintext_bytes = plaintext.as_bytes();
+    // Manual PKCS7 padding
+    let pad_len = 16 - (plaintext_bytes.len() % 16);
+    let mut buf = Vec::with_capacity(plaintext_bytes.len() + pad_len);
+    buf.extend_from_slice(plaintext_bytes);
+    buf.resize(plaintext_bytes.len() + pad_len, pad_len as u8);
+
+    // Encrypt in-place using block API
+    fn to_blocks_mut(data: &mut [u8]) -> &mut [aes::Block] {
+        assert!(data.len() % 16 == 0);
+        unsafe {
+            std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut aes::Block, data.len() / 16)
+        }
+    }
+    encryptor.encrypt_blocks_mut(to_blocks_mut(&mut buf));
+
+    // Format: aes:<base64(iv + ciphertext)>
+    let mut combined = Vec::with_capacity(16 + buf.len());
+    combined.extend_from_slice(&iv);
+    combined.extend_from_slice(&buf);
     format!(
-        "enc:{}",
-        base64::engine::general_purpose::STANDARD.encode(&xored)
+        "aes:{}",
+        base64::engine::general_purpose::STANDARD.encode(&combined)
     )
 }
 
-/// Deobfuscate a stored string (reverse of obfuscate, with plaintext fallback)
+/// Decrypt a stored string. Supports "aes:" (AES-256-CBC), "enc:" (legacy XOR), and plaintext fallback.
 pub fn deobfuscate(stored: &str) -> String {
+    if let Some(encoded) = stored.strip_prefix("aes:") {
+        use aes::Aes256;
+        use base64::Engine;
+        use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+
+        if let Ok(combined) = base64::engine::general_purpose::STANDARD.decode(encoded) {
+            if combined.len() >= 32 && (combined.len() - 16) % 16 == 0 {
+                let iv: [u8; 16] = combined[..16].try_into().expect("iv slice");
+                let ciphertext = &combined[16..];
+                let key = crate::enc::crypto::derive_key(
+                    PASSWORD_STORAGE_PASSPHRASE,
+                    PASSWORD_STORAGE_SALT,
+                );
+
+                type Aes256CbcDec = cbc::Decryptor<Aes256>;
+                let mut decryptor = Aes256CbcDec::new(&key.into(), &iv.into());
+
+                let mut buf = ciphertext.to_vec();
+                fn to_blocks_mut(data: &mut [u8]) -> &mut [aes::Block] {
+                    assert!(data.len() % 16 == 0);
+                    unsafe {
+                        std::slice::from_raw_parts_mut(
+                            data.as_mut_ptr() as *mut aes::Block,
+                            data.len() / 16,
+                        )
+                    }
+                }
+                decryptor.decrypt_blocks_mut(to_blocks_mut(&mut buf));
+
+                // Remove PKCS7 padding
+                if let Some(&pad_byte) = buf.last() {
+                    let pad_len = pad_byte as usize;
+                    if pad_len >= 1
+                        && pad_len <= 16
+                        && buf.len() >= pad_len
+                        && buf[buf.len() - pad_len..].iter().all(|&b| b == pad_byte)
+                    {
+                        buf.truncate(buf.len() - pad_len);
+                        if let Ok(s) = String::from_utf8(buf) {
+                            return s;
+                        }
+                    }
+                }
+            }
+        }
+        return stored.to_string(); // AES decode failed, return as-is
+    }
+
     if let Some(encoded) = stored.strip_prefix("enc:") {
+        // Legacy XOR deobfuscation (read-only backward compatibility)
         use base64::Engine;
         if let Ok(xored) = base64::engine::general_purpose::STANDARD.decode(encoded) {
             let plain: Vec<u8> = xored
@@ -194,8 +275,8 @@ impl std::fmt::Debug for SftpSession {
 
 impl SftpSession {
     /// Connect to remote host via SSH and open SFTP channel
-    pub fn connect(profile: &RemoteProfile) -> Result<Self, String> {
-        let runtime = Runtime::new().map_err(|e| format!("Failed to create runtime: {}", e))?;
+    pub fn connect(profile: &RemoteProfile) -> AppResult<Self> {
+        let runtime = Runtime::new()?;
 
         let profile = profile.clone();
         let (ssh_handle, sftp) = runtime.block_on(async { Self::connect_async(&profile).await })?;
@@ -209,7 +290,7 @@ impl SftpSession {
 
     async fn connect_async(
         profile: &RemoteProfile,
-    ) -> Result<(client::Handle<SshHandler>, RusshSftpSession), String> {
+    ) -> AppResult<(client::Handle<SshHandler>, RusshSftpSession)> {
         let config = client::Config {
             inactivity_timeout: Some(std::time::Duration::from_secs(300)),
             keepalive_interval: Some(std::time::Duration::from_secs(30)),
@@ -223,14 +304,14 @@ impl SftpSession {
             SshHandler,
         )
         .await
-        .map_err(|e| format!("SSH connection failed: {}", e))?;
+        .map_err(|e| AppError::Ssh(format!("SSH connection failed: {}", e)))?;
 
         // Authenticate
         let auth_result = match &profile.auth {
             RemoteAuth::Password { password } => ssh
                 .authenticate_password(&profile.user, password)
                 .await
-                .map_err(|e| format!("Password auth failed: {}", e))?,
+                .map_err(|e| AppError::Ssh(format!("Password auth failed: {}", e)))?,
             RemoteAuth::KeyFile { path, passphrase } => {
                 let key_path = if path.starts_with('~') {
                     if let Some(home) = dirs::home_dir() {
@@ -244,36 +325,36 @@ impl SftpSession {
 
                 let key_pair = if let Some(pass) = passphrase {
                     russh_keys::load_secret_key(&key_path, Some(pass))
-                        .map_err(|e| format!("Failed to load key: {}", e))?
+                        .map_err(|e| AppError::Ssh(format!("Failed to load key: {}", e)))?
                 } else {
                     russh_keys::load_secret_key(&key_path, None)
-                        .map_err(|e| format!("Failed to load key: {}", e))?
+                        .map_err(|e| AppError::Ssh(format!("Failed to load key: {}", e)))?
                 };
 
                 ssh.authenticate_publickey(&profile.user, Arc::new(key_pair))
                     .await
-                    .map_err(|e| format!("Key auth failed: {}", e))?
+                    .map_err(|e| AppError::Ssh(format!("Key auth failed: {}", e)))?
             }
         };
 
         if !auth_result {
-            return Err("Authentication rejected by server".to_string());
+            return Err(AppError::Ssh("Authentication rejected by server".to_string()));
         }
 
         // Open SFTP channel
         let channel = ssh
             .channel_open_session()
             .await
-            .map_err(|e| format!("Failed to open channel: {}", e))?;
+            .map_err(|e| AppError::Ssh(format!("Failed to open channel: {}", e)))?;
 
         channel
             .request_subsystem(true, "sftp")
             .await
-            .map_err(|e| format!("Failed to request SFTP subsystem: {}", e))?;
+            .map_err(|e| AppError::Ssh(format!("Failed to request SFTP subsystem: {}", e)))?;
 
         let sftp = RusshSftpSession::new(channel.into_stream())
             .await
-            .map_err(|e| format!("Failed to init SFTP session: {}", e))?;
+            .map_err(|e| AppError::Ssh(format!("Failed to init SFTP session: {}", e)))?;
 
         Ok((ssh, sftp))
     }
@@ -284,15 +365,15 @@ impl SftpSession {
     }
 
     /// List directory contents via SFTP
-    pub fn list_dir(&self, path: &str) -> Result<Vec<SftpFileEntry>, String> {
-        let sftp = self.sftp.as_ref().ok_or("Not connected")?;
+    pub fn list_dir(&self, path: &str) -> AppResult<Vec<SftpFileEntry>> {
+        let sftp = self.sftp.as_ref().ok_or(AppError::Ssh("Not connected".to_string()))?;
         let path = path.to_string();
 
         self.runtime.block_on(async {
             let dir = sftp
                 .read_dir(&path)
                 .await
-                .map_err(|e| format!("Failed to read dir '{}': {}", path, e))?;
+                .map_err(|e| AppError::Ssh(format!("Failed to read dir '{}': {}", path, e)))?;
 
             let mut entries = Vec::new();
             for entry in dir {
@@ -332,8 +413,8 @@ impl SftpSession {
     }
 
     /// Remove file or directory via SFTP
-    pub fn remove(&self, path: &str, is_dir: bool) -> Result<(), String> {
-        let sftp = self.sftp.as_ref().ok_or("Not connected")?;
+    pub fn remove(&self, path: &str, is_dir: bool) -> AppResult<()> {
+        let sftp = self.sftp.as_ref().ok_or(AppError::Ssh("Not connected".to_string()))?;
         let path = path.to_string();
 
         self.runtime.block_on(async {
@@ -342,17 +423,17 @@ impl SftpSession {
             } else {
                 sftp.remove_file(&path)
                     .await
-                    .map_err(|e| format!("Failed to remove '{}': {}", path, e))
+                    .map_err(|e| AppError::Ssh(format!("Failed to remove '{}': {}", path, e)))
             }
         })
     }
 
     /// Recursively remove directory
-    async fn remove_dir_recursive(sftp: &RusshSftpSession, path: &str) -> Result<(), String> {
+    async fn remove_dir_recursive(sftp: &RusshSftpSession, path: &str) -> AppResult<()> {
         let entries = sftp
             .read_dir(path)
             .await
-            .map_err(|e| format!("Failed to read dir '{}': {}", path, e))?;
+            .map_err(|e| AppError::Ssh(format!("Failed to read dir '{}': {}", path, e)))?;
 
         for entry in entries {
             let name = entry.file_name();
@@ -366,43 +447,43 @@ impl SftpSession {
             } else {
                 sftp.remove_file(&child_path)
                     .await
-                    .map_err(|e| format!("Failed to remove '{}': {}", child_path, e))?;
+                    .map_err(|e| AppError::Ssh(format!("Failed to remove '{}': {}", child_path, e)))?;
             }
         }
 
         sftp.remove_dir(path)
             .await
-            .map_err(|e| format!("Failed to remove dir '{}': {}", path, e))
+            .map_err(|e| AppError::Ssh(format!("Failed to remove dir '{}': {}", path, e)))
     }
 
     /// Rename file or directory via SFTP
-    pub fn rename(&self, old_path: &str, new_path: &str) -> Result<(), String> {
-        let sftp = self.sftp.as_ref().ok_or("Not connected")?;
+    pub fn rename(&self, old_path: &str, new_path: &str) -> AppResult<()> {
+        let sftp = self.sftp.as_ref().ok_or(AppError::Ssh("Not connected".to_string()))?;
         let old = old_path.to_string();
         let new = new_path.to_string();
 
         self.runtime.block_on(async {
             sftp.rename(&old, &new)
                 .await
-                .map_err(|e| format!("Failed to rename '{}' to '{}': {}", old, new, e))
+                .map_err(|e| AppError::Ssh(format!("Failed to rename '{}' to '{}': {}", old, new, e)))
         })
     }
 
     /// Create directory via SFTP
-    pub fn mkdir(&self, path: &str) -> Result<(), String> {
-        let sftp = self.sftp.as_ref().ok_or("Not connected")?;
+    pub fn mkdir(&self, path: &str) -> AppResult<()> {
+        let sftp = self.sftp.as_ref().ok_or(AppError::Ssh("Not connected".to_string()))?;
         let path = path.to_string();
 
         self.runtime.block_on(async {
             sftp.create_dir(&path)
                 .await
-                .map_err(|e| format!("Failed to create dir '{}': {}", path, e))
+                .map_err(|e| AppError::Ssh(format!("Failed to create dir '{}': {}", path, e)))
         })
     }
 
     /// Create an empty file via SFTP
-    pub fn create_file(&self, path: &str) -> Result<(), String> {
-        let sftp = self.sftp.as_ref().ok_or("Not connected")?;
+    pub fn create_file(&self, path: &str) -> AppResult<()> {
+        let sftp = self.sftp.as_ref().ok_or(AppError::Ssh("Not connected".to_string()))?;
         let path = path.to_string();
 
         self.runtime.block_on(async {
@@ -410,14 +491,14 @@ impl SftpSession {
             let _file = sftp
                 .create(&path)
                 .await
-                .map_err(|e| format!("Failed to create file '{}': {}", path, e))?;
+                .map_err(|e| AppError::Ssh(format!("Failed to create file '{}': {}", path, e)))?;
             Ok(())
         })
     }
 
     /// Download remote file to local path via SFTP (streaming, chunked)
-    pub fn download_file(&self, remote_path: &str, local_path: &str) -> Result<u64, String> {
-        let sftp = self.sftp.as_ref().ok_or("Not connected")?;
+    pub fn download_file(&self, remote_path: &str, local_path: &str) -> AppResult<u64> {
+        let sftp = self.sftp.as_ref().ok_or(AppError::Ssh("Not connected".to_string()))?;
         let remote_path = remote_path.to_string();
         let local_path = local_path.to_string();
 
@@ -427,10 +508,9 @@ impl SftpSession {
             let mut remote_file = sftp
                 .open(&remote_path)
                 .await
-                .map_err(|e| format!("Failed to open '{}': {}", remote_path, e))?;
+                .map_err(|e| AppError::Ssh(format!("Failed to open '{}': {}", remote_path, e)))?;
 
-            let mut local_file = std::fs::File::create(&local_path)
-                .map_err(|e| format!("Failed to create '{}': {}", local_path, e))?;
+            let mut local_file = std::fs::File::create(&local_path)?;
 
             let mut buf = vec![0u8; 64 * 1024];
             let mut total = 0u64;
@@ -438,12 +518,11 @@ impl SftpSession {
                 let n = remote_file
                     .read(&mut buf)
                     .await
-                    .map_err(|e| format!("Failed to read '{}': {}", remote_path, e))?;
+                    .map_err(|e| AppError::Ssh(format!("Failed to read '{}': {}", remote_path, e)))?;
                 if n == 0 {
                     break;
                 }
-                std::io::Write::write_all(&mut local_file, &buf[..n])
-                    .map_err(|e| format!("Failed to write '{}': {}", local_path, e))?;
+                std::io::Write::write_all(&mut local_file, &buf[..n])?;
                 total += n as u64;
             }
             Ok(total)
@@ -458,11 +537,11 @@ impl SftpSession {
         file_size: u64,
         cancel_flag: &std::sync::atomic::AtomicBool,
         on_progress: F,
-    ) -> Result<u64, String>
+    ) -> AppResult<u64>
     where
         F: Fn(u64, u64),
     {
-        let sftp = self.sftp.as_ref().ok_or("Not connected")?;
+        let sftp = self.sftp.as_ref().ok_or(AppError::Ssh("Not connected".to_string()))?;
         let remote_path = remote_path.to_string();
         let local_path = local_path.to_string();
 
@@ -472,29 +551,26 @@ impl SftpSession {
             let mut remote_file = sftp
                 .open(&remote_path)
                 .await
-                .map_err(|e| format!("Failed to open '{}': {}", remote_path, e))?;
+                .map_err(|e| AppError::Ssh(format!("Failed to open '{}': {}", remote_path, e)))?;
 
-            let mut local_file = std::fs::File::create(&local_path)
-                .map_err(|e| format!("Failed to create '{}': {}", local_path, e))?;
+            let mut local_file = std::fs::File::create(&local_path)?;
 
             let mut buf = vec![0u8; 64 * 1024];
             let mut total = 0u64;
             loop {
                 if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                    // 취소 시 임시 파일 삭제
                     drop(local_file);
                     let _ = std::fs::remove_file(&local_path);
-                    return Err("Cancelled".to_string());
+                    return Err(AppError::Other("Cancelled".to_string()));
                 }
                 let n = remote_file
                     .read(&mut buf)
                     .await
-                    .map_err(|e| format!("Failed to read '{}': {}", remote_path, e))?;
+                    .map_err(|e| AppError::Ssh(format!("Failed to read '{}': {}", remote_path, e)))?;
                 if n == 0 {
                     break;
                 }
-                std::io::Write::write_all(&mut local_file, &buf[..n])
-                    .map_err(|e| format!("Failed to write '{}': {}", local_path, e))?;
+                std::io::Write::write_all(&mut local_file, &buf[..n])?;
                 total += n as u64;
                 on_progress(total, file_size);
             }
@@ -503,40 +579,38 @@ impl SftpSession {
     }
 
     /// Upload local file to remote path via SFTP (streaming, chunked)
-    pub fn upload_file(&self, local_path: &str, remote_path: &str) -> Result<u64, String> {
-        let sftp = self.sftp.as_ref().ok_or("Not connected")?;
+    pub fn upload_file(&self, local_path: &str, remote_path: &str) -> AppResult<u64> {
+        let sftp = self.sftp.as_ref().ok_or(AppError::Ssh("Not connected".to_string()))?;
         let remote_path = remote_path.to_string();
         let local_path = local_path.to_string();
 
         self.runtime.block_on(async {
             use tokio::io::AsyncWriteExt;
 
-            let mut local_file = std::fs::File::open(&local_path)
-                .map_err(|e| format!("Failed to open '{}': {}", local_path, e))?;
+            let mut local_file = std::fs::File::open(&local_path)?;
 
             let mut remote_file = sftp
                 .create(&remote_path)
                 .await
-                .map_err(|e| format!("Failed to create '{}': {}", remote_path, e))?;
+                .map_err(|e| AppError::Ssh(format!("Failed to create '{}': {}", remote_path, e)))?;
 
             let mut buf = vec![0u8; 64 * 1024];
             let mut total = 0u64;
             loop {
-                let n = std::io::Read::read(&mut local_file, &mut buf)
-                    .map_err(|e| format!("Failed to read '{}': {}", local_path, e))?;
+                let n = std::io::Read::read(&mut local_file, &mut buf)?;
                 if n == 0 {
                     break;
                 }
                 remote_file
                     .write_all(&buf[..n])
                     .await
-                    .map_err(|e| format!("Failed to write '{}': {}", remote_path, e))?;
+                    .map_err(|e| AppError::Ssh(format!("Failed to write '{}': {}", remote_path, e)))?;
                 total += n as u64;
             }
             remote_file
                 .shutdown()
                 .await
-                .map_err(|e| format!("Failed to close '{}': {}", remote_path, e))?;
+                .map_err(|e| AppError::Ssh(format!("Failed to close '{}': {}", remote_path, e)))?;
             Ok(total)
         })
     }
