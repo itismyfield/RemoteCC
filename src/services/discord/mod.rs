@@ -1,4 +1,5 @@
 mod formatting;
+mod meeting;
 mod settings;
 mod tmux;
 
@@ -129,6 +130,8 @@ pub(super) struct CoreState {
     pub(super) active_request_owner: HashMap<ChannelId, UserId>,
     /// Per-channel steering interventions collected while a request is in progress
     pub(super) intervention_queue: HashMap<ChannelId, Vec<Intervention>>,
+    /// Per-channel active meeting (one meeting per channel)
+    pub(super) active_meetings: HashMap<ChannelId, meeting::Meeting>,
 }
 
 /// Shared state for the Discord bot — split into independently-lockable groups
@@ -279,6 +282,7 @@ pub async fn run_bot(token: &str) {
             cancel_tokens: HashMap::new(),
             active_request_owner: HashMap::new(),
             intervention_queue: HashMap::new(),
+            active_meetings: HashMap::new(),
         }),
         settings: tokio::sync::RwLock::new(bot_settings),
         api_timestamps: dashmap::DashMap::new(),
@@ -517,8 +521,10 @@ async fn handle_event(
                 }
             }
 
-            // Ignore messages that look like slash commands
-            if new_message.content.starts_with('/') {
+            // Ignore messages that look like slash commands (except /meeting)
+            if new_message.content.starts_with('/')
+                && !new_message.content.starts_with("/meeting")
+            {
                 return Ok(());
             }
 
@@ -642,6 +648,22 @@ async fn handle_event(
                         .say(&ctx.http, format!("{} (queue: {})", feedback, queued_count))
                         .await;
                     return Ok(());
+                }
+            }
+
+            // Meeting commands (/meeting start|stop|status)
+            if text.starts_with("/meeting") {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!("  [{ts}] ◀ [{user_name}] Meeting cmd: {}", truncate_str(text, 60));
+                match meeting::handle_meeting_command(ctx.http.clone(), channel_id, text, &data.shared)
+                    .await
+                {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {} // not a meeting command, fall through
+                    Err(e) => {
+                        eprintln!("Meeting command error: {}", e);
+                        return Ok(());
+                    }
                 }
             }
 
