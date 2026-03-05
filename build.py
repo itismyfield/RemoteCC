@@ -167,6 +167,11 @@ Note: All tools are installed locally in builder/tools/ directory.
         action="store_true",
         help="Don't automatically install missing tools",
     )
+    other_group.add_argument(
+        "--no-deploy",
+        action="store_true",
+        help="Skip deploying built binary to ~/.remotecc/bin/",
+    )
 
     # Positional targets
     parser.add_argument(
@@ -321,7 +326,7 @@ def main() -> int:
                 return 1
 
     # Run build
-    success = run_build(config, project_root, targets, logger)
+    success = run_build(config, project_root, targets, logger, deploy=not args.no_deploy)
 
     return 0 if success else 1
 

@@ -172,6 +172,15 @@ class BuildExecutor:
                 shutil.copy2(result.binary_path, dest_path)
                 dest_path.chmod(0o755)
 
+                # Re-sign macOS binaries (cp invalidates adhoc signatures)
+                if "apple-darwin" in result.target.rust_target:
+                    subprocess.run(
+                        ["codesign", "--force", "--sign", "-", str(dest_path)],
+                        check=True,
+                        capture_output=True,
+                    )
+                    self.logger.debug(f"Re-signed {dest_path.name}")
+
                 # Get file size
                 size = dest_path.stat().st_size
                 size_str = self._format_size(size)
@@ -230,6 +239,7 @@ def run_build(
     project_root: Path,
     targets: List[str],
     logger: Logger,
+    deploy: bool = False,
 ) -> bool:
     """
     Main entry point for running builds.
@@ -239,6 +249,7 @@ def run_build(
         project_root: Path to project root
         targets: List of target specifications
         logger: Logger instance
+        deploy: If True, deploy native build to ~/.remotecc/bin/
 
     Returns:
         True if all builds succeeded
@@ -283,5 +294,32 @@ def run_build(
         copied = executor.copy_to_dist(results)
         logger.results(copied)
 
-    # Return success if all builds passed
-    return all(r.success for r in results)
+    all_success = all(r.success for r in results)
+
+    # Deploy to ~/.remotecc/bin/ if requested
+    if deploy and all_success:
+        deploy_dir = Path.home() / ".remotecc" / "bin"
+        deploy_dir.mkdir(parents=True, exist_ok=True)
+        deploy_path = deploy_dir / "remotecc"
+
+        # Find the native/macOS-arm64 binary from dist
+        dist_dir = project_root / "dist"
+        candidates = [
+            dist_dir / "remotecc-macos-aarch64",
+            dist_dir / "remotecc-macos-x86_64",
+        ]
+        source = next((c for c in candidates if c.exists()), None)
+        if source:
+            shutil.copy2(source, deploy_path)
+            deploy_path.chmod(0o755)
+            subprocess.run(
+                ["codesign", "--force", "--sign", "-", str(deploy_path)],
+                check=True,
+                capture_output=True,
+            )
+            size_str = executor._format_size(deploy_path.stat().st_size)
+            logger.success(f"Deployed to {deploy_path} ({size_str})")
+        else:
+            logger.warning("No macOS binary found in dist/ for deployment")
+
+    return all_success

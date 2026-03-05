@@ -63,6 +63,11 @@ pub(super) async fn tmux_output_watcher(
         if !alive {
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!("  [{ts}] 👁 tmux session {tmux_session_name} ended, watcher stopping");
+            // Notify Discord channel that the session has ended
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            let _ = channel_id
+                .say(&http, "⚠️ 작업 세션이 종료되었습니다. 다음 메시지를 보내면 새 세션이 시작됩니다.")
+                .await;
             break;
         }
 
@@ -253,63 +258,120 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
         _ => return, // No tmux or no sessions
     };
 
-    // Collect sessions to restore (under lock), then spawn watchers outside lock
+    let remotecc_sessions: Vec<&str> = output
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| l.starts_with("remoteCC-"))
+        .collect();
+
+    if remotecc_sessions.is_empty() {
+        return;
+    }
+
+    // Build channel name → ChannelId map from Discord API (sessions map may be empty after restart)
+    let mut name_to_channel: std::collections::HashMap<String, (ChannelId, String)> =
+        std::collections::HashMap::new();
+
+    // Try from in-memory sessions first
+    {
+        let data = shared.core.lock().await;
+        for (&ch_id, session) in &data.sessions {
+            if let Some(ref ch_name) = session.channel_name {
+                let tmux_name = claude::sanitize_tmux_session_name(ch_name);
+                name_to_channel.insert(tmux_name, (ch_id, ch_name.clone()));
+            }
+        }
+    }
+
+    // If in-memory sessions don't cover all tmux sessions, fetch from Discord API
+    let unresolved: Vec<&&str> = remotecc_sessions
+        .iter()
+        .filter(|s| !name_to_channel.contains_key(**s))
+        .collect();
+
+    if !unresolved.is_empty() {
+        // Fetch guild channels via Discord API
+        if let Ok(guilds) = http.get_guilds(None, None).await {
+            for guild_info in &guilds {
+                if let Ok(channels) = guild_info.id.channels(http).await {
+                    for (ch_id, channel) in &channels {
+                        let tmux_name = claude::sanitize_tmux_session_name(&channel.name);
+                        name_to_channel
+                            .entry(tmux_name)
+                            .or_insert((*ch_id, channel.name.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    // Collect sessions to restore
     struct PendingWatcher {
         channel_id: ChannelId,
+        channel_name: String,
         output_path: String,
         session_name: String,
         initial_offset: u64,
     }
 
-    let pending: Vec<PendingWatcher> = {
-        let data = shared.core.lock().await;
-        let mut result = Vec::new();
+    let mut pending: Vec<PendingWatcher> = Vec::new();
 
-        for session_name in output.lines() {
-            let session_name = session_name.trim();
-            if !session_name.starts_with("remoteCC-") {
-                continue;
-            }
-
-            // Find the channel that maps to this tmux session name
-            let mut found_channel: Option<ChannelId> = None;
-            for (&ch_id, session) in &data.sessions {
-                if let Some(ref ch_name) = session.channel_name {
-                    if claude::sanitize_tmux_session_name(ch_name) == session_name {
-                        found_channel = Some(ch_id);
-                        break;
-                    }
-                }
-            }
-
-            let Some(channel_id) = found_channel else {
-                continue;
-            };
-            if shared.tmux_watchers.contains_key(&channel_id) {
-                continue;
-            }
-
-            let output_path = format!("/tmp/remotecc-{}.jsonl", session_name);
-            if std::fs::metadata(&output_path).is_err() {
-                continue;
-            }
-
-            let initial_offset = std::fs::metadata(&output_path)
-                .map(|m| m.len())
-                .unwrap_or(0);
-
-            result.push(PendingWatcher {
-                channel_id,
-                output_path,
-                session_name: session_name.to_string(),
-                initial_offset,
-            });
+    for session_name in &remotecc_sessions {
+        if shared.tmux_watchers.contains_key(
+            &name_to_channel
+                .get(*session_name)
+                .map(|(id, _)| *id)
+                .unwrap_or(ChannelId::new(0)),
+        ) {
+            continue;
         }
 
-        result
-    }; // lock dropped here
+        let Some((channel_id, channel_name)) = name_to_channel.get(*session_name) else {
+            continue;
+        };
 
-    // Now spawn watchers outside the lock
+        let output_path = format!("/tmp/remotecc-{}.jsonl", session_name);
+        if std::fs::metadata(&output_path).is_err() {
+            continue;
+        }
+
+        let initial_offset = std::fs::metadata(&output_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        pending.push(PendingWatcher {
+            channel_id: *channel_id,
+            channel_name: channel_name.clone(),
+            output_path,
+            session_name: session_name.to_string(),
+            initial_offset,
+        });
+    }
+
+    // Register sessions in CoreState so cleanup_orphan_tmux_sessions recognizes them
+    if !pending.is_empty() {
+        let mut data = shared.core.lock().await;
+        for pw in &pending {
+            data.sessions
+                .entry(pw.channel_id)
+                .or_insert_with(|| super::DiscordSession {
+                    session_id: None,
+                    current_path: None,
+                    history: Vec::new(),
+                    pending_uploads: Vec::new(),
+                    pending_interventions: Vec::new(),
+                    cleared: false,
+                    channel_name: Some(pw.channel_name.clone()),
+                    category_name: None,
+                    remote_profile_name: None,
+                    channel_id: Some(pw.channel_id.get()),
+                    silent: false,
+                    last_active: tokio::time::Instant::now(),
+                });
+        }
+    }
+
+    // Spawn watchers
     for pw in pending {
         let ts = chrono::Local::now().format("%H:%M:%S");
         println!(
