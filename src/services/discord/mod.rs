@@ -88,6 +88,8 @@ pub(super) struct DiscordBotSettings {
     pub(super) owner_user_id: Option<u64>,
     /// Additional authorized user IDs (added by owner via /adduser)
     pub(super) allowed_user_ids: Vec<u64>,
+    /// Bot IDs whose messages are NOT ignored (e.g. announce bot for CEO directives)
+    pub(super) allowed_bot_ids: Vec<u64>,
 }
 
 impl Default for DiscordBotSettings {
@@ -101,6 +103,7 @@ impl Default for DiscordBotSettings {
             last_remotes: std::collections::HashMap::new(),
             owner_user_id: None,
             allowed_user_ids: Vec::new(),
+            allowed_bot_ids: Vec::new(),
         }
     }
 }
@@ -503,9 +506,15 @@ async fn handle_event(
     maybe_cleanup_sessions(&data.shared).await;
     match event {
         serenity::FullEvent::Message { new_message } => {
-            // Ignore own messages (prevent echo loops) and other bot messages
+            // Ignore bot messages, unless the bot is in the allowed_bot_ids list
             if new_message.author.bot {
-                return Ok(());
+                let allowed = {
+                    let settings = data.shared.settings.read().await;
+                    settings.allowed_bot_ids.contains(&new_message.author.id.get())
+                };
+                if !allowed {
+                    return Ok(());
+                }
             }
 
             // Ignore messages that look like slash commands

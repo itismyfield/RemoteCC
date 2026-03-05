@@ -205,12 +205,18 @@ pub(super) fn load_bot_settings(token: &str) -> DiscordBotSettings {
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
         .unwrap_or_default();
+    let allowed_bot_ids = entry
+        .get("allowed_bot_ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
+        .unwrap_or_default();
     DiscordBotSettings {
         allowed_tools: tools,
         last_sessions,
         last_remotes,
         owner_user_id,
         allowed_user_ids,
+        allowed_bot_ids,
     }
 }
 
@@ -234,6 +240,7 @@ pub(super) fn save_bot_settings(token: &str, settings: &DiscordBotSettings) {
         "last_sessions": settings.last_sessions,
         "last_remotes": settings.last_remotes,
         "allowed_user_ids": settings.allowed_user_ids,
+        "allowed_bot_ids": settings.allowed_bot_ids,
     });
     if let Some(owner_id) = settings.owner_user_id {
         entry["owner_user_id"] = serde_json::json!(owner_id);
