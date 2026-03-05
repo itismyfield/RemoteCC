@@ -344,10 +344,17 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
     }
 
     // Register sessions in CoreState so cleanup_orphan_tmux_sessions recognizes them
+    // and message handlers find an active session with current_path
     if !pending.is_empty() {
+        let settings = shared.settings.read().await;
         let mut data = shared.core.lock().await;
         for pw in &pending {
-            data.sessions
+            let channel_key = pw.channel_id.get().to_string();
+            let last_path = settings.last_sessions.get(&channel_key).cloned();
+            let remote_profile = settings.last_remotes.get(&channel_key).cloned();
+
+            let session = data
+                .sessions
                 .entry(pw.channel_id)
                 .or_insert_with(|| super::DiscordSession {
                     session_id: None,
@@ -358,11 +365,18 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
                     cleared: false,
                     channel_name: Some(pw.channel_name.clone()),
                     category_name: None,
-                    remote_profile_name: None,
+                    remote_profile_name: remote_profile,
                     channel_id: Some(pw.channel_id.get()),
                     silent: false,
                     last_active: tokio::time::Instant::now(),
                 });
+
+            // Restore current_path from saved settings so message handler accepts messages
+            if session.current_path.is_none() {
+                if let Some(path) = last_path {
+                    session.current_path = Some(path);
+                }
+            }
         }
     }
 
