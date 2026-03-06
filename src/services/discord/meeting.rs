@@ -46,6 +46,10 @@ pub(super) struct Meeting {
     pub current_round: u32,
     pub max_rounds: u32,
     pub status: MeetingStatus,
+    /// Final summary produced by the summary agent
+    pub summary: Option<String>,
+    /// Meeting start timestamp (RFC 3339)
+    pub started_at: String,
 }
 
 /// Meeting configuration from role_map.json "meeting" section
@@ -164,6 +168,8 @@ pub(super) async fn start_meeting(
                 current_round: 0,
                 max_rounds: config.max_rounds,
                 status: MeetingStatus::SelectingParticipants,
+                summary: None,
+                started_at: chrono::Local::now().to_rfc3339(),
             },
         );
     }
@@ -736,9 +742,11 @@ async fn conclude_meeting(
     let summary =
         tokio::task::spawn_blocking(move || claude::execute_command_simple(&prompt)).await;
 
-    match summary {
+    let summary_text = match summary {
         Ok(Ok(text)) => {
-            send_long_message_raw(http, channel_id, &text.trim(), shared).await?;
+            let trimmed = text.trim().to_string();
+            send_long_message_raw(http, channel_id, &trimmed, shared).await?;
+            Some(trimmed)
         }
         Ok(Err(e)) => {
             rate_limit_wait(shared, channel_id).await;
@@ -749,6 +757,7 @@ async fn conclude_meeting(
                         .content(format!("⚠️ 회의록 작성 실패: {}", e)),
                 )
                 .await;
+            None
         }
         Err(e) => {
             rate_limit_wait(shared, channel_id).await;
@@ -759,13 +768,15 @@ async fn conclude_meeting(
                         .content(format!("⚠️ 회의록 작성 실패: {}", e)),
                 )
                 .await;
+            None
         }
-    }
+    };
 
-    // Mark completed
+    // Mark completed and save summary
     {
         let mut core = shared.core.lock().await;
         if let Some(m) = core.active_meetings.get_mut(&channel_id) {
+            m.summary = summary_text;
             m.status = MeetingStatus::Completed;
         }
     }
@@ -773,75 +784,148 @@ async fn conclude_meeting(
     Ok(())
 }
 
-/// Save meeting record to ~/.remotecc/meetings/{uuid}.json
+/// Save meeting record as Obsidian Markdown to CookingHeart/meetings/
 async fn save_meeting_record(
     shared: &Arc<SharedData>,
     channel_id: ChannelId,
 ) -> Result<(), Error> {
-    let record = {
+    let (md, meeting_id, pcd_payload) = {
         let core = shared.core.lock().await;
         let m = core
             .active_meetings
             .get(&channel_id)
             .ok_or("Meeting not found")?;
 
-        let participants: Vec<serde_json::Value> = m
-            .participants
-            .iter()
-            .map(|p| {
-                serde_json::json!({
-                    "role_id": p.role_id,
-                    "display_name": p.display_name,
-                })
-            })
-            .collect();
-
-        let transcript: Vec<serde_json::Value> = m
-            .transcript
-            .iter()
-            .map(|u| {
-                serde_json::json!({
-                    "role_id": u.role_id,
-                    "display_name": u.display_name,
-                    "round": u.round,
-                    "content": u.content,
-                })
-            })
-            .collect();
-
-        let status_str = match &m.status {
-            MeetingStatus::SelectingParticipants => "selecting_participants",
-            MeetingStatus::InProgress => "in_progress",
-            MeetingStatus::Concluding => "concluding",
-            MeetingStatus::Completed => "completed",
-            MeetingStatus::Cancelled => "cancelled",
-        };
-
-        serde_json::json!({
-            "id": m.id,
-            "channel_id": m.channel_id.get().to_string(),
-            "agenda": m.agenda,
-            "participants": participants,
-            "transcript": transcript,
-            "current_round": m.current_round,
-            "max_rounds": m.max_rounds,
-            "status": status_str,
-            "timestamp": chrono::Local::now().to_rfc3339(),
-        })
+        let payload = build_pcd_payload(m);
+        (build_meeting_markdown(m), m.id.clone(), payload)
     };
 
     let meetings_dir = dirs::home_dir()
         .ok_or("Home dir not found")?
-        .join(".remotecc")
+        .join("ObsidianVault")
+        .join("CookingHeart")
         .join("meetings");
     fs::create_dir_all(&meetings_dir)?;
 
-    let id = record["id"].as_str().unwrap_or("unknown");
-    let path = meetings_dir.join(format!("{}.json", id));
-    let json_str = serde_json::to_string_pretty(&record)?;
-    fs::write(&path, json_str)?;
+    let date_str = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let path = meetings_dir.join(format!("{}_{}.md", date_str, meeting_id));
+    fs::write(&path, md)?;
+
+    // POST meeting data to PCD (fire-and-forget, ignore errors)
+    if let Some(payload) = pcd_payload {
+        tokio::spawn(async move {
+            let _ = post_meeting_to_pcd(payload).await;
+        });
+    }
 
     Ok(())
+}
+
+/// Build PCD API payload from meeting
+fn build_pcd_payload(m: &Meeting) -> Option<serde_json::Value> {
+    let status_str = match &m.status {
+        MeetingStatus::Completed => "completed",
+        MeetingStatus::Cancelled => "cancelled",
+        _ => "in_progress",
+    };
+
+    let participant_names: Vec<&str> = m.participants.iter().map(|p| p.display_name.as_str()).collect();
+
+    let entries: Vec<serde_json::Value> = m
+        .transcript
+        .iter()
+        .enumerate()
+        .map(|(i, u)| {
+            serde_json::json!({
+                "seq": i + 1,
+                "round": u.round,
+                "speaker_role_id": u.role_id,
+                "speaker_name": u.display_name,
+                "content": u.content,
+                "is_summary": false,
+            })
+        })
+        .collect();
+
+    let started_at = chrono::DateTime::parse_from_rfc3339(&m.started_at)
+        .map(|dt| dt.timestamp_millis())
+        .unwrap_or_else(|_| chrono::Local::now().timestamp_millis());
+
+    Some(serde_json::json!({
+        "id": m.id,
+        "agenda": m.agenda,
+        "summary": m.summary,
+        "status": status_str,
+        "participant_names": participant_names,
+        "total_rounds": m.current_round,
+        "started_at": started_at,
+        "completed_at": if m.status == MeetingStatus::Completed { serde_json::Value::from(chrono::Local::now().timestamp_millis()) } else { serde_json::Value::Null },
+        "entries": entries,
+    }))
+}
+
+/// POST meeting data to PCD server
+async fn post_meeting_to_pcd(payload: serde_json::Value) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    let _ = client
+        .post("http://localhost:8791/api/round-table-meetings")
+        .json(&payload)
+        .send()
+        .await?;
+    Ok(())
+}
+
+/// Build Obsidian Markdown content for a meeting
+fn build_meeting_markdown(m: &Meeting) -> String {
+    let now = chrono::Local::now();
+    let date_str = now.format("%Y-%m-%d").to_string();
+    let datetime_str = now.format("%Y-%m-%d %H:%M").to_string();
+
+    let status_str = match &m.status {
+        MeetingStatus::SelectingParticipants | MeetingStatus::InProgress => "진행중",
+        MeetingStatus::Concluding => "마무리중",
+        MeetingStatus::Completed => "완료",
+        MeetingStatus::Cancelled => "취소",
+    };
+
+    let participants_inline = m
+        .participants
+        .iter()
+        .map(|p| p.display_name.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // Build transcript grouped by rounds
+    let max_round = m.transcript.iter().map(|u| u.round).max().unwrap_or(0);
+    let mut transcript_sections = Vec::new();
+    for round in 1..=max_round {
+        let mut section = format!("### 라운드 {}\n", round);
+        for u in m.transcript.iter().filter(|u| u.round == round) {
+            section.push_str(&format!("\n**{}**\n\n{}\n", u.display_name, u.content));
+        }
+        transcript_sections.push(section);
+    }
+
+    let summary_section = m
+        .summary
+        .clone()
+        .unwrap_or_else(|| "_회의록이 작성되지 않았습니다._".to_string());
+
+    format!(
+        "---\ntags: [meeting, cookingheart]\ndate: {date}\nstatus: {status}\nparticipants: [{participants}]\nagenda: \"{agenda}\"\nmeeting_id: {id}\n---\n\n# 회의록: {agenda}\n\n> **날짜**: {datetime}\n> **참여자**: {participants}\n> **라운드**: {rounds}/{max_rounds}\n> **상태**: {status}\n\n---\n\n## 요약\n\n{summary}\n\n---\n\n## 전체 발언 기록\n\n{transcript}\n",
+        date = date_str,
+        status = status_str,
+        participants = participants_inline,
+        agenda = m.agenda,
+        id = m.id,
+        datetime = datetime_str,
+        rounds = m.current_round,
+        max_rounds = m.max_rounds,
+        summary = summary_section,
+        transcript = transcript_sections.join("\n"),
+    )
 }
 
 /// Format transcript for inclusion in prompts

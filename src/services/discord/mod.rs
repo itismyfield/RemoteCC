@@ -310,6 +310,7 @@ pub async fn run_bot(token: &str) {
                 cmd_adduser(),
                 cmd_removeuser(),
                 cmd_help(),
+                cmd_meeting(),
             ],
             event_handler: |ctx, event, _framework, data| Box::pin(handle_event(ctx, event, data)),
             ..Default::default()
@@ -521,10 +522,8 @@ async fn handle_event(
                 }
             }
 
-            // Ignore messages that look like slash commands (except /meeting)
-            if new_message.content.starts_with('/')
-                && !new_message.content.starts_with("/meeting")
-            {
+            // Ignore messages that look like slash commands
+            if new_message.content.starts_with('/') {
                 return Ok(());
             }
 
@@ -651,19 +650,13 @@ async fn handle_event(
                 }
             }
 
-            // Meeting commands (/meeting start|stop|status)
-            if text.starts_with("/meeting") {
+            // Meeting command from text (e.g. announce bot sending "/meeting start ...")
+            if text.starts_with("/meeting ") {
                 let ts = chrono::Local::now().format("%H:%M:%S");
-                println!("  [{ts}] ◀ [{user_name}] Meeting cmd: {}", truncate_str(text, 60));
-                match meeting::handle_meeting_command(ctx.http.clone(), channel_id, text, &data.shared)
-                    .await
-                {
-                    Ok(true) => return Ok(()),
-                    Ok(false) => {} // not a meeting command, fall through
-                    Err(e) => {
-                        eprintln!("Meeting command error: {}", e);
-                        return Ok(());
-                    }
+                println!("  [{ts}] ◀ [{user_name}] Meeting cmd: {text}");
+                let http = ctx.http.clone();
+                if meeting::handle_meeting_command(http, channel_id, text, &data.shared).await? {
+                    return Ok(());
                 }
             }
 
@@ -1781,6 +1774,72 @@ async fn cmd_cc(
         &ctx.data().token,
     )
     .await?;
+
+    Ok(())
+}
+
+#[poise::command(slash_command, rename = "meeting")]
+async fn cmd_meeting(
+    ctx: Context<'_>,
+    #[description = "Action: start / stop / status"] action: String,
+    #[description = "Agenda (required for start)"] agenda: Option<String>,
+) -> Result<(), Error> {
+    let user_id = ctx.author().id;
+    let user_name = &ctx.author().name;
+    if !check_auth(user_id, user_name, &ctx.data().shared, &ctx.data().token).await {
+        return Ok(());
+    }
+
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    let channel_id = ctx.channel_id();
+    let agenda_str = agenda.as_deref().unwrap_or("");
+    println!("  [{ts}] ◀ [{user_name}] /meeting {action} {agenda_str}");
+
+    ctx.defer().await?;
+
+    let http = ctx.serenity_context().http.clone();
+    let shared = ctx.data().shared.clone();
+
+    match action.as_str() {
+        "start" => {
+            let agenda_text = agenda_str.trim();
+            if agenda_text.is_empty() {
+                ctx.say("사용법: `/meeting start <안건>`").await?;
+                return Ok(());
+            }
+            let agenda_owned = agenda_text.to_string();
+            // Spawn as background task
+            tokio::spawn(async move {
+                match meeting::start_meeting(&*http, channel_id, &agenda_owned, &shared).await {
+                    Ok(id) => {
+                        let ts = chrono::Local::now().format("%H:%M:%S");
+                        println!("  [{ts}] ✅ Meeting completed: {id}");
+                    }
+                    Err(e) => {
+                        let ts = chrono::Local::now().format("%H:%M:%S");
+                        println!("  [{ts}] ❌ Meeting error: {e}");
+                        rate_limit_wait(&shared, channel_id).await;
+                        let _ = channel_id
+                            .send_message(
+                                &*http,
+                                CreateMessage::new().content(format!("❌ 회의 오류: {}", e)),
+                            )
+                            .await;
+                    }
+                }
+            });
+            ctx.say("📋 회의를 시작할게.").await?;
+        }
+        "stop" => {
+            meeting::cancel_meeting(&*http, channel_id, &shared).await?;
+        }
+        "status" => {
+            meeting::meeting_status(&*http, channel_id, &shared).await?;
+        }
+        _ => {
+            ctx.say("사용법: `/meeting start|stop|status`").await?;
+        }
+    }
 
     Ok(())
 }
