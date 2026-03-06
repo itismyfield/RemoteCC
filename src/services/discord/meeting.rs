@@ -5,7 +5,8 @@ use poise::serenity_prelude as serenity;
 use rand::Rng;
 use serenity::{ChannelId, CreateMessage};
 
-use crate::services::claude;
+use crate::services::provider::ProviderKind;
+use crate::services::provider_exec;
 
 use super::formatting::send_long_message_raw;
 use super::settings::{load_role_prompt, RoleBinding};
@@ -41,6 +42,8 @@ pub(super) struct Meeting {
     pub id: String,
     pub channel_id: ChannelId,
     pub agenda: String,
+    pub primary_provider: ProviderKind,
+    pub reviewer_provider: ProviderKind,
     pub participants: Vec<MeetingParticipant>,
     pub transcript: Vec<MeetingUtterance>,
     pub current_round: u32,
@@ -71,11 +74,93 @@ pub(super) struct MeetingAgentConfig {
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct MeetingStartRequest {
+    pub primary_provider: ProviderKind,
+    pub agenda: String,
+}
+
 /// Generate a unique meeting ID (timestamp + random hex)
 fn generate_meeting_id() -> String {
     let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
     let random: u32 = rand::thread_rng().gen();
     format!("mtg-{}-{:08x}", ts, random)
+}
+
+fn parse_json_array_fragment(text: &str) -> Result<Vec<String>, String> {
+    let trimmed = text.trim();
+    let json_str = if let Some(start) = trimmed.find('[') {
+        if let Some(end) = trimmed.rfind(']') {
+            &trimmed[start..=end]
+        } else {
+            return Err("Invalid JSON array response".to_string());
+        }
+    } else {
+        return Err("No JSON array found".to_string());
+    };
+
+    serde_json::from_str(json_str).map_err(|e| format!("Failed to parse JSON array: {}", e))
+}
+
+fn truncate_for_meeting(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    trimmed.chars().take(max_chars).collect::<String>() + "..."
+}
+
+fn parse_primary_provider_arg(raw: Option<&str>, default_provider: ProviderKind) -> Result<ProviderKind, String> {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => ProviderKind::from_str(value)
+            .ok_or_else(|| format!("지원하지 않는 provider야: `{}` (`claude` 또는 `codex`만 가능)", value)),
+        None => Ok(default_provider),
+    }
+}
+
+pub(super) fn parse_meeting_start_text(
+    text: &str,
+    default_provider: ProviderKind,
+) -> Result<Option<MeetingStartRequest>, String> {
+    let Some(rest) = text.trim().strip_prefix("/meeting start ") else {
+        return Ok(None);
+    };
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return Err("사용법: `/meeting start [--primary claude|codex] <안건>`".to_string());
+    }
+
+    let mut primary_provider = default_provider;
+    let mut agenda = rest;
+
+    if let Some(after_flag) = rest.strip_prefix("--primary=") {
+        let after_flag = after_flag.trim_start();
+        let split_at = after_flag
+            .find(char::is_whitespace)
+            .unwrap_or(after_flag.len());
+        let provider_raw = after_flag[..split_at].trim();
+        let remainder = after_flag[split_at..].trim();
+        primary_provider = parse_primary_provider_arg(Some(provider_raw), default_provider)?;
+        agenda = remainder;
+    } else if let Some(after_flag) = rest.strip_prefix("--primary ") {
+        let after_flag = after_flag.trim_start();
+        let split_at = after_flag
+            .find(char::is_whitespace)
+            .unwrap_or(after_flag.len());
+        let provider_raw = after_flag[..split_at].trim();
+        let remainder = after_flag[split_at..].trim();
+        primary_provider = parse_primary_provider_arg(Some(provider_raw), default_provider)?;
+        agenda = remainder;
+    }
+
+    if agenda.trim().is_empty() {
+        return Err("사용법: `/meeting start [--primary claude|codex] <안건>`".to_string());
+    }
+
+    Ok(Some(MeetingStartRequest {
+        primary_provider,
+        agenda: agenda.trim().to_string(),
+    }))
 }
 
 // ─── Config Parsing ──────────────────────────────────────────────────────────
@@ -145,9 +230,11 @@ pub(super) async fn start_meeting(
     http: &serenity::Http,
     channel_id: ChannelId,
     agenda: &str,
+    primary_provider: ProviderKind,
     shared: &Arc<SharedData>,
 ) -> Result<String, Error> {
     let config = load_meeting_config().ok_or("Meeting config not found in role_map.json")?;
+    let reviewer_provider = primary_provider.counterpart();
 
     let meeting_id = generate_meeting_id();
 
@@ -163,6 +250,8 @@ pub(super) async fn start_meeting(
                 id: meeting_id.clone(),
                 channel_id,
                 agenda: agenda.to_string(),
+                primary_provider,
+                reviewer_provider,
                 participants: Vec::new(),
                 transcript: Vec::new(),
                 current_round: 0,
@@ -179,14 +268,16 @@ pub(super) async fn start_meeting(
         .send_message(
             http,
             CreateMessage::new().content(format!(
-                "📋 **라운드 테이블 회의 시작**\n안건: {}\n참여자 선정 중...",
-                agenda
+                "📋 **라운드 테이블 회의 시작**\n안건: {}\n진행 모델: {} / 교차검증: {}\n참여자 선정 중...",
+                agenda,
+                primary_provider.display_name(),
+                reviewer_provider.display_name()
             )),
         )
         .await;
 
-    // Select participants via Claude
-    let participants = match select_participants(&config, agenda).await {
+    // Select participants via primary provider + reviewer cross-check
+    let participants = match select_participants(&config, agenda, primary_provider, reviewer_provider).await {
         Ok(p) if !p.is_empty() => p,
         Ok(_) => {
             cleanup_meeting(shared, channel_id).await;
@@ -355,13 +446,15 @@ pub(super) async fn meeting_status(
                 m.participants.len(),
                 m.transcript.len(),
                 m.status.clone(),
+                m.primary_provider,
+                m.reviewer_provider,
             )
         })
     };
 
     rate_limit_wait(shared, channel_id).await;
     match info {
-        Some((agenda, round, max_rounds, participants, utterances, status)) => {
+        Some((agenda, round, max_rounds, participants, utterances, status, primary, reviewer)) => {
             let status_str = match status {
                 MeetingStatus::SelectingParticipants => "참여자 선정 중",
                 MeetingStatus::InProgress => "진행 중",
@@ -373,8 +466,15 @@ pub(super) async fn meeting_status(
                 .send_message(
                     http,
                     CreateMessage::new().content(format!(
-                        "📊 **회의 현황**\n안건: {}\n상태: {}\n라운드: {}/{}\n참여자: {}명\n발언: {}개",
-                        agenda, status_str, round, max_rounds, participants, utterances
+                        "📊 **회의 현황**\n안건: {}\n상태: {}\n진행 모델: {} / 교차검증: {}\n라운드: {}/{}\n참여자: {}명\n발언: {}개",
+                        agenda,
+                        status_str,
+                        primary.display_name(),
+                        reviewer.display_name(),
+                        round,
+                        max_rounds,
+                        participants,
+                        utterances
                     )),
                 )
                 .await;
@@ -390,10 +490,12 @@ pub(super) async fn meeting_status(
 
 // ─── Internal Functions ──────────────────────────────────────────────────────
 
-/// Select participants using Claude `-p --print` (no tools, quick response)
+/// Select participants using primary provider + reviewer micro cross-check.
 async fn select_participants(
     config: &MeetingConfig,
     agenda: &str,
+    primary_provider: ProviderKind,
+    reviewer_provider: ProviderKind,
 ) -> Result<Vec<MeetingParticipant>, String> {
     let agents_desc: Vec<String> = config
         .available_agents
@@ -408,7 +510,7 @@ async fn select_participants(
         })
         .collect();
 
-    let prompt = format!(
+    let selection_prompt = format!(
         r#"다음 안건에 대한 라운드 테이블 회의에 참여할 에이전트를 선정해줘.
 
 안건: {}
@@ -425,23 +527,59 @@ async fn select_participants(
         agents_desc.join("\n")
     );
 
-    let response = claude::execute_command_simple(&prompt)?;
+    let initial_response = provider_exec::execute_simple(primary_provider, selection_prompt).await?;
+    let initial_selected = parse_json_array_fragment(&initial_response)?;
 
-    // Parse JSON array from response
-    let trimmed = response.trim();
-    // Try to find JSON array in the response
-    let json_str = if let Some(start) = trimmed.find('[') {
-        if let Some(end) = trimmed.rfind(']') {
-            &trimmed[start..=end]
-        } else {
-            return Err("Invalid JSON response from participant selection".to_string());
-        }
-    } else {
-        return Err("No JSON array in participant selection response".to_string());
-    };
+    let review_prompt = format!(
+        r#"당신은 회의 참가자 선정을 비판적으로 검토하는 리뷰어다.
 
-    let selected: Vec<String> = serde_json::from_str(json_str)
-        .map_err(|e| format!("Failed to parse participant selection: {}", e))?;
+안건: {agenda}
+
+사용 가능한 에이전트:
+{agents}
+
+현재 선정안:
+{current}
+
+검토 규칙:
+- 빠진 역할, 중복 역할, 안건과의 부적합만 짚어라
+- 4개 이하 bullet만 사용하라
+- 전체를 다시 쓰지 말고, 비판적으로만 검토하라
+- 도구나 명령 실행은 하지 마라"#,
+        agenda = agenda,
+        agents = agents_desc.join("\n"),
+        current = serde_json::to_string(&initial_selected).unwrap_or_else(|_| "[]".to_string()),
+    );
+
+    let review_notes = provider_exec::execute_simple(reviewer_provider, review_prompt).await?;
+
+    let finalize_prompt = format!(
+        r#"다음 안건에 대한 회의 참가자 선정을 최종 확정해줘.
+
+안건: {agenda}
+
+사용 가능한 에이전트:
+{agents}
+
+초기 선정안:
+{initial}
+
+교차검증 리뷰:
+{review}
+
+규칙:
+- 리뷰가 타당하면 반영하고, 타당하지 않으면 유지하라
+- 최종 결과는 2~5명이어야 한다
+- JSON 배열로만 응답하라
+- 형식: ["role_id1", "role_id2", ...]"#,
+        agenda = agenda,
+        agents = agents_desc.join("\n"),
+        initial = serde_json::to_string(&initial_selected).unwrap_or_else(|_| "[]".to_string()),
+        review = review_notes.trim(),
+    );
+
+    let final_response = provider_exec::execute_simple(primary_provider, finalize_prompt).await?;
+    let selected = parse_json_array_fragment(&final_response)?;
 
     let participants: Vec<MeetingParticipant> = selected
         .iter()
@@ -458,6 +596,13 @@ async fn select_participants(
         })
         .collect();
 
+    if participants.len() < 2 || participants.len() > 5 {
+        return Err(format!(
+            "Invalid participant count after cross-check: {}",
+            participants.len()
+        ));
+    }
+
     Ok(participants)
 }
 
@@ -469,13 +614,18 @@ async fn run_meeting_round(
     shared: &Arc<SharedData>,
 ) -> Result<bool, Error> {
     // Snapshot participants and transcript for this round
-    let (participants, agenda) = {
+    let (participants, agenda, primary_provider, reviewer_provider) = {
         let core = shared.core.lock().await;
         let m = core
             .active_meetings
             .get(&channel_id)
             .ok_or("Meeting not found")?;
-        (m.participants.clone(), m.agenda.clone())
+        (
+            m.participants.clone(),
+            m.agenda.clone(),
+            m.primary_provider,
+            m.reviewer_provider,
+        )
     };
 
     for participant in &participants {
@@ -502,7 +652,16 @@ async fn run_meeting_round(
         };
 
         // Execute agent turn
-        match execute_agent_turn(participant, &agenda, round, &transcript_text).await {
+        match execute_agent_turn(
+            participant,
+            &agenda,
+            round,
+            &transcript_text,
+            primary_provider,
+            reviewer_provider,
+        )
+        .await
+        {
             Ok(response) => {
                 // Post to Discord
                 let discord_msg = format!(
@@ -551,12 +710,14 @@ async fn run_meeting_round(
     Ok(consensus)
 }
 
-/// Execute a single agent turn using Claude `-p --print`
+/// Execute a single agent turn using primary draft -> reviewer critique -> primary final.
 async fn execute_agent_turn(
     participant: &MeetingParticipant,
     agenda: &str,
     round: u32,
     transcript: &str,
+    primary_provider: ProviderKind,
+    reviewer_provider: ProviderKind,
 ) -> Result<String, String> {
     // Load role prompt if available
     let role_context = if !participant.prompt_file.is_empty() {
@@ -569,7 +730,7 @@ async fn execute_agent_turn(
         String::new()
     };
 
-    let prompt = format!(
+    let draft_prompt = format!(
         r#"당신은 라운드 테이블 회의에 참여한 {name}입니다.
 
 {role_context}
@@ -587,7 +748,8 @@ async fn execute_agent_turn(
 - 이전 발언자들의 의견을 참고하고 필요시 반론/보충하세요
 - 답변은 300자 이내로 간결하게 작성하세요
 - 합의에 도달했다고 판단되면, 반드시 "CONSENSUS:" 로 시작하는 한 줄 요약을 마지막에 추가하세요
-- 아직 논의가 더 필요하면 CONSENSUS: 키워드를 사용하지 마세요"#,
+- 아직 논의가 더 필요하면 CONSENSUS: 키워드를 사용하지 마세요
+- 도구나 명령 실행 없이 답변만 작성하세요"#,
         name = participant.display_name,
         role_context = if role_context.is_empty() {
             String::new()
@@ -603,23 +765,94 @@ async fn execute_agent_turn(
         },
     );
 
-    // Run on blocking thread since execute_command_simple is synchronous
-    let response =
-        tokio::task::spawn_blocking(move || claude::execute_command_simple(&prompt)).await;
+    let draft = provider_exec::execute_simple(primary_provider, draft_prompt).await?;
 
-    match response {
-        Ok(Ok(text)) => {
-            // Truncate if too long (2000 chars max for a single utterance)
-            let trimmed = text.trim().to_string();
-            if trimmed.chars().count() > 1500 {
-                Ok(trimmed.chars().take(1500).collect::<String>() + "...")
-            } else {
-                Ok(trimmed)
-            }
-        }
-        Ok(Err(e)) => Err(e),
-        Err(e) => Err(format!("Task join error: {}", e)),
-    }
+    let critique_prompt = format!(
+        r#"당신은 회의 발언 초안을 비판적으로 검토하는 리뷰어다.
+
+발언 역할: {name}
+
+역할 컨텍스트:
+{role_context}
+
+회의 안건:
+{agenda}
+
+현재 라운드: {round}
+
+이전 발언 기록:
+{transcript}
+
+초안:
+{draft}
+
+검토 규칙:
+- 4개 이하 bullet만 사용하라
+- 누락된 핵심 포인트, 과한 주장, 리스크 누락, 역할 범위 이탈만 지적하라
+- 초안을 통째로 다시 쓰지 마라
+- 도구나 명령 실행은 하지 마라"#,
+        name = participant.display_name,
+        role_context = if role_context.is_empty() {
+            "(역할 컨텍스트 없음)".to_string()
+        } else {
+            role_context.clone()
+        },
+        agenda = agenda,
+        round = round,
+        transcript = if transcript.is_empty() {
+            "(아직 발언 없음)".to_string()
+        } else {
+            transcript.to_string()
+        },
+        draft = draft.trim(),
+    );
+    let critique = provider_exec::execute_simple(reviewer_provider, critique_prompt).await?;
+
+    let final_prompt = format!(
+        r#"당신은 라운드 테이블 회의에 참여한 {name}입니다.
+
+{role_context}
+
+회의 안건:
+{agenda}
+
+현재 라운드: {round}
+
+이전 발언 기록:
+{transcript}
+
+초안:
+{draft}
+
+교차검증 리뷰:
+{critique}
+
+지시사항:
+- 리뷰를 반영해 최종 발언을 다시 작성하라
+- 답변은 300자 이내로 유지하라
+- 합의에 도달했다고 판단되면, 반드시 "CONSENSUS:" 로 시작하는 한 줄 요약을 마지막에 추가하세요
+- 리뷰에서 중요한 이견이 남아 있다고 판단되면 마지막 줄에 `이견:` 한 줄로 짧게 남겨라
+- 도구나 명령 실행 없이 최종 발언만 작성하라"#,
+        name = participant.display_name,
+        role_context = if role_context.is_empty() {
+            String::new()
+        } else {
+            format!("## 역할 컨텍스트\n{}", role_context)
+        },
+        agenda = agenda,
+        round = round,
+        transcript = if transcript.is_empty() {
+            "(아직 발언 없음)".to_string()
+        } else {
+            transcript.to_string()
+        },
+        draft = draft.trim(),
+        critique = critique.trim(),
+    );
+
+    provider_exec::execute_simple(primary_provider, final_prompt)
+        .await
+        .map(|text| truncate_for_meeting(&text, 1500))
 }
 
 /// Check if majority of participants in a given round used CONSENSUS: keyword
@@ -653,7 +886,7 @@ async fn conclude_meeting(
         }
     }
 
-    let (agenda, transcript_text, participants_list) = {
+    let (agenda, transcript_text, participants_list, primary_provider, reviewer_provider) = {
         let core = shared.core.lock().await;
         let m = core
             .active_meetings
@@ -665,7 +898,13 @@ async fn conclude_meeting(
             .iter()
             .map(|p| p.display_name.clone())
             .collect();
-        (m.agenda.clone(), t, p.join(", "))
+        (
+            m.agenda.clone(),
+            t,
+            p.join(", "),
+            m.primary_provider,
+            m.reviewer_provider,
+        )
     };
 
     // Find summary agent's prompt file
@@ -686,7 +925,7 @@ async fn conclude_meeting(
         String::new()
     };
 
-    let prompt = format!(
+    let draft_prompt = format!(
         r#"당신은 회의록을 작성하는 {agent}입니다.
 
 {role_context}
@@ -736,24 +975,89 @@ async fn conclude_meeting(
         )
         .await;
 
-    let summary =
-        tokio::task::spawn_blocking(move || claude::execute_command_simple(&prompt)).await;
+    let draft = provider_exec::execute_simple(primary_provider, draft_prompt).await;
 
-    let summary_text = match summary {
-        Ok(Ok(text)) => {
-            let trimmed = text.trim().to_string();
-            send_long_message_raw(http, channel_id, &trimmed, shared).await?;
-            Some(trimmed)
-        }
-        Ok(Err(e)) => {
-            rate_limit_wait(shared, channel_id).await;
-            let _ = channel_id
-                .send_message(
-                    http,
-                    CreateMessage::new().content(format!("⚠️ 회의록 작성 실패: {}", e)),
-                )
-                .await;
-            None
+    let summary_text = match draft {
+        Ok(draft_text) => {
+            let critique_prompt = format!(
+                r#"당신은 회의록 초안을 비판적으로 검토하는 리뷰어다.
+
+안건:
+{agenda}
+
+참여자:
+{participants}
+
+초안:
+{draft}
+
+검토 규칙:
+- 누락된 핵심 논점, 잘못된 결론, 빠진 action item, 과도한 일반화만 지적하라
+- 6개 이하 bullet만 사용하라
+- 회의록 전체를 다시 쓰지 마라
+- 도구나 명령 실행은 하지 마라"#,
+                agenda = agenda,
+                participants = participants_list,
+                draft = draft_text.trim(),
+            );
+            let critique = provider_exec::execute_simple(reviewer_provider, critique_prompt).await;
+            let final_prompt = format!(
+                r#"당신은 회의록을 작성하는 {agent}입니다.
+
+{role_context}
+
+안건:
+{agenda}
+
+참여자:
+{participants}
+
+전체 발언 기록:
+{transcript}
+
+초안:
+{draft}
+
+교차검증 리뷰:
+{critique}
+
+지시사항:
+- 리뷰에서 타당한 지적을 반영해 최종 회의록을 작성하라
+- 형식은 기존 회의록 형식을 유지하라
+- 미합의 사항이 남아 있으면 결론에 분리해 적어라
+- 도구나 명령 실행 없이 최종 회의록만 작성하라"#,
+                agent = config.summary_agent,
+                role_context = if summary_role_context.is_empty() {
+                    String::new()
+                } else {
+                    format!("## 역할 컨텍스트\n{}", summary_role_context)
+                },
+                agenda = agenda,
+                participants = participants_list,
+                transcript = transcript_text,
+                draft = draft_text.trim(),
+                critique = match critique {
+                    Ok(text) => text.trim().to_string(),
+                    Err(err) => format!("- 리뷰 실패: {}", err),
+                },
+            );
+            match provider_exec::execute_simple(primary_provider, final_prompt).await {
+                Ok(text) => {
+                    let trimmed = text.trim().to_string();
+                    send_long_message_raw(http, channel_id, &trimmed, shared).await?;
+                    Some(trimmed)
+                }
+                Err(e) => {
+                    rate_limit_wait(shared, channel_id).await;
+                    let _ = channel_id
+                        .send_message(
+                            http,
+                            CreateMessage::new().content(format!("⚠️ 회의록 작성 실패: {}", e)),
+                        )
+                        .await;
+                    None
+                }
+            }
         }
         Err(e) => {
             rate_limit_wait(shared, channel_id).await;
@@ -852,6 +1156,8 @@ fn build_pcd_payload(m: &Meeting) -> Option<serde_json::Value> {
         "agenda": m.agenda,
         "summary": m.summary,
         "status": status_str,
+        "primary_provider": m.primary_provider.as_str(),
+        "reviewer_provider": m.reviewer_provider.as_str(),
         "participant_names": participant_names,
         "total_rounds": m.current_round,
         "started_at": started_at,
@@ -912,12 +1218,14 @@ fn build_meeting_markdown(m: &Meeting) -> String {
         .unwrap_or_else(|| "_회의록이 작성되지 않았습니다._".to_string());
 
     format!(
-        "---\ntags: [meeting, cookingheart]\ndate: {date}\nstatus: {status}\nparticipants: [{participants}]\nagenda: \"{agenda}\"\nmeeting_id: {id}\n---\n\n# 회의록: {agenda}\n\n> **날짜**: {datetime}\n> **참여자**: {participants}\n> **라운드**: {rounds}/{max_rounds}\n> **상태**: {status}\n\n---\n\n## 요약\n\n{summary}\n\n---\n\n## 전체 발언 기록\n\n{transcript}\n",
+        "---\ntags: [meeting, cookingheart]\ndate: {date}\nstatus: {status}\nparticipants: [{participants}]\nagenda: \"{agenda}\"\nmeeting_id: {id}\nprimary_provider: {primary_provider}\nreviewer_provider: {reviewer_provider}\n---\n\n# 회의록: {agenda}\n\n> **날짜**: {datetime}\n> **참여자**: {participants}\n> **라운드**: {rounds}/{max_rounds}\n> **상태**: {status}\n> **진행 모델**: {primary_provider}\n> **교차검증**: {reviewer_provider}\n\n---\n\n## 요약\n\n{summary}\n\n---\n\n## 전체 발언 기록\n\n{transcript}\n",
         date = date_str,
         status = status_str,
         participants = participants_inline,
         agenda = m.agenda,
         id = m.id,
+        primary_provider = m.primary_provider.as_str(),
+        reviewer_provider = m.reviewer_provider.as_str(),
         datetime = datetime_str,
         rounds = m.current_round,
         max_rounds = m.max_rounds,
@@ -952,19 +1260,31 @@ pub(super) async fn handle_meeting_command(
     http: Arc<serenity::Http>,
     channel_id: ChannelId,
     text: &str,
+    default_provider: ProviderKind,
     shared: &Arc<SharedData>,
 ) -> Result<bool, Error> {
     let text = text.trim().to_string();
 
-    // /meeting start <agenda>
-    if let Some(agenda) = text.strip_prefix("/meeting start ") {
-        let agenda = agenda.trim().to_string();
-        if agenda.is_empty() {
+    // /meeting start [--primary claude|codex] <agenda>
+    if text.starts_with("/meeting start ") {
+        let request = match parse_meeting_start_text(&text, default_provider) {
+            Ok(Some(request)) => request,
+            Ok(None) => return Ok(false),
+            Err(message) => {
+                rate_limit_wait(shared, channel_id).await;
+                let _ = channel_id
+                    .send_message(&*http, CreateMessage::new().content(message))
+                    .await;
+                return Ok(true);
+            }
+        };
+
+        if request.agenda.is_empty() {
             rate_limit_wait(shared, channel_id).await;
             let _ = channel_id
                 .send_message(
                     &*http,
-                    CreateMessage::new().content("사용법: `/meeting start <안건>`"),
+                    CreateMessage::new().content("사용법: `/meeting start [--primary claude|codex] <안건>`"),
                 )
                 .await;
             return Ok(true);
@@ -972,10 +1292,12 @@ pub(super) async fn handle_meeting_command(
 
         let http_clone = http.clone();
         let shared_clone = shared.clone();
+        let agenda = request.agenda.clone();
+        let primary_provider = request.primary_provider;
 
         // Spawn meeting as a background task so it doesn't block message handling
         tokio::spawn(async move {
-            match start_meeting(&*http_clone, channel_id, &agenda, &shared_clone).await {
+            match start_meeting(&*http_clone, channel_id, &agenda, primary_provider, &shared_clone).await {
                 Ok(id) => {
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     println!("  [{ts}] ✅ Meeting completed: {id}");
@@ -1010,4 +1332,28 @@ pub(super) async fn handle_meeting_command(
     }
 
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_meeting_start_text, ProviderKind};
+
+    #[test]
+    fn test_parse_meeting_start_text_defaults_to_current_provider() {
+        let parsed = parse_meeting_start_text("/meeting start 신규 안건", ProviderKind::Claude)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.primary_provider, ProviderKind::Claude);
+        assert_eq!(parsed.agenda, "신규 안건");
+    }
+
+    #[test]
+    fn test_parse_meeting_start_text_accepts_primary_flag() {
+        let parsed =
+            parse_meeting_start_text("/meeting start --primary codex 신규 안건", ProviderKind::Claude)
+                .unwrap()
+                .unwrap();
+        assert_eq!(parsed.primary_provider, ProviderKind::Codex);
+        assert_eq!(parsed.agenda, "신규 안건");
+    }
 }

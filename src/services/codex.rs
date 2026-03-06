@@ -1,6 +1,7 @@
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
 use std::sync::OnceLock;
@@ -41,6 +42,64 @@ fn get_codex_path() -> Option<&'static str> {
 
 pub fn is_codex_available() -> bool {
     get_codex_path().is_some()
+}
+
+pub fn execute_command_simple(prompt: &str) -> Result<String, String> {
+    let codex_bin = get_codex_path().ok_or_else(|| "Codex CLI not found".to_string())?;
+    let args = base_exec_args(None, prompt);
+    let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+    let output = Command::new(codex_bin)
+        .args(&args)
+        .current_dir(working_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("Failed to start Codex: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("Codex exited with code {:?}", output.status.code())
+        } else {
+            stderr
+        });
+    }
+
+    let mut final_text = String::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(json) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if json.get("type").and_then(|v| v.as_str()) != Some("item.completed") {
+            continue;
+        }
+        let Some(item) = json.get("item") else {
+            continue;
+        };
+        if item.get("type").and_then(|v| v.as_str()) != Some("agent_message") {
+            continue;
+        }
+        let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if text.is_empty() {
+            continue;
+        }
+        if !final_text.is_empty() {
+            final_text.push_str("\n\n");
+        }
+        final_text.push_str(text);
+    }
+
+    let final_text = final_text.trim().to_string();
+    if final_text.is_empty() {
+        Err("Empty response from Codex".to_string())
+    } else {
+        Ok(final_text)
+    }
 }
 
 pub fn execute_command_streaming(

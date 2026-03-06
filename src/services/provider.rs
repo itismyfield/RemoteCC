@@ -21,6 +21,13 @@ impl ProviderKind {
         }
     }
 
+    pub fn counterpart(self) -> Self {
+        match self {
+            Self::Claude => Self::Codex,
+            Self::Codex => Self::Claude,
+        }
+    }
+
     pub fn from_str(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "claude" => Some(Self::Claude),

@@ -785,7 +785,15 @@ async fn handle_event(
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 println!("  [{ts}] ◀ [{user_name}] Meeting cmd: {text}");
                 let http = ctx.http.clone();
-                if meeting::handle_meeting_command(http, channel_id, text, &data.shared).await? {
+                if meeting::handle_meeting_command(
+                    http,
+                    channel_id,
+                    text,
+                    data.provider,
+                    &data.shared,
+                )
+                .await?
+                {
                     return Ok(());
                 }
             }
@@ -1941,6 +1949,7 @@ async fn cmd_meeting(
     ctx: Context<'_>,
     #[description = "Action: start / stop / status"] action: String,
     #[description = "Agenda (required for start)"] agenda: Option<String>,
+    #[description = "Primary provider (optional: claude / codex)"] primary_provider: Option<String>,
 ) -> Result<(), Error> {
     let user_id = ctx.author().id;
     let user_name = &ctx.author().name;
@@ -1953,12 +1962,6 @@ async fn cmd_meeting(
     let agenda_str = agenda.as_deref().unwrap_or("");
     println!("  [{ts}] ◀ [{user_name}] /meeting {action} {agenda_str}");
 
-    if ctx.data().provider != ProviderKind::Claude {
-        ctx.say("`/meeting` is currently supported only on the Claude bot.")
-            .await?;
-        return Ok(());
-    }
-
     ctx.defer().await?;
 
     let http = ctx.serenity_context().http.clone();
@@ -1968,13 +1971,31 @@ async fn cmd_meeting(
         "start" => {
             let agenda_text = agenda_str.trim();
             if agenda_text.is_empty() {
-                ctx.say("사용법: `/meeting start <안건>`").await?;
+                ctx.say("사용법: `/meeting start <안건>` + optional `primary_provider=claude|codex`")
+                    .await?;
                 return Ok(());
             }
+            let selected_provider = match primary_provider.as_deref().map(ProviderKind::from_str) {
+                Some(Some(provider)) => provider,
+                Some(None) => {
+                    ctx.say("primary_provider는 `claude` 또는 `codex`만 가능해.")
+                        .await?;
+                    return Ok(());
+                }
+                None => ctx.data().provider,
+            };
             let agenda_owned = agenda_text.to_string();
             // Spawn as background task
             tokio::spawn(async move {
-                match meeting::start_meeting(&*http, channel_id, &agenda_owned, &shared).await {
+                match meeting::start_meeting(
+                    &*http,
+                    channel_id,
+                    &agenda_owned,
+                    selected_provider,
+                    &shared,
+                )
+                .await
+                {
                     Ok(id) => {
                         let ts = chrono::Local::now().format("%H:%M:%S");
                         println!("  [{ts}] ✅ Meeting completed: {id}");
@@ -1992,7 +2013,12 @@ async fn cmd_meeting(
                     }
                 }
             });
-            ctx.say("📋 회의를 시작할게.").await?;
+            ctx.say(format!(
+                "📋 회의를 시작할게. 진행 모델: {} / 교차검증: {}",
+                selected_provider.display_name(),
+                selected_provider.counterpart().display_name()
+            ))
+            .await?;
         }
         "stop" => {
             meeting::cancel_meeting(&*http, channel_id, &shared).await?;

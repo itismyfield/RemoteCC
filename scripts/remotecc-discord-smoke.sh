@@ -111,16 +111,19 @@ tmp_deploy="$prod_bin.new.$$"
 rm -f "$tmp_deploy"
 install -m 755 "$release_bin" "$tmp_deploy"
 codesign --force --sign - "$tmp_deploy" >/dev/null
+signed_sha="$(shasum -a 256 "$tmp_deploy" | awk '{print $1}')"
 mv -f "$tmp_deploy" "$prod_bin"
 
 prod_sha="$(shasum -a 256 "$prod_bin" | awk '{print $1}')"
 echo "prod_sha256=$prod_sha"
+echo "signed_sha256=$signed_sha"
 echo "backup_path=$backup_path"
 
-if [[ "$prod_sha" != "$release_sha" ]]; then
-  echo "error: deployed binary hash mismatch" >&2
+if [[ "$prod_sha" != "$signed_sha" ]]; then
+  echo "error: deployed binary hash mismatch after codesign" >&2
   exit 1
 fi
+codesign --verify --verbose=2 "$prod_bin" >/dev/null
 
 echo "Restarting dcserver"
 "$prod_bin" --restart-dcserver

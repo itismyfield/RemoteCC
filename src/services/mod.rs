@@ -6,6 +6,7 @@ pub mod discord;
 pub mod file_ops;
 pub mod process;
 pub mod provider;
+pub mod provider_exec;
 pub mod remote;
 pub mod remote_transfer;
 pub mod tmux_wrapper;
