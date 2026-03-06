@@ -522,8 +522,8 @@ async fn handle_event(
                 }
             }
 
-            // Ignore messages that look like slash commands
-            if new_message.content.starts_with('/') {
+            // Ignore messages that look like slash commands (but allow from trusted bots)
+            if new_message.content.starts_with('/') && !new_message.author.bot {
                 return Ok(());
             }
 
