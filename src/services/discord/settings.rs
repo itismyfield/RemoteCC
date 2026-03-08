@@ -122,6 +122,43 @@ pub(super) fn resolve_role_binding(
     by_name.get(cname).and_then(parse_role_binding)
 }
 
+/// Resolve workspace path from role_map.json for a given channel.
+pub(super) fn resolve_workspace(
+    channel_id: ChannelId,
+    channel_name: Option<&str>,
+) -> Option<String> {
+    let path = role_map_path()?;
+    let content = fs::read_to_string(path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+    // 1) Primary: exact channel ID match
+    if let Some(by_id) = json.get("byChannelId").and_then(|v| v.as_object()) {
+        let key = channel_id.get().to_string();
+        if let Some(entry) = by_id.get(&key) {
+            if let Some(ws) = entry.get("workspace").and_then(|v| v.as_str()) {
+                return Some(ws.to_string());
+            }
+        }
+    }
+
+    // 2) Fallback: channel name match
+    let fallback_enabled = json
+        .get("fallbackByChannelName")
+        .and_then(|v| v.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !fallback_enabled {
+        return None;
+    }
+    let cname = channel_name?;
+    let by_name = json.get("byChannelName").and_then(|v| v.as_object())?;
+    by_name
+        .get(cname)
+        .and_then(|entry| entry.get("workspace"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
 pub(super) fn load_role_prompt(binding: &RoleBinding) -> Option<String> {
     let raw = fs::read_to_string(Path::new(&binding.prompt_file)).ok()?;
     const MAX_CHARS: usize = 12_000;
