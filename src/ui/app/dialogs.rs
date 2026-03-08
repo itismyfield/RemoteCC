@@ -170,6 +170,7 @@ impl App {
         self.current_screen = Screen::FileInfo;
     }
 
+    #[allow(dead_code)]
     pub fn view_file(&mut self) {
         if self.active_panel().is_remote() {
             self.show_message("Cannot view remote files directly. Use copy to download first.");
@@ -575,6 +576,7 @@ impl App {
         self.refresh_panels();
     }
 
+    #[allow(dead_code)]
     pub fn show_system_info(&mut self) {
         self.system_info_state = crate::ui::system_info::SystemInfoState::default();
         self.current_screen = Screen::SystemInfo;

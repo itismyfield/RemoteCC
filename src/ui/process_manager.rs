@@ -6,7 +6,6 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
-use unicode_width::UnicodeWidthStr;
 
 use super::{
     app::{App, Screen},

@@ -54,6 +54,7 @@ const COPY_BUFFER_SIZE: usize = 64 * 1024;
 /// Try to clone file using APFS clonefile (macOS only)
 /// Returns Ok(true) if clone succeeded, Ok(false) if should fallback to regular copy
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
 fn try_clonefile(src: &Path, dest: &Path) -> io::Result<bool> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -700,6 +701,7 @@ pub fn move_files_with_progress(
 }
 
 /// Copy a file or directory
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn copy_file(src: &Path, dest: &Path) -> io::Result<()> {
     // Check if source and destination are the same
     let resolved_src = src.canonicalize()?;
@@ -831,6 +833,7 @@ fn copy_dir_recursive_inner(
 }
 
 /// Move a file or directory
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn move_file(src: &Path, dest: &Path) -> io::Result<()> {
     // Check if source and destination are the same
     let resolved_src = src.canonicalize()?;
@@ -962,6 +965,7 @@ const SENSITIVE_PATHS: &[&str] = &[
 
 /// Check symlinks in files to be archived for security
 /// Returns an error if any symlink points outside base_dir or to sensitive system paths
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn check_symlinks_for_tar(base_dir: &Path, files: &[String]) -> io::Result<()> {
     use std::collections::HashSet;
     let mut visited = HashSet::new();
@@ -973,6 +977,7 @@ pub fn check_symlinks_for_tar(base_dir: &Path, files: &[String]) -> io::Result<(
 }
 
 /// Recursively check symlinks in a file or directory
+#[cfg_attr(not(test), allow(dead_code))]
 fn check_symlink_recursive(
     path: &Path,
     base_dir: &Path,

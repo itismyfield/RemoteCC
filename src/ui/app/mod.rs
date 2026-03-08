@@ -174,6 +174,7 @@ pub struct App {
 }
 
 impl App {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(first_path: PathBuf, second_path: PathBuf) -> Self {
         Self {
             panels: vec![PanelState::new(first_path), PanelState::new(second_path)],
@@ -460,6 +461,7 @@ impl App {
         &self.panels[self.active_panel_index]
     }
 
+    #[allow(dead_code)]
     pub fn target_panel(&self) -> &PanelState {
         let target_idx = (self.active_panel_index + 1) % self.panels.len();
         &self.panels[target_idx]

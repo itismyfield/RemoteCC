@@ -1162,7 +1162,7 @@ mod tests {
         for y in 0..10u16 {
             let mut line = String::new();
             for x in 0..40u16 {
-                let cell = buffer.get(x, y);
+                let cell = &buffer[(x, y)];
                 line.push_str(cell.symbol());
             }
             let trimmed = line.trim_end();

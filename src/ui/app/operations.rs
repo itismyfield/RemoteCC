@@ -401,8 +401,8 @@ impl App {
         let source_path = self.active_panel().path.clone();
         let is_remote = self.active_panel().is_remote();
 
-        let mut success_count = 0;
-        let mut last_error = String::new();
+        let _success_count = 0;
+        let _last_error = String::new();
 
         if is_remote {
             // Remote delete via SFTP (async with spinner)
@@ -410,7 +410,7 @@ impl App {
                 return;
             }
             let panel_idx = self.active_panel_index;
-            let mut ctx = match self.panels[panel_idx].remote_ctx.take() {
+            let ctx = match self.panels[panel_idx].remote_ctx.take() {
                 Some(ctx) => ctx,
                 None => return,
             };
@@ -1008,7 +1008,7 @@ impl App {
             rename_map.push((src, dest));
         }
 
-        let file_count = rename_map.len();
+        let _file_count = rename_map.len();
 
         // Set pending focus to all dup file names (will find first match in sorted file list)
         let dup_names: Vec<String> = rename_map
@@ -1227,11 +1227,13 @@ impl App {
     }
 
     /// Check if clipboard has content
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn has_clipboard(&self) -> bool {
         self.clipboard.is_some()
     }
 
     /// Get clipboard info for status display
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn clipboard_info(&self) -> Option<(usize, &str)> {
         self.clipboard.as_ref().map(|cb| {
             let op = match cb.operation {
@@ -1255,7 +1257,7 @@ impl App {
                 return;
             }
             let panel_idx = self.active_panel_index;
-            let mut ctx = match self.panels[panel_idx].remote_ctx.take() {
+            let ctx = match self.panels[panel_idx].remote_ctx.take() {
                 Some(ctx) => ctx,
                 None => return,
             };
@@ -1330,7 +1332,7 @@ impl App {
                 return;
             }
             let panel_idx = self.active_panel_index;
-            let mut ctx = match self.panels[panel_idx].remote_ctx.take() {
+            let ctx = match self.panels[panel_idx].remote_ctx.take() {
                 Some(ctx) => ctx,
                 None => return,
             };
@@ -1411,7 +1413,7 @@ impl App {
                     return;
                 }
                 let panel_idx = self.active_panel_index;
-                let mut ctx = match self.panels[panel_idx].remote_ctx.take() {
+                let ctx = match self.panels[panel_idx].remote_ctx.take() {
                     Some(ctx) => ctx,
                     None => return,
                 };

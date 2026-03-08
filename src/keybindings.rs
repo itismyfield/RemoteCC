@@ -1541,6 +1541,7 @@ pub struct Keybindings {
     goto: ActionMap<GotoAction>,
 }
 
+#[allow(dead_code)]
 impl Keybindings {
     pub fn from_config(config: &KeybindingsConfig) -> Self {
         Self {

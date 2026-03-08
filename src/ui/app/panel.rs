@@ -344,6 +344,7 @@ impl PanelState {
         }
     }
 
+    #[allow(unsafe_code)]
     fn update_disk_info(&mut self) {
         if self.is_remote() {
             self.disk_total = 0;
