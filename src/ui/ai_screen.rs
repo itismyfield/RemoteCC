@@ -1137,6 +1137,9 @@ Keep responses concise and terminal-friendly.",
                 StreamMessage::TmuxReady { .. } => {
                     // Ignored in TUI (only used for Discord tmux watcher)
                 }
+                StreamMessage::OutputOffset { .. } => {
+                    // Ignored in TUI (only used for Discord restart recovery)
+                }
             }
 
             // Auto scroll while processing

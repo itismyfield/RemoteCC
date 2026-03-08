@@ -165,7 +165,7 @@ pub(super) async fn tmux_output_watcher(
         // Send the terminal response to Discord
         if !full_response.trim().is_empty() {
             let formatted = format_for_discord(&full_response);
-            let prefixed = format!("🖥 **[Terminal]**\n{}", formatted);
+            let prefixed = formatted.to_string();
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!(
                 "  [{ts}] 👁 Relaying terminal response to Discord ({} chars)",
@@ -341,6 +341,10 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
             continue;
         };
 
+        if shared.recovering_channels.contains_key(channel_id) {
+            continue;
+        }
+
         if shared.tmux_watchers.contains_key(channel_id) {
             continue;
         }
@@ -388,6 +392,7 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
                         channel_id: Some(pw.channel_id.get()),
                         silent: false,
                         last_active: tokio::time::Instant::now(),
+                        worktree: None,
                     });
 
             // Restore current_path from saved settings so message handler accepts messages

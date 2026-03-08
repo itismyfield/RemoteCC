@@ -1,4 +1,5 @@
 mod formatting;
+mod inflight;
 mod meeting;
 mod settings;
 mod shared_memory;
@@ -18,7 +19,9 @@ use tokio::sync::Mutex;
 use poise::serenity_prelude as serenity;
 use serenity::{ChannelId, CreateAttachment, CreateMessage, EditMessage, MessageId, UserId};
 
-use crate::services::claude::{self, CancelToken, StreamMessage, DEFAULT_ALLOWED_TOOLS};
+use crate::services::claude::{
+    self, CancelToken, ReadOutputResult, StreamMessage, DEFAULT_ALLOWED_TOOLS,
+};
 use crate::services::codex;
 use crate::services::provider::ProviderKind;
 use crate::ui::ai_screen::{self, HistoryItem, HistoryType, SessionData};
@@ -27,6 +30,9 @@ use formatting::{
     add_reaction_raw, canonical_tool_name, extract_skill_description, format_for_discord,
     format_tool_input, normalize_empty_lines, remove_reaction_raw, risk_badge,
     send_long_message_ctx, send_long_message_raw, tool_info, truncate_str, BUILTIN_SKILLS,
+};
+use inflight::{
+    clear_inflight_state, load_inflight_states, save_inflight_state, InflightTurnState,
 };
 use settings::{
     channel_supports_provider, channel_upload_dir, cleanup_channel_uploads, cleanup_old_uploads,
@@ -68,6 +74,19 @@ pub(super) struct DiscordSession {
     pub(super) silent: bool,
     /// Last time this session was actively used (for TTL cleanup)
     pub(super) last_active: tokio::time::Instant,
+    /// If this session runs in a git worktree, store the info here
+    pub(super) worktree: Option<WorktreeInfo>,
+}
+
+/// Worktree info for sessions that were auto-redirected to avoid conflicts
+#[derive(Clone, Debug)]
+pub(super) struct WorktreeInfo {
+    /// The original repo path that was conflicted
+    pub original_path: String,
+    /// The worktree directory path
+    pub worktree_path: String,
+    /// The branch name created for this worktree
+    pub branch_name: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,7 +156,7 @@ pub(super) struct CoreState {
     pub(super) cancel_tokens: HashMap<ChannelId, Arc<CancelToken>>,
     /// Per-channel owner of the currently running request
     pub(super) active_request_owner: HashMap<ChannelId, UserId>,
-    /// Per-channel steering interventions collected while a request is in progress
+    /// Per-channel queued interventions collected while a request is in progress
     pub(super) intervention_queue: HashMap<ChannelId, Vec<Intervention>>,
     /// Per-channel active meeting (one meeting per channel)
     pub(super) active_meetings: HashMap<ChannelId, meeting::Meeting>,
@@ -155,6 +174,8 @@ pub(super) struct SharedData {
     pub(super) skills_cache: tokio::sync::RwLock<Vec<(String, String)>>,
     /// Per-channel tmux output watchers for terminal→Discord relay
     pub(super) tmux_watchers: dashmap::DashMap<ChannelId, TmuxWatcherHandle>,
+    /// Per-channel in-flight turn recovery marker (restart resume in progress)
+    pub(super) recovering_channels: dashmap::DashMap<ChannelId, ()>,
 }
 
 /// Poise user data type
@@ -363,6 +384,7 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
         api_timestamps: dashmap::DashMap::new(),
         skills_cache: tokio::sync::RwLock::new(initial_skills),
         tmux_watchers: dashmap::DashMap::new(),
+        recovering_channels: dashmap::DashMap::new(),
     });
 
     let token_owned = token.to_string();
@@ -422,6 +444,7 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
                 let http_for_tmux = ctx.http.clone();
                 let shared_for_tmux2 = shared_for_tmux.clone();
                 tokio::spawn(async move {
+                    restore_inflight_turns(&http_for_tmux, &shared_for_tmux2, provider).await;
                     restore_tmux_watchers(&http_for_tmux, &shared_for_tmux2).await;
                     cleanup_orphan_tmux_sessions(&shared_for_tmux2).await;
                 });
@@ -497,6 +520,49 @@ async fn check_auth(
 async fn check_owner(user_id: UserId, shared: &Arc<SharedData>) -> bool {
     let settings = shared.settings.read().await;
     settings.owner_user_id == Some(user_id.get())
+}
+
+fn cancel_active_token(token: &Arc<CancelToken>, cleanup_tmux: bool) {
+    token.cancelled.store(true, Ordering::Relaxed);
+
+    let child_pid = token.child_pid.lock().ok().and_then(|guard| *guard);
+    if let Some(pid) = child_pid {
+        claude::kill_pid_tree(pid);
+    }
+
+    if cleanup_tmux {
+        if child_pid.is_some() {
+            if let Some(name) = token
+                .tmux_session
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone())
+            {
+                let _ = std::process::Command::new("tmux")
+                    .args(["kill-session", "-t", &name])
+                    .output();
+            }
+        } else {
+            token.cancel_with_tmux_cleanup();
+        }
+    }
+}
+
+fn tmux_runtime_paths(tmux_session_name: &str) -> (String, String) {
+    (
+        format!("/tmp/remotecc-{}.jsonl", tmux_session_name),
+        format!("/tmp/remotecc-{}.input", tmux_session_name),
+    )
+}
+
+fn stale_inflight_message(saved_response: &str) -> String {
+    let trimmed = saved_response.trim();
+    if trimmed.is_empty() {
+        "⚠️ RemoteCC가 재시작되어 진행 중이던 응답을 이어붙이지 못했습니다.".to_string()
+    } else {
+        let formatted = format_for_discord(trimmed);
+        format!("{}\n\n[Interrupted by restart]", formatted)
+    }
 }
 
 fn family_profile_probe_script_path() -> Option<std::path::PathBuf> {
@@ -620,7 +686,8 @@ async fn try_handle_family_profile_probe_reply(
         return Ok(false);
     }
 
-    let Some((topic_key, target)) = pending_family_profile_probe_for_user(msg.author.id.get()) else {
+    let Some((topic_key, target)) = pending_family_profile_probe_for_user(msg.author.id.get())
+    else {
         return Ok(false);
     };
 
@@ -679,12 +746,7 @@ fn default_dm_workspace() -> Option<String> {
     } else {
         home
     };
-    Some(
-        base.canonicalize()
-            .unwrap_or(base)
-            .display()
-            .to_string(),
-    )
+    Some(base.canonicalize().unwrap_or(base).display().to_string())
 }
 
 fn resolve_effective_role_binding(
@@ -747,6 +809,7 @@ async fn ensure_default_dm_session(
                 category_name: None,
                 silent: false,
                 last_active: tokio::time::Instant::now(),
+                worktree: None,
             });
 
         session.channel_id = Some(channel_id.get());
@@ -898,6 +961,12 @@ async fn maybe_cleanup_sessions(shared: &Arc<SharedData>) {
     {
         let mut data = shared.core.lock().await;
         for ch in &expired {
+            // Clean up worktree if session had one
+            if let Some(session) = data.sessions.get(ch) {
+                if let Some(ref wt) = session.worktree {
+                    cleanup_git_worktree(wt);
+                }
+            }
             data.sessions.remove(ch);
             data.cancel_tokens.remove(ch);
             data.active_request_owner.remove(ch);
@@ -964,8 +1033,13 @@ async fn handle_event(
 
             let text = new_message.content.trim();
             if !text.is_empty()
-                && try_handle_family_profile_probe_reply(ctx, new_message, &data.shared, data.provider)
-                    .await?
+                && try_handle_family_profile_probe_reply(
+                    ctx,
+                    new_message,
+                    &data.shared,
+                    data.provider,
+                )
+                .await?
             {
                 return Ok(());
             }
@@ -1045,12 +1119,7 @@ async fn handle_event(
                     };
 
                     if let Some(token) = hard_token {
-                        token.cancelled.store(true, Ordering::Relaxed);
-                        if let Ok(guard) = token.child_pid.lock() {
-                            if let Some(pid) = *guard {
-                                claude::kill_pid_tree(pid);
-                            }
-                        }
+                        cancel_active_token(&token, true);
                     }
 
                     drop(d);
@@ -1058,16 +1127,16 @@ async fn handle_event(
                     if !inserted {
                         rate_limit_wait(&data.shared, channel_id).await;
                         let _ = channel_id
-                            .say(&ctx.http, "↪ 같은 steering이 방금 이미 들어와서 무시했어.")
+                            .say(&ctx.http, "↪ 같은 메시지가 방금 이미 큐잉되어서 무시했어.")
                             .await;
                         return Ok(());
                     }
 
                     rate_limit_wait(&data.shared, channel_id).await;
                     let feedback = match mode {
-                        InterventionMode::Hard => "🛑 hard steering 받았어. 현재 작업을 중단할게.",
+                        InterventionMode::Hard => "🛑 현재 작업을 중단할게.",
                         InterventionMode::Soft => {
-                            "📝 steering 저장됨. 현재 턴 종료 후 다음 요청에 반영할게."
+                            "📋 큐잉됨. 현재 턴 종료 후 자동 처리돼. 즉시 반영하려면 /stop"
                         }
                     };
                     let _ = channel_id
@@ -1275,12 +1344,54 @@ async fn cmd_start(
             .unwrap_or_else(|_| expanded)
     };
 
-    // Try to load existing session for this path
-    let existing = load_existing_session(&canonical_path, Some(ctx.channel_id().get()));
-
     // Resolve channel/category names before taking the lock
     let (ch_name, cat_name) =
         resolve_channel_category(ctx.serenity_context(), ctx.channel_id()).await;
+
+    // Check for worktree conflict (another channel using same git repo path)
+    let worktree_info = {
+        let data = ctx.data().shared.core.lock().await;
+        let conflict =
+            detect_worktree_conflict(&data.sessions, &canonical_path, ctx.channel_id());
+        drop(data);
+        if let Some(conflicting_channel) = conflict {
+            let provider_str = {
+                let settings = ctx.data().shared.settings.read().await;
+                settings.provider.as_str().to_string()
+            };
+            let ch = ch_name.as_deref().unwrap_or("unknown");
+            match create_git_worktree(&canonical_path, ch, &provider_str) {
+                Ok((wt_path, branch)) => {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    println!(
+                        "  [{ts}] 🌿 Worktree conflict: {} already uses {}. Created worktree.",
+                        conflicting_channel, canonical_path
+                    );
+                    Some(WorktreeInfo {
+                        original_path: canonical_path.clone(),
+                        worktree_path: wt_path,
+                        branch_name: branch,
+                    })
+                }
+                Err(e) => {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    println!("  [{ts}] 🌿 Worktree creation skipped: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
+    // Use worktree path if created, otherwise original
+    let effective_path = worktree_info
+        .as_ref()
+        .map(|wt| wt.worktree_path.clone())
+        .unwrap_or_else(|| canonical_path.clone());
+
+    // Try to load existing session for this path
+    let existing = load_existing_session(&effective_path, Some(ctx.channel_id().get()));
 
     let mut response_lines = Vec::new();
 
@@ -1306,6 +1417,7 @@ async fn cmd_start(
                 channel_id: Some(channel_id.get()),
                 silent: false,
                 last_active: tokio::time::Instant::now(),
+                worktree: None,
             });
         session.channel_id = Some(channel_id.get());
         session.channel_name = ch_name;
@@ -1321,8 +1433,11 @@ async fn cmd_start(
             }
         }
 
+        // Apply worktree info if created
+        session.worktree = worktree_info.clone();
+
         if let Some((session_data, _)) = &existing {
-            session.current_path = Some(canonical_path.clone());
+            session.current_path = Some(effective_path.clone());
             session.history = session_data.history.clone();
             // Only restore remote_profile_name from file if session is newly created.
             // If session already existed in memory, the user may have explicitly set
@@ -1346,10 +1461,10 @@ async fn cmd_start(
                 .as_ref()
                 .map(|n| format!(" (remote: {})", n))
                 .unwrap_or_default();
-            println!("  [{ts}] ▶ Session restored: {canonical_path}{remote_info}");
+            println!("  [{ts}] ▶ Session restored: {effective_path}{remote_info}");
             response_lines.push(format!(
                 "Session restored at `{}`{}.",
-                canonical_path, remote_info
+                effective_path, remote_info
             ));
             response_lines.push(String::new());
 
@@ -1375,7 +1490,7 @@ async fn cmd_start(
             }
         } else {
             session.session_id = None;
-            session.current_path = Some(canonical_path.clone());
+            session.current_path = Some(effective_path.clone());
             session.history.clear();
 
             let ts = chrono::Local::now().format("%H:%M:%S");
@@ -1384,11 +1499,20 @@ async fn cmd_start(
                 .as_ref()
                 .map(|n| format!(" (remote: {})", n))
                 .unwrap_or_default();
-            println!("  [{ts}] ▶ Session started: {canonical_path}{remote_info}");
+            println!("  [{ts}] ▶ Session started: {effective_path}{remote_info}");
             response_lines.push(format!(
                 "Session started at `{}`{}.",
-                canonical_path, remote_info
+                effective_path, remote_info
             ));
+        }
+
+        // Notify about worktree if created
+        if let Some(ref wt) = session.worktree {
+            response_lines.push(format!(
+                "🌿 Worktree: `{}` 가 이미 사용 중이라 분리된 worktree에서 작업합니다.",
+                wt.original_path
+            ));
+            response_lines.push(format!("Branch: `{}`", wt.branch_name));
         }
 
         // Persist channel → path mapping for auto-restore
@@ -1426,7 +1550,7 @@ async fn cmd_start(
         drop(settings);
 
         // Rescan skills with project path to pick up project-level commands
-        let new_skills = scan_skills(ctx.data().provider, Some(&canonical_path));
+        let new_skills = scan_skills(ctx.data().provider, Some(&effective_path));
         *ctx.data().shared.skills_cache.write().await = new_skills;
     }
 
@@ -1495,12 +1619,7 @@ async fn cmd_clear(ctx: Context<'_>) -> Result<(), Error> {
         data.cancel_tokens.get(&channel_id).cloned()
     };
     if let Some(token) = cancel_token {
-        token.cancelled.store(true, Ordering::Relaxed);
-        if let Ok(guard) = token.child_pid.lock() {
-            if let Some(pid) = *guard {
-                claude::kill_pid_tree(pid);
-            }
-        }
+        cancel_active_token(&token, true);
     }
 
     {
@@ -1553,12 +1672,7 @@ async fn cmd_stop(ctx: Context<'_>) -> Result<(), Error> {
 
             ctx.say("Stopping...").await?;
 
-            token.cancelled.store(true, Ordering::Relaxed);
-            if let Ok(guard) = token.child_pid.lock() {
-                if let Some(pid) = *guard {
-                    claude::kill_pid_tree(pid);
-                }
-            }
+            cancel_active_token(&token, true);
             println!("  [{ts}] ■ Cancel signal sent");
         }
         None => {
@@ -2056,12 +2170,7 @@ async fn cmd_cc(
                 data.cancel_tokens.get(&channel_id).cloned()
             };
             if let Some(token) = cancel_token {
-                token.cancelled.store(true, Ordering::Relaxed);
-                if let Ok(guard) = token.child_pid.lock() {
-                    if let Some(pid) = *guard {
-                        claude::kill_pid_tree(pid);
-                    }
-                }
+                cancel_active_token(&token, true);
             }
             {
                 let mut data = ctx.data().shared.core.lock().await;
@@ -2093,12 +2202,7 @@ async fn cmd_cc(
                         return Ok(());
                     }
                     ctx.say("Stopping...").await?;
-                    token.cancelled.store(true, Ordering::Relaxed);
-                    if let Ok(guard) = token.child_pid.lock() {
-                        if let Some(pid) = *guard {
-                            claude::kill_pid_tree(pid);
-                        }
-                    }
+                    cancel_active_token(&token, true);
                     println!("  [{ts}] ■ Cancel signal sent");
                 }
                 None => {
@@ -2376,11 +2480,111 @@ async fn handle_text_message(
     let (session_id, current_path) = match session_info {
         Some(info) => info,
         None => {
-            rate_limit_wait(shared, channel_id).await;
-            let _ = channel_id
-                .say(&ctx.http, "No active session. Use `/start <path>` first.")
-                .await;
-            return Ok(());
+            // Try auto-start from role_map workspace
+            let ch_name = {
+                let data = shared.core.lock().await;
+                data.sessions
+                    .get(&channel_id)
+                    .and_then(|s| s.channel_name.clone())
+            };
+            let workspace = settings::resolve_workspace(channel_id, ch_name.as_deref());
+            if let Some(ws_path) = workspace {
+                let ws = std::path::Path::new(&ws_path);
+                if ws.is_dir() {
+                    let canonical = ws
+                        .canonicalize()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| ws_path.clone());
+                    // Check worktree conflict
+                    let wt_info = {
+                        let data = shared.core.lock().await;
+                        let conflict = detect_worktree_conflict(
+                            &data.sessions,
+                            &canonical,
+                            channel_id,
+                        );
+                        drop(data);
+                        if let Some(conflicting) = conflict {
+                            let ch = ch_name.as_deref().unwrap_or("unknown");
+                            match create_git_worktree(&canonical, ch, provider.as_str()) {
+                                Ok((wt_path, branch)) => {
+                                    let ts = chrono::Local::now().format("%H:%M:%S");
+                                    println!(
+                                        "  [{ts}] 🌿 Auto-start worktree: {} uses {}",
+                                        conflicting, canonical
+                                    );
+                                    Some(WorktreeInfo {
+                                        original_path: canonical.clone(),
+                                        worktree_path: wt_path,
+                                        branch_name: branch,
+                                    })
+                                }
+                                Err(_) => None,
+                            }
+                        } else {
+                            None
+                        }
+                    };
+                    let eff_path = wt_info
+                        .as_ref()
+                        .map(|wt| wt.worktree_path.clone())
+                        .unwrap_or_else(|| canonical.clone());
+                    let (ch_name_resolved, cat_name) =
+                        resolve_channel_category(ctx, channel_id).await;
+                    let existing = load_existing_session(&eff_path, Some(channel_id.get()));
+                    {
+                        let mut data = shared.core.lock().await;
+                        let session =
+                            data.sessions
+                                .entry(channel_id)
+                                .or_insert_with(|| DiscordSession {
+                                    session_id: None,
+                                    current_path: None,
+                                    history: Vec::new(),
+                                    pending_uploads: Vec::new(),
+                                    cleared: false,
+                                    channel_name: None,
+                                    category_name: None,
+                                    remote_profile_name: None,
+                                    channel_id: Some(channel_id.get()),
+                                    silent: false,
+                                    last_active: tokio::time::Instant::now(),
+                                    worktree: None,
+                                });
+                        session.current_path = Some(eff_path.clone());
+                        session.channel_name = ch_name_resolved;
+                        session.category_name = cat_name;
+                        session.channel_id = Some(channel_id.get());
+                        session.last_active = tokio::time::Instant::now();
+                        session.worktree = wt_info;
+                        if let Some((session_data, _)) = &existing {
+                            session.history = session_data.history.clone();
+                            session.session_id = Some(session_data.session_id.clone());
+                        }
+                    }
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    println!("  [{ts}] ▶ Auto-started session from workspace: {eff_path}");
+                    let sid = {
+                        let data = shared.core.lock().await;
+                        data.sessions
+                            .get(&channel_id)
+                            .and_then(|s| s.session_id.clone())
+                    };
+                    (sid, eff_path)
+                } else {
+                    rate_limit_wait(shared, channel_id).await;
+                    let _ = channel_id
+                        .say(&ctx.http, "No active session. Use `/start <path>` first.")
+                        .await;
+                    return Ok(());
+                }
+            } else {
+                rate_limit_wait(shared, channel_id).await;
+                let _ = channel_id
+                    .say(&ctx.http, "No active session. Use `/start <path>` first.")
+                    .await;
+                return Ok(());
+            }
         }
     };
 
@@ -2569,16 +2773,68 @@ async fn handle_text_message(
             })
     };
 
-    // Resolve tmux session name from channel name
-    let tmux_session_name = {
+    // Resolve channel/tmux session name from current session state
+    let (channel_name, tmux_session_name) = {
         let data = shared.core.lock().await;
-        data.sessions
+        let channel_name = data
+            .sessions
             .get(&channel_id)
-            .and_then(|s| s.channel_name.as_ref())
-            .map(|name| provider.build_tmux_session_name(name))
+            .and_then(|s| s.channel_name.clone());
+        let tmux_session_name = channel_name
+            .as_ref()
+            .map(|name| provider.build_tmux_session_name(name));
+        (channel_name, tmux_session_name)
     };
     let pcd_session_key = build_pcd_session_key(shared, channel_id, provider).await;
     post_pcd_session_status(pcd_session_key.as_deref(), "working", provider, None).await;
+
+    let (inflight_tmux_name, inflight_output_path, inflight_input_fifo, inflight_offset) =
+        if remote_profile.is_none() && claude::is_tmux_available() {
+            if let Some(ref tmux_name) = tmux_session_name {
+                let (output_path, input_fifo_path) = tmux_runtime_paths(tmux_name);
+                let session_exists = std::process::Command::new("tmux")
+                    .args(["has-session", "-t", tmux_name])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                let last_offset = if session_exists {
+                    std::fs::metadata(&output_path)
+                        .map(|m| m.len())
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                (
+                    Some(tmux_name.clone()),
+                    Some(output_path),
+                    Some(input_fifo_path),
+                    last_offset,
+                )
+            } else {
+                (None, None, None, 0)
+            }
+        } else {
+            (None, None, None, 0)
+        };
+
+    let inflight_state = InflightTurnState::new(
+        provider,
+        channel_id.get(),
+        channel_name.clone(),
+        request_owner.get(),
+        user_msg_id.get(),
+        placeholder_msg_id.get(),
+        user_text.to_string(),
+        session_id.clone(),
+        inflight_tmux_name,
+        inflight_output_path,
+        inflight_input_fifo.clone(),
+        inflight_offset,
+    );
+    if let Err(e) = save_inflight_state(&inflight_state) {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        println!("  [{ts}]   ⚠ inflight state save failed: {e}");
+    }
 
     // Create channel for streaming
     let (tx, rx) = mpsc::channel();
@@ -2649,37 +2905,257 @@ async fn handle_text_message(
         }
     });
 
-    // Check silent mode for this channel
-    let is_silent = {
-        let data = shared.core.lock().await;
-        data.sessions
-            .get(&channel_id)
-            .map(|s| s.silent)
-            .unwrap_or(false)
+    spawn_turn_bridge(
+        ctx.http.clone(),
+        shared.clone(),
+        cancel_token.clone(),
+        rx,
+        TurnBridgeContext {
+            provider,
+            channel_id,
+            user_msg_id,
+            user_text_owned: user_text.to_string(),
+            role_binding: role_binding.clone(),
+            pcd_session_key,
+            current_msg_id: placeholder_msg_id,
+            current_msg_len: 0,
+            response_sent_offset: 0,
+            full_response: String::new(),
+            tmux_last_offset: Some(inflight_offset),
+            tmux_input_fifo: inflight_input_fifo,
+            new_session_id: session_id.clone(),
+            inflight_state,
+        },
+    );
+
+    Ok(())
+}
+
+/// Check if a path is a git repo and if another channel already uses it.
+/// Returns the conflicting channel's name if found.
+fn detect_worktree_conflict(
+    sessions: &HashMap<ChannelId, DiscordSession>,
+    path: &str,
+    my_channel: ChannelId,
+) -> Option<String> {
+    let norm = path.trim_end_matches('/');
+    for (cid, session) in sessions {
+        if *cid == my_channel {
+            continue;
+        }
+        let other_path = if let Some(ref wt) = session.worktree {
+            &wt.original_path
+        } else {
+            match &session.current_path {
+                Some(p) => p.as_str(),
+                None => continue,
+            }
+        };
+        if other_path.trim_end_matches('/') == norm {
+            return session
+                .channel_name
+                .clone()
+                .or_else(|| Some(cid.get().to_string()));
+        }
+    }
+    None
+}
+
+/// Create a git worktree for the given repo path.
+/// Returns (worktree_path, branch_name) on success.
+fn create_git_worktree(
+    repo_path: &str,
+    channel_name: &str,
+    provider: &str,
+) -> Result<(String, String), String> {
+    let git_check = std::process::Command::new("git")
+        .args(["-C", repo_path, "rev-parse", "--is-inside-work-tree"])
+        .output()
+        .map_err(|e| format!("git check failed: {}", e))?;
+    if !git_check.status.success() {
+        return Err(format!("{} is not a git repository", repo_path));
+    }
+
+    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let safe_name = channel_name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let branch = format!("wt/{}-{}-{}", provider, safe_name, ts);
+
+    let home = dirs::home_dir().ok_or("Cannot determine home dir")?;
+    let wt_base = home.join(".remotecc").join("worktrees");
+    std::fs::create_dir_all(&wt_base)
+        .map_err(|e| format!("Failed to create worktree base dir: {}", e))?;
+    let wt_dir = wt_base.join(format!("{}-{}-{}", provider, safe_name, ts));
+    let wt_path = wt_dir.display().to_string();
+
+    let output = std::process::Command::new("git")
+        .args(["-C", repo_path, "worktree", "add", &wt_path, "-b", &branch])
+        .output()
+        .map_err(|e| format!("git worktree add failed: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("git worktree add failed: {}", stderr));
+    }
+
+    let ts_log = chrono::Local::now().format("%H:%M:%S");
+    println!(
+        "  [{ts_log}] 🌿 Created worktree: {} (branch: {})",
+        wt_path, branch
+    );
+    Ok((wt_path, branch))
+}
+
+/// Clean up a git worktree after session ends.
+fn cleanup_git_worktree(wt_info: &WorktreeInfo) {
+    let ts = chrono::Local::now().format("%H:%M:%S");
+
+    let status = std::process::Command::new("git")
+        .args(["-C", &wt_info.worktree_path, "status", "--porcelain"])
+        .output();
+    let has_changes = match &status {
+        Ok(out) => !out.stdout.is_empty(),
+        Err(_) => false,
     };
 
-    // Spawn the polling loop
-    let http = ctx.http.clone();
-    let shared_owned = shared.clone();
-    let user_text_owned = user_text.to_string();
+    // Check if branch has new commits
+    let diff = std::process::Command::new("git")
+        .args([
+            "-C",
+            &wt_info.original_path,
+            "log",
+            "--oneline",
+            &format!("HEAD..{}", wt_info.branch_name),
+        ])
+        .output();
+    let has_commits = match &diff {
+        Ok(out) => !out.stdout.is_empty(),
+        Err(_) => false,
+    };
+
+    if has_changes || has_commits {
+        println!(
+            "  [{ts}] 🌿 Worktree {} has changes/commits — keeping for manual merge",
+            wt_info.worktree_path
+        );
+        println!(
+            "  [{ts}] 🌿 Branch: {} | Original: {}",
+            wt_info.branch_name, wt_info.original_path
+        );
+    } else {
+        let _ = std::process::Command::new("git")
+            .args([
+                "-C",
+                &wt_info.original_path,
+                "worktree",
+                "remove",
+                &wt_info.worktree_path,
+            ])
+            .output();
+        let _ = std::process::Command::new("git")
+            .args([
+                "-C",
+                &wt_info.original_path,
+                "branch",
+                "-d",
+                &wt_info.branch_name,
+            ])
+            .output();
+        println!(
+            "  [{ts}] 🌿 Cleaned up worktree: {} (no changes)",
+            wt_info.worktree_path
+        );
+    }
+}
+
+/// Write a command to the tmux FIFO pipe for command queuing.
+/// Called from spawn_blocking since FIFO write can block.
+fn write_command_to_fifo(fifo_path: &str, command: &str) -> Result<(), String> {
+    use std::io::Write;
+    let msg = serde_json::json!({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": command
+        }
+    });
+    let mut fifo = std::fs::OpenOptions::new()
+        .write(true)
+        .open(fifo_path)
+        .map_err(|e| format!("Failed to open FIFO: {}", e))?;
+    writeln!(fifo, "{}", msg).map_err(|e| format!("Failed to write to FIFO: {}", e))?;
+    fifo.flush()
+        .map_err(|e| format!("Failed to flush FIFO: {}", e))?;
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    println!(
+        "  [{ts}] 📋 Queued command sent to FIFO: {}",
+        &command[..command.len().min(80)]
+    );
+    Ok(())
+}
+
+struct TurnBridgeContext {
+    provider: ProviderKind,
+    channel_id: ChannelId,
+    user_msg_id: MessageId,
+    user_text_owned: String,
+    role_binding: Option<RoleBinding>,
+    pcd_session_key: Option<String>,
+    current_msg_id: MessageId,
+    current_msg_len: usize,
+    response_sent_offset: usize,
+    full_response: String,
+    tmux_last_offset: Option<u64>,
+    tmux_input_fifo: Option<String>,
+    new_session_id: Option<String>,
+    inflight_state: InflightTurnState,
+}
+
+fn spawn_turn_bridge(
+    http: Arc<serenity::Http>,
+    shared_owned: Arc<SharedData>,
+    cancel_token: Arc<CancelToken>,
+    rx: mpsc::Receiver<StreamMessage>,
+    bridge: TurnBridgeContext,
+) {
     tokio::spawn(async move {
         const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        let mut full_response = String::new();
+        let channel_id = bridge.channel_id;
+        let provider = bridge.provider;
+        let user_msg_id = bridge.user_msg_id;
+        let user_text_owned = bridge.user_text_owned.clone();
+        let role_binding = bridge.role_binding.clone();
+        let pcd_session_key = bridge.pcd_session_key.clone();
+
+        let mut full_response = bridge.full_response.clone();
         let mut last_edit_text = String::new();
         let mut done = false;
         let mut cancelled = false;
         let mut current_tool_line: Option<String> = None;
         let mut last_tool_name: Option<String> = None;
         let mut accumulated_tokens: u64 = 0;
-        let mut new_session_id: Option<String> = None;
-        let mut tmux_last_offset: Option<u64> = None;
-        let mut tmux_input_fifo: Option<String> = None;
         let mut spin_idx: usize = 0;
-        let mut current_msg_id = placeholder_msg_id;
-        let mut current_msg_len: usize = 0;
-        let mut response_sent_offset: usize = 0; // tracks how much of full_response was finalized in previous messages
+        let mut current_msg_id = bridge.current_msg_id;
+        let mut current_msg_len = bridge.current_msg_len;
+        let mut response_sent_offset = bridge.response_sent_offset;
+        let mut tmux_last_offset = bridge.tmux_last_offset;
+        let mut tmux_input_fifo = bridge.tmux_input_fifo.clone();
+        let mut new_session_id = bridge.new_session_id.clone();
+        let mut inflight_state = bridge.inflight_state.clone();
+
+        let _ = save_inflight_state(&inflight_state);
 
         while !done {
+            let mut state_dirty = false;
+
             if cancel_token.cancelled.load(Ordering::Relaxed) {
                 cancelled = true;
                 break;
@@ -2692,142 +3168,135 @@ async fn handle_text_message(
                 break;
             }
 
-            // Drain all available messages
             loop {
                 match rx.try_recv() {
-                    Ok(msg) => {
-                        match msg {
-                            StreamMessage::Init { session_id: sid } => {
-                                new_session_id = Some(sid);
-                            }
-                            StreamMessage::Text { content } => {
-                                full_response.push_str(&content);
-                                current_tool_line = None;
-                                last_tool_name = None;
-                            }
-                            StreamMessage::ToolUse { name, input } => {
-                                let summary = format_tool_input(&name, &input);
-                                if !is_silent {
-                                    let ts = chrono::Local::now().format("%H:%M:%S");
-                                    eprint!(
-                                        "\r  [{ts}]   ⚙ {name}: {:<80}",
-                                        truncate_str(&summary, 80)
-                                    );
-                                }
-                                current_tool_line =
-                                    Some(format!("⚙ {}: {}", name, truncate_str(&summary, 120)));
-                                last_tool_name = Some(name.clone());
-                                // Ensure paragraph break between text blocks separated by tool calls
-                                if !full_response.is_empty() {
-                                    let trimmed = full_response.trim_end();
-                                    full_response.truncate(trimmed.len());
-                                    full_response.push_str("\n\n");
-                                }
-                            }
-                            StreamMessage::ToolResult { content, is_error } => {
-                                if !is_silent {
-                                    if is_error {
-                                        let ts = chrono::Local::now().format("%H:%M:%S");
-                                        eprintln!(
-                                            "\r  [{ts}]   ✗ Error: {:<80}",
-                                            truncate_str(&content, 80)
-                                        );
-                                    } else if let Some(ref tn) = last_tool_name {
-                                        let ts = chrono::Local::now().format("%H:%M:%S");
-                                        eprintln!("\r  [{ts}]   ✓ {tn}{:<80}", "");
-                                    }
-                                }
-                                // Keep showing last tool as "done" until next text arrives
-                                if let Some(ref tn) = last_tool_name {
-                                    let status = if is_error { "✗" } else { "✓" };
-                                    current_tool_line = Some(format!("{} {}", status, tn));
-                                }
-                                // Tool results (including errors) are only logged to console, not sent to Discord
-                                let _ = content;
-                            }
-                            StreamMessage::TaskNotification { summary, .. } => {
-                                if !summary.is_empty() {
-                                    full_response.push_str(&format!("\n[Task: {}]\n", summary));
-                                }
-                            }
-                            StreamMessage::Done {
-                                result,
-                                session_id: sid,
-                            } => {
-                                if !result.is_empty() && full_response.is_empty() {
-                                    full_response = result;
-                                }
-                                if let Some(s) = sid {
-                                    new_session_id = Some(s);
-                                }
-                                done = true;
-                            }
-                            StreamMessage::Error {
-                                message, stderr, ..
-                            } => {
-                                if !stderr.is_empty() {
-                                    full_response = format!(
-                                        "Error: {}\nstderr: {}",
-                                        message,
-                                        truncate_str(&stderr, 500)
-                                    );
-                                } else {
-                                    full_response = format!("Error: {}", message);
-                                }
-                                done = true;
-                            }
-                            StreamMessage::StatusUpdate {
-                                input_tokens,
-                                output_tokens,
-                                ..
-                            } => {
-                                // Accumulate tokens for PCD XP reporting
-                                if let (Some(it), Some(ot)) = (input_tokens, output_tokens) {
-                                    accumulated_tokens += it + ot;
-                                }
-                            }
-                            StreamMessage::TmuxReady {
-                                output_path,
-                                input_fifo_path,
-                                tmux_session_name,
-                                last_offset,
-                            } => {
-                                // Record offset and FIFO path for command queuing
-                                tmux_last_offset = Some(last_offset);
-                                tmux_input_fifo = Some(input_fifo_path);
-                                // Start background tmux watcher for terminal→Discord relay
-                                let already_watching =
-                                    shared_owned.tmux_watchers.contains_key(&channel_id);
-                                if !already_watching {
-                                    let cancel =
-                                        Arc::new(std::sync::atomic::AtomicBool::new(false));
-                                    let paused =
-                                        Arc::new(std::sync::atomic::AtomicBool::new(false));
-                                    let resume_offset =
-                                        Arc::new(std::sync::Mutex::new(None::<u64>));
-                                    let handle = TmuxWatcherHandle {
-                                        cancel: cancel.clone(),
-                                        paused: paused.clone(),
-                                        resume_offset: resume_offset.clone(),
-                                    };
-                                    shared_owned.tmux_watchers.insert(channel_id, handle);
-                                    let http_bg = http.clone();
-                                    let shared_bg = shared_owned.clone();
-                                    tokio::spawn(tmux_output_watcher(
-                                        channel_id,
-                                        http_bg,
-                                        shared_bg,
-                                        output_path,
-                                        tmux_session_name,
-                                        last_offset,
-                                        cancel,
-                                        paused,
-                                        resume_offset,
-                                    ));
-                                }
+                    Ok(msg) => match msg {
+                        StreamMessage::Init { session_id: sid } => {
+                            new_session_id = Some(sid.clone());
+                            inflight_state.session_id = Some(sid);
+                            state_dirty = true;
+                        }
+                        StreamMessage::Text { content } => {
+                            full_response.push_str(&content);
+                            current_tool_line = None;
+                            last_tool_name = None;
+                            inflight_state.full_response = full_response.clone();
+                            state_dirty = true;
+                        }
+                        StreamMessage::ToolUse { name, input } => {
+                            let summary = format_tool_input(&name, &input);
+                            current_tool_line =
+                                Some(format!("⚙ {}: {}", name, truncate_str(&summary, 120)));
+                            last_tool_name = Some(name.clone());
+                            if !full_response.is_empty() {
+                                let trimmed = full_response.trim_end();
+                                full_response.truncate(trimmed.len());
+                                full_response.push_str("\n\n");
+                                inflight_state.full_response = full_response.clone();
+                                state_dirty = true;
                             }
                         }
-                    }
+                        StreamMessage::ToolResult { content, is_error } => {
+                            if let Some(ref tn) = last_tool_name {
+                                let status = if is_error { "✗" } else { "✓" };
+                                current_tool_line = Some(format!("{} {}", status, tn));
+                            }
+                            let _ = content;
+                        }
+                        StreamMessage::TaskNotification { summary, .. } => {
+                            if !summary.is_empty() {
+                                full_response.push_str(&format!("\n[Task: {}]\n", summary));
+                                inflight_state.full_response = full_response.clone();
+                                state_dirty = true;
+                            }
+                        }
+                        StreamMessage::Done {
+                            result,
+                            session_id: sid,
+                        } => {
+                            if !result.is_empty() && full_response.is_empty() {
+                                full_response = result;
+                                inflight_state.full_response = full_response.clone();
+                            }
+                            if let Some(s) = sid {
+                                new_session_id = Some(s.clone());
+                                inflight_state.session_id = Some(s);
+                            }
+                            state_dirty = true;
+                            done = true;
+                        }
+                        StreamMessage::Error {
+                            message, stderr, ..
+                        } => {
+                            if !stderr.is_empty() {
+                                full_response = format!(
+                                    "Error: {}\nstderr: {}",
+                                    message,
+                                    truncate_str(&stderr, 500)
+                                );
+                            } else {
+                                full_response = format!("Error: {}", message);
+                            }
+                            inflight_state.full_response = full_response.clone();
+                            state_dirty = true;
+                            done = true;
+                        }
+                        StreamMessage::StatusUpdate {
+                            input_tokens,
+                            output_tokens,
+                            ..
+                        } => {
+                            if let (Some(it), Some(ot)) = (input_tokens, output_tokens) {
+                                accumulated_tokens += it + ot;
+                            }
+                        }
+                        StreamMessage::TmuxReady {
+                            output_path,
+                            input_fifo_path,
+                            tmux_session_name,
+                            last_offset,
+                        } => {
+                            tmux_last_offset = Some(last_offset);
+                            tmux_input_fifo = Some(input_fifo_path.clone());
+                            inflight_state.tmux_session_name = Some(tmux_session_name.clone());
+                            inflight_state.output_path = Some(output_path.clone());
+                            inflight_state.input_fifo_path = Some(input_fifo_path);
+                            inflight_state.last_offset = last_offset;
+
+                            let already_watching =
+                                shared_owned.tmux_watchers.contains_key(&channel_id);
+                            if !already_watching {
+                                let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                let resume_offset = Arc::new(std::sync::Mutex::new(None::<u64>));
+                                let handle = TmuxWatcherHandle {
+                                    cancel: cancel.clone(),
+                                    paused: paused.clone(),
+                                    resume_offset: resume_offset.clone(),
+                                };
+                                shared_owned.tmux_watchers.insert(channel_id, handle);
+                                let http_bg = http.clone();
+                                let shared_bg = shared_owned.clone();
+                                tokio::spawn(tmux_output_watcher(
+                                    channel_id,
+                                    http_bg,
+                                    shared_bg,
+                                    output_path,
+                                    tmux_session_name,
+                                    last_offset,
+                                    cancel,
+                                    paused,
+                                    resume_offset,
+                                ));
+                            }
+                            state_dirty = true;
+                        }
+                        StreamMessage::OutputOffset { offset } => {
+                            tmux_last_offset = Some(offset);
+                            inflight_state.last_offset = offset;
+                            state_dirty = true;
+                        }
+                    },
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         done = true;
@@ -2836,7 +3305,6 @@ async fn handle_text_message(
                 }
             }
 
-            // Build display text with spinner (only show unsent portion of response)
             let indicator = SPINNER[spin_idx % SPINNER.len()];
             spin_idx += 1;
 
@@ -2858,13 +3326,10 @@ async fn handle_text_message(
             };
 
             if display_text != last_edit_text && !done {
-                // Check if we need to start a new message (content too long)
                 if display_text.len() > DISCORD_MSG_LIMIT - 50 && current_msg_len > 100 {
-                    // Finalize current message with content up to this point
                     let normalized = normalize_empty_lines(current_portion);
                     let finalize_text = truncate_str(&normalized, DISCORD_MSG_LIMIT - 10);
                     current_msg_len = finalize_text.len();
-                    // Track how much of full_response is now finalized
                     response_sent_offset = full_response.len();
 
                     rate_limit_wait(&shared_owned, channel_id).await;
@@ -2876,7 +3341,6 @@ async fn handle_text_message(
                         )
                         .await;
 
-                    // Start new message
                     rate_limit_wait(&shared_owned, channel_id).await;
                     if let Ok(new_msg) = channel_id
                         .send_message(
@@ -2900,10 +3364,18 @@ async fn handle_text_message(
                     current_msg_len = display_text.len();
                 }
                 last_edit_text = display_text;
+                inflight_state.current_msg_id = current_msg_id.get();
+                inflight_state.current_msg_len = current_msg_len;
+                inflight_state.response_sent_offset = response_sent_offset;
+                inflight_state.full_response = full_response.clone();
+                state_dirty = true;
+            }
+
+            if state_dirty {
+                let _ = save_inflight_state(&inflight_state);
             }
         }
 
-        // Resume tmux watcher if it was paused
         if let Some(offset) = tmux_last_offset {
             if let Some(watcher) = shared_owned.tmux_watchers.get(&channel_id) {
                 *watcher.resume_offset.lock().unwrap() = Some(offset);
@@ -2911,7 +3383,6 @@ async fn handle_text_message(
             }
         }
 
-        // Report session presence and any accrued tokens to PCD.
         post_pcd_session_status(
             pcd_session_key.as_deref(),
             "idle",
@@ -2920,7 +3391,6 @@ async fn handle_text_message(
         )
         .await;
 
-        // Remove active token/owner and collect queued commands for auto-processing
         let queued_commands: Vec<String> = {
             let mut data = shared_owned.core.lock().await;
             data.cancel_tokens.remove(&channel_id);
@@ -2937,11 +3407,9 @@ async fn handle_text_message(
                 .collect()
         };
 
-        // Remove hourglass reaction
         remove_reaction_raw(&http, channel_id, user_msg_id, '⏳').await;
 
         if cancelled {
-            // Kill child process
             if let Ok(guard) = cancel_token.child_pid.lock() {
                 if let Some(pid) = *guard {
                     claude::kill_pid_tree(pid);
@@ -2955,7 +3423,6 @@ async fn handle_text_message(
                 format!("{}\n\n[Stopped]", formatted)
             };
 
-            // Send final stopped message
             rate_limit_wait(&shared_owned, channel_id).await;
             let _ = channel_id
                 .edit_message(
@@ -2965,13 +3432,11 @@ async fn handle_text_message(
                 )
                 .await;
 
-            // Add stop reaction
             add_reaction_raw(&http, channel_id, user_msg_id, '🛑').await;
 
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!("  [{ts}] ■ Stopped");
 
-            // Record in history
             let mut data = shared_owned.core.lock().await;
             if let Some(session) = data.sessions.get_mut(&channel_id) {
                 if !session.cleared {
@@ -3008,12 +3473,9 @@ async fn handle_text_message(
                 }
             }
 
-            // Process queued commands even after cancellation
             if !queued_commands.is_empty() {
                 if let Some(ref fifo_path) = tmux_input_fifo {
                     let cmd_count = queued_commands.len();
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    println!("  [{ts}] 📋 Processing {cmd_count} queued command(s) after cancel");
                     rate_limit_wait(&shared_owned, channel_id).await;
                     let _ = channel_id
                         .say(&http, format!("📋 큐잉된 명령 처리 중 ({cmd_count}개)..."))
@@ -3029,17 +3491,17 @@ async fn handle_text_message(
                 }
             }
 
+            clear_inflight_state(provider, channel_id.get());
+            shared_owned.recovering_channels.remove(&channel_id);
             return;
         }
 
-        // Final response
         if full_response.is_empty() {
             full_response = "(No response)".to_string();
         }
 
         let full_response = format_for_discord(&full_response);
 
-        // Delete placeholder and send final split messages
         rate_limit_wait(&shared_owned, channel_id).await;
         let _ = channel_id.delete_message(&http, current_msg_id).await;
 
@@ -3048,7 +3510,6 @@ async fn handle_text_message(
         {
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!("  [{ts}]   ⚠ send_long_message failed: {e}");
-            // Fallback: send truncated
             rate_limit_wait(&shared_owned, channel_id).await;
             let _ = channel_id
                 .send_message(
@@ -3058,10 +3519,8 @@ async fn handle_text_message(
                 .await;
         }
 
-        // Add checkmark reaction
         add_reaction_raw(&http, channel_id, user_msg_id, '✅').await;
 
-        // Update session state
         {
             let mut data = shared_owned.core.lock().await;
             if let Some(session) = data.sessions.get_mut(&channel_id) {
@@ -3103,12 +3562,9 @@ async fn handle_text_message(
         let ts = chrono::Local::now().format("%H:%M:%S");
         println!("  [{ts}] ▶ Response sent");
 
-        // Auto-process queued commands via FIFO (command queuing)
         if !queued_commands.is_empty() {
             if let Some(ref fifo_path) = tmux_input_fifo {
                 let cmd_count = queued_commands.len();
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                println!("  [{ts}] 📋 Processing {cmd_count} queued command(s)");
                 rate_limit_wait(&shared_owned, channel_id).await;
                 let _ = channel_id
                     .say(&http, format!("📋 큐잉된 명령 처리 중 ({cmd_count}개)..."))
@@ -3123,32 +3579,201 @@ async fn handle_text_message(
                 }
             }
         }
-    });
 
-    Ok(())
+        clear_inflight_state(provider, channel_id.get());
+        shared_owned.recovering_channels.remove(&channel_id);
+    });
 }
 
-/// Write a command to the tmux FIFO pipe for command queuing.
-/// Called from spawn_blocking since FIFO write can block.
-fn write_command_to_fifo(fifo_path: &str, command: &str) -> Result<(), String> {
-    use std::io::Write;
-    let msg = serde_json::json!({
-        "type": "user",
-        "message": {
-            "role": "user",
-            "content": command
+async fn restore_inflight_turns(
+    http: &Arc<serenity::Http>,
+    shared: &Arc<SharedData>,
+    provider: ProviderKind,
+) {
+    let states = load_inflight_states(provider);
+    if states.is_empty() {
+        return;
+    }
+
+    let settings_snapshot = shared.settings.read().await.clone();
+
+    for state in states {
+        let channel_id = ChannelId::new(state.channel_id);
+        let current_msg_id = MessageId::new(state.current_msg_id);
+        let user_msg_id = MessageId::new(state.user_msg_id);
+        let channel_name = state.channel_name.clone();
+        let tmux_session_name = state.tmux_session_name.clone().or_else(|| {
+            channel_name
+                .as_ref()
+                .map(|name| provider.build_tmux_session_name(name))
+        });
+        let (fallback_output, fallback_input) = tmux_session_name
+            .as_deref()
+            .map(tmux_runtime_paths)
+            .unwrap_or_else(|| (String::new(), String::new()));
+        let output_path = state
+            .output_path
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| (!fallback_output.is_empty()).then_some(fallback_output.clone()));
+        let input_fifo_path = state
+            .input_fifo_path
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| (!fallback_input.is_empty()).then_some(fallback_input.clone()));
+
+        let can_recover = tmux_session_name.as_deref().map_or(false, |name| {
+            std::process::Command::new("tmux")
+                .args(["has-session", "-t", name])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        });
+
+        if !can_recover {
+            rate_limit_wait(shared, channel_id).await;
+            let _ = channel_id
+                .edit_message(
+                    http,
+                    current_msg_id,
+                    EditMessage::new().content(truncate_str(
+                        &stale_inflight_message(&state.full_response),
+                        DISCORD_MSG_LIMIT,
+                    )),
+                )
+                .await;
+            clear_inflight_state(provider, state.channel_id);
+            continue;
         }
-    });
-    let mut fifo = std::fs::OpenOptions::new()
-        .write(true)
-        .open(fifo_path)
-        .map_err(|e| format!("Failed to open FIFO: {}", e))?;
-    writeln!(fifo, "{}", msg).map_err(|e| format!("Failed to write to FIFO: {}", e))?;
-    fifo.flush()
-        .map_err(|e| format!("Failed to flush FIFO: {}", e))?;
-    let ts = chrono::Local::now().format("%H:%M:%S");
-    println!("  [{ts}] 📋 Queued command sent to FIFO: {}", &command[..command.len().min(80)]);
-    Ok(())
+
+        let Some(tmux_session_name) = tmux_session_name else {
+            clear_inflight_state(provider, state.channel_id);
+            continue;
+        };
+        let Some(output_path) = output_path else {
+            clear_inflight_state(provider, state.channel_id);
+            continue;
+        };
+        let Some(input_fifo_path) = input_fifo_path else {
+            clear_inflight_state(provider, state.channel_id);
+            continue;
+        };
+
+        shared.recovering_channels.insert(channel_id, ());
+
+        let channel_key = channel_id.get().to_string();
+        let last_path = settings_snapshot.last_sessions.get(&channel_key).cloned();
+        let saved_remote = settings_snapshot.last_remotes.get(&channel_key).cloned();
+
+        let cancel_token = Arc::new(CancelToken::new());
+        if let Ok(mut guard) = cancel_token.tmux_session.lock() {
+            *guard = Some(tmux_session_name.clone());
+        }
+
+        {
+            let mut data = shared.core.lock().await;
+            let session = data
+                .sessions
+                .entry(channel_id)
+                .or_insert_with(|| DiscordSession {
+                    session_id: state.session_id.clone(),
+                    current_path: None,
+                    history: Vec::new(),
+                    pending_uploads: Vec::new(),
+                    cleared: false,
+                    remote_profile_name: saved_remote.clone(),
+                    channel_id: Some(channel_id.get()),
+                    channel_name: channel_name.clone(),
+                    category_name: None,
+                    silent: false,
+                    last_active: tokio::time::Instant::now(),
+                    worktree: None,
+                });
+            session.channel_id = Some(channel_id.get());
+            session.last_active = tokio::time::Instant::now();
+            if session.current_path.is_none() {
+                session.current_path = last_path;
+            }
+            if session.channel_name.is_none() {
+                session.channel_name = channel_name.clone();
+            }
+            if session.remote_profile_name.is_none() {
+                session.remote_profile_name = saved_remote;
+            }
+            data.cancel_tokens.insert(channel_id, cancel_token.clone());
+            data.active_request_owner
+                .insert(channel_id, UserId::new(state.request_owner_user_id));
+        }
+
+        let role_binding = resolve_role_binding(channel_id, channel_name.as_deref());
+        let pcd_session_key = build_pcd_session_key(shared, channel_id, provider).await;
+        post_pcd_session_status(pcd_session_key.as_deref(), "working", provider, None).await;
+
+        let (tx, rx) = mpsc::channel();
+        let cancel_for_reader = cancel_token.clone();
+        let output_for_reader = output_path.clone();
+        let input_for_reader = input_fifo_path.clone();
+        let tmux_for_reader = tmux_session_name.clone();
+        let start_offset = state.last_offset;
+        let recovery_session_id = state.session_id.clone();
+        std::thread::spawn(move || {
+            match claude::read_output_file_until_result(
+                &output_for_reader,
+                start_offset,
+                tx.clone(),
+                Some(cancel_for_reader),
+                &tmux_for_reader,
+            ) {
+                Ok(ReadOutputResult::Completed { offset })
+                | Ok(ReadOutputResult::Cancelled { offset }) => {
+                    let _ = tx.send(StreamMessage::TmuxReady {
+                        output_path: output_for_reader,
+                        input_fifo_path: input_for_reader,
+                        tmux_session_name: tmux_for_reader,
+                        last_offset: offset,
+                    });
+                }
+                Ok(ReadOutputResult::SessionDied { .. }) => {
+                    let _ = tx.send(StreamMessage::Done {
+                        result: "⚠️ RemoteCC 재시작 중 진행되던 세션을 복구하지 못했습니다."
+                            .to_string(),
+                        session_id: recovery_session_id,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(StreamMessage::Error {
+                        message: e,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        exit_code: None,
+                    });
+                }
+            }
+        });
+
+        spawn_turn_bridge(
+            http.clone(),
+            shared.clone(),
+            cancel_token,
+            rx,
+            TurnBridgeContext {
+                provider,
+                channel_id,
+                user_msg_id,
+                user_text_owned: state.user_text.clone(),
+                role_binding,
+                pcd_session_key,
+                current_msg_id,
+                current_msg_len: state.current_msg_len,
+                response_sent_offset: state.response_sent_offset,
+                full_response: state.full_response.clone(),
+                tmux_last_offset: Some(state.last_offset),
+                tmux_input_fifo: Some(input_fifo_path),
+                new_session_id: state.session_id.clone(),
+                inflight_state: state,
+            },
+        );
+    }
 }
 
 // ─── File upload handling ────────────────────────────────────────────────────
@@ -3456,6 +4081,7 @@ async fn auto_restore_session(
                     remote_profile_name: saved_remote.clone(),
                     silent: false,
                     last_active: tokio::time::Instant::now(),
+                    worktree: None,
                 });
             session.channel_id = Some(channel_id.get());
             session.last_active = tokio::time::Instant::now();
