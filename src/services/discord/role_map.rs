@@ -1,0 +1,184 @@
+use std::fs;
+
+use poise::serenity_prelude::ChannelId;
+
+use super::meeting::{MeetingAgentConfig, MeetingConfig};
+use super::runtime_store::role_map_path;
+use super::settings::{PeerAgentInfo, RoleBinding};
+use crate::services::provider::ProviderKind;
+
+fn load_role_map_json() -> Option<serde_json::Value> {
+    let path = role_map_path()?;
+    let content = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn parse_role_binding(value: &serde_json::Value) -> Option<RoleBinding> {
+    let obj = value.as_object()?;
+    let role_id = obj.get("roleId")?.as_str()?.to_string();
+    let prompt_file = obj.get("promptFile")?.as_str()?.to_string();
+    let provider = obj
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .and_then(ProviderKind::from_str);
+    Some(RoleBinding {
+        role_id,
+        prompt_file,
+        provider,
+    })
+}
+
+fn fallback_enabled(json: &serde_json::Value) -> bool {
+    json.get("fallbackByChannelName")
+        .and_then(|v| v.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+pub(super) fn resolve_role_binding(
+    channel_id: ChannelId,
+    channel_name: Option<&str>,
+) -> Option<RoleBinding> {
+    let json = load_role_map_json()?;
+
+    if let Some(by_id) = json.get("byChannelId").and_then(|v| v.as_object()) {
+        let key = channel_id.get().to_string();
+        if let Some(binding) = by_id.get(&key).and_then(parse_role_binding) {
+            return Some(binding);
+        }
+    }
+
+    if !fallback_enabled(&json) {
+        return None;
+    }
+
+    let cname = channel_name?;
+    let by_name = json.get("byChannelName").and_then(|v| v.as_object())?;
+    by_name.get(cname).and_then(parse_role_binding)
+}
+
+pub(super) fn resolve_workspace(
+    channel_id: ChannelId,
+    channel_name: Option<&str>,
+) -> Option<String> {
+    let json = load_role_map_json()?;
+
+    if let Some(by_id) = json.get("byChannelId").and_then(|v| v.as_object()) {
+        let key = channel_id.get().to_string();
+        if let Some(entry) = by_id.get(&key) {
+            if let Some(ws) = entry.get("workspace").and_then(|v| v.as_str()) {
+                return Some(ws.to_string());
+            }
+        }
+    }
+
+    if !fallback_enabled(&json) {
+        return None;
+    }
+
+    let cname = channel_name?;
+    let by_name = json.get("byChannelName").and_then(|v| v.as_object())?;
+    by_name
+        .get(cname)
+        .and_then(|entry| entry.get("workspace"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+pub(super) fn load_peer_agents() -> Vec<PeerAgentInfo> {
+    let Some(json) = load_role_map_json() else {
+        return Vec::new();
+    };
+    let Some(agents) = json
+        .get("meeting")
+        .and_then(|meeting| meeting.get("available_agents"))
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    for agent in agents {
+        let Some(obj) = agent.as_object() else {
+            continue;
+        };
+        let Some(role_id) = obj.get("role_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !seen.insert(role_id.to_string()) {
+            continue;
+        }
+        let Some(display_name) = obj.get("display_name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let keywords = obj
+            .get("keywords")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        result.push(PeerAgentInfo {
+            role_id: role_id.to_string(),
+            display_name: display_name.to_string(),
+            keywords,
+        });
+    }
+
+    result
+}
+
+pub(super) fn load_meeting_config() -> Option<MeetingConfig> {
+    let json = load_role_map_json()?;
+    let meeting = json.get("meeting")?;
+
+    let channel_name = meeting.get("channel_name")?.as_str()?.to_string();
+    let max_rounds = meeting
+        .get("max_rounds")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(3) as u32;
+    let summary_agent = meeting.get("summary_agent")?.as_str()?.to_string();
+
+    let agents_arr = meeting.get("available_agents")?.as_array()?;
+    let mut available_agents = Vec::new();
+    for agent in agents_arr {
+        let Some(role_id) = agent.get("role_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(display_name) = agent.get("display_name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let prompt_file = agent
+            .get("prompt_file")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let keywords = agent
+            .get("keywords")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        available_agents.push(MeetingAgentConfig {
+            role_id: role_id.to_string(),
+            display_name: display_name.to_string(),
+            keywords,
+            prompt_file,
+        });
+    }
+
+    Some(MeetingConfig {
+        channel_name,
+        max_rounds,
+        summary_agent,
+        available_agents,
+    })
+}
