@@ -1,0 +1,1 @@
+../../.claude/commands/rcc-smoke-test.md

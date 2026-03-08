@@ -68,6 +68,35 @@ npm install -g @anthropic-ai/claude-code
 
 Learn more at [docs.anthropic.com](https://docs.anthropic.com/en/docs/claude-code)
 
+## Discord Bot Notes
+
+- `/start` without a path creates a local workspace under `~/.remotecc/workspace/<random>`.
+- `/allowed +/-ToolName` matches tool names case-insensitively against the built-in Claude Code tool list.
+- An explicitly empty `allowed_tools` list in `~/.remotecc/bot_settings.json` is preserved across restarts, so "disable everything" remains a valid policy.
+
+## Discord Smoke Test
+
+Run this before shipping Discord runtime changes:
+
+```bash
+cd /Users/itismyfield/remotecc
+scripts/remotecc-discord-smoke.sh
+```
+
+For live rollout on mac-mini:
+
+```bash
+cd /Users/itismyfield/remotecc
+scripts/remotecc-discord-smoke.sh --deploy-live --reset-wrappers
+```
+
+Minimum release bar for changes in `src/services/tmux_wrapper.rs`, `src/services/claude.rs`, or `src/services/discord/*`:
+
+- `scripts/remotecc-discord-smoke.sh` passes locally.
+- If the deployed binary changed, run `--deploy-live`.
+- If wrapper code changed, include `--reset-wrappers` so old tmux sessions do not keep the stale binary.
+- After deploy, send one short Korean prompt in `#mac-mini` and confirm an actual Discord reply.
+
 ## Supported Platforms
 
 - macOS (Apple Silicon & Intel)

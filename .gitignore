@@ -31,3 +31,6 @@ Thumbs.db
 # Environment
 .env
 .env.local
+
+# Local cross-build artifacts
+/dist/remotecc-macos-x86_64

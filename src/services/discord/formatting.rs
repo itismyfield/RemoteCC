@@ -1,5 +1,6 @@
 use poise::serenity_prelude as serenity;
 use serenity::{ChannelId, CreateMessage};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::{rate_limit_wait, SharedData, DISCORD_MSG_LIMIT};
@@ -54,6 +55,40 @@ pub(super) fn tool_info(name: &str) -> (&'static str, bool) {
         .find(|(n, _, _)| *n == name)
         .map(|(_, desc, destr)| (*desc, *destr))
         .unwrap_or(("Custom tool", false))
+}
+
+/// Map a user-provided tool name onto its canonical Claude Code tool name.
+pub(super) fn canonical_tool_name(name: &str) -> Option<&'static str> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    ALL_TOOLS
+        .iter()
+        .find(|(tool_name, _, _)| tool_name.eq_ignore_ascii_case(trimmed))
+        .map(|(tool_name, _, _)| *tool_name)
+}
+
+/// Canonicalize, dedupe, and discard unknown tool names while preserving input order.
+pub(super) fn normalize_allowed_tools<I, S>(tools: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::new();
+
+    for tool in tools {
+        let Some(canonical) = canonical_tool_name(tool.as_ref()) else {
+            continue;
+        };
+        if seen.insert(canonical) {
+            normalized.push(canonical.to_string());
+        }
+    }
+
+    normalized
 }
 
 /// Format a risk badge for display
@@ -156,6 +191,45 @@ pub(super) fn extract_skill_description(content: &str) -> String {
     "Custom skill".to_string()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{canonical_tool_name, normalize_allowed_tools};
+
+    #[test]
+    fn test_canonical_tool_name_is_case_insensitive() {
+        assert_eq!(canonical_tool_name("webfetch"), Some("WebFetch"));
+        assert_eq!(canonical_tool_name("WEBSEARCH"), Some("WebSearch"));
+        assert_eq!(
+            canonical_tool_name("AskUserQuestion"),
+            Some("AskUserQuestion")
+        );
+        assert_eq!(
+            canonical_tool_name("askuserquestion"),
+            Some("AskUserQuestion")
+        );
+    }
+
+    #[test]
+    fn test_normalize_allowed_tools_discards_unknown_and_dedupes() {
+        let normalized = normalize_allowed_tools([
+            "webfetch",
+            "WebFetch",
+            "BASH",
+            "unknown-tool",
+            "askuserquestion",
+        ]);
+
+        assert_eq!(
+            normalized,
+            vec![
+                "WebFetch".to_string(),
+                "Bash".to_string(),
+                "AskUserQuestion".to_string()
+            ]
+        );
+    }
+}
+
 pub(super) fn floor_char_boundary(s: &str, index: usize) -> usize {
     if index >= s.len() {
         s.len()
@@ -208,7 +282,9 @@ pub(super) fn normalize_empty_lines(s: &str) -> String {
 
 /// Shorten a file path for display: replace home dir with ~ and show only last 2 components
 pub(super) fn shorten_path(path: &str) -> String {
-    let home = dirs::home_dir().map(|h| h.display().to_string()).unwrap_or_default();
+    let home = dirs::home_dir()
+        .map(|h| h.display().to_string())
+        .unwrap_or_default();
     let shortened = if !home.is_empty() && path.starts_with(&home) {
         format!("~{}", &path[home.len()..])
     } else {
@@ -217,7 +293,7 @@ pub(super) fn shorten_path(path: &str) -> String {
     // If path has many components, show .../<last2>
     let parts: Vec<&str> = shortened.split('/').collect();
     if parts.len() > 4 {
-        format!(".../{}", parts[parts.len()-2..].join("/"))
+        format!(".../{}", parts[parts.len() - 2..].join("/"))
     } else {
         shortened
     }
@@ -281,7 +357,12 @@ pub(super) fn format_tool_input(name: &str, input: &str) -> String {
             let output_mode = v.get("output_mode").and_then(|v| v.as_str()).unwrap_or("");
             if !path.is_empty() {
                 if !output_mode.is_empty() {
-                    format!("\"{}\" in {} ({})", pattern, shorten_path(path), output_mode)
+                    format!(
+                        "\"{}\" in {} ({})",
+                        pattern,
+                        shorten_path(path),
+                        output_mode
+                    )
                 } else {
                     format!("\"{}\" in {}", pattern, shorten_path(path))
                 }

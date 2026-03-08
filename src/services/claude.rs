@@ -6,7 +6,9 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
 use std::sync::OnceLock;
 
+use crate::services::provider::ProviderKind;
 use crate::services::remote::RemoteProfile;
+use crate::utils::format::safe_prefix;
 
 /// Cached path to the claude binary.
 /// Once resolved, reused for all subsequent calls.
@@ -27,12 +29,28 @@ fn resolve_claude_path() -> Option<String> {
     }
 
     // Fallback: use login shell to resolve PATH
-    if let Ok(output) = Command::new("bash").args(["-lc", "which claude"]).output() {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Some(path);
+    for shell in &["zsh", "bash"] {
+        if let Ok(output) = Command::new(shell).args(["-lc", "which claude"]).output() {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path.is_empty() {
+                    return Some(path);
+                }
             }
+        }
+    }
+
+    // Fallback: check known installation paths
+    let home = dirs::home_dir().unwrap_or_default();
+    let known_paths = [
+        home.join(".local/bin/claude"),
+        home.join("bin/claude"),
+        std::path::PathBuf::from("/usr/local/bin/claude"),
+        std::path::PathBuf::from("/opt/homebrew/bin/claude"),
+    ];
+    for path in &known_paths {
+        if path.is_file() {
+            return Some(path.display().to_string());
         }
     }
 
@@ -1021,7 +1039,7 @@ impl StreamLineState {
 
 /// Process a single stream-json line. Returns false if the sender channel is disconnected.
 /// Sets `stdout_error` in state for error messages (these are deferred until process exit).
-fn process_stream_line(
+pub(crate) fn process_stream_line(
     line: &str,
     sender: &Sender<StreamMessage>,
     state: &mut StreamLineState,
@@ -1116,7 +1134,7 @@ fn process_stream_line(
 
 /// Shell-escape a string using single quotes (POSIX safe).
 /// Internal single quotes are replaced with `'\''`.
-fn shell_escape(s: &str) -> String {
+pub(crate) fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
@@ -1238,7 +1256,7 @@ fn execute_streaming_remote(
             escaped_args.join(" ")
         );
 
-        debug_log(&format!("Remote command: {}", &cmd[..cmd.len().min(300)]));
+        debug_log(&format!("Remote command: {}", safe_prefix(&cmd, 300)));
 
         channel.exec(true, cmd)
             .await
@@ -1493,18 +1511,7 @@ pub fn is_tmux_available() -> bool {
 /// Sanitize a name for use as a tmux session name.
 /// Replaces non-alphanumeric characters (except - and _) with -.
 pub fn sanitize_tmux_session_name(channel_name: &str) -> String {
-    let sanitized: String = channel_name
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let trimmed = &sanitized[..sanitized.len().min(50)];
-    format!("remoteCC-{}", trimmed)
+    ProviderKind::Claude.build_tmux_session_name(channel_name)
 }
 
 /// Execute Claude inside a local tmux session with bidirectional input.
@@ -1605,10 +1612,7 @@ fn execute_streaming_local_tmux(
     }
     let wrapper_cmd = wrapper_parts.join(" ");
 
-    debug_log(&format!(
-        "Wrapper cmd: {}",
-        &wrapper_cmd[..wrapper_cmd.len().min(300)]
-    ));
+    debug_log(&format!("Wrapper cmd: {}", safe_prefix(&wrapper_cmd, 300)));
 
     // Launch tmux session (remove CLAUDECODE so nested claude invocations work)
     let wrapper_cmd_with_env = format!("env -u CLAUDECODE {}", wrapper_cmd);
@@ -1668,10 +1672,7 @@ fn execute_streaming_local_tmux(
             ReadOutputResult::SessionDied { .. } => {
                 attempt += 1;
                 if attempt > MAX_RETRIES {
-                    debug_log(&format!(
-                        "tmux session died {} times, giving up",
-                        attempt
-                    ));
+                    debug_log(&format!("tmux session died {} times, giving up", attempt));
                     let _ = sender.send(StreamMessage::Done {
                         result: "⚠ tmux 세션이 반복 종료되었습니다. 다시 시도해 주세요."
                             .to_string(),
@@ -1825,7 +1826,7 @@ fn send_followup_to_tmux(
 /// Poll-read the output file from a given offset until a "result" event is received.
 /// Uses raw File::read to handle growing file (not BufReader which caches EOF).
 /// Returns ReadOutputResult indicating how the read ended.
-fn read_output_file_until_result(
+pub(crate) fn read_output_file_until_result(
     output_path: &str,
     start_offset: u64,
     sender: Sender<StreamMessage>,
@@ -1852,7 +1853,9 @@ fn read_output_file_until_result(
         }
         if let Some(ref token) = cancel_token {
             if token.cancelled.load(Ordering::Relaxed) {
-                return Ok(ReadOutputResult::Cancelled { offset: start_offset });
+                return Ok(ReadOutputResult::Cancelled {
+                    offset: start_offset,
+                });
             }
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -1874,7 +1877,9 @@ fn read_output_file_until_result(
         if let Some(ref token) = cancel_token {
             if token.cancelled.load(Ordering::Relaxed) {
                 debug_log("Cancel detected during output file read");
-                return Ok(ReadOutputResult::Cancelled { offset: current_offset });
+                return Ok(ReadOutputResult::Cancelled {
+                    offset: current_offset,
+                });
             }
         }
 
@@ -1911,13 +1916,17 @@ fn read_output_file_until_result(
 
                     if !process_stream_line(trimmed, &sender, &mut state) {
                         debug_log("Channel disconnected during output file read");
-                        return Ok(ReadOutputResult::Cancelled { offset: current_offset });
+                        return Ok(ReadOutputResult::Cancelled {
+                            offset: current_offset,
+                        });
                     }
 
                     // Check if we got a result (turn complete)
                     if state.final_result.is_some() {
                         debug_log("Result received — returning from output file read");
-                        return Ok(ReadOutputResult::Completed { offset: current_offset });
+                        return Ok(ReadOutputResult::Completed {
+                            offset: current_offset,
+                        });
                     }
                 }
             }
@@ -1939,7 +1948,9 @@ fn read_output_file_until_result(
     }
 
     debug_log("=== read_output_file_until_result END (session died) ===");
-    Ok(ReadOutputResult::SessionDied { offset: current_offset })
+    Ok(ReadOutputResult::SessionDied {
+        offset: current_offset,
+    })
 }
 
 /// Execute Claude inside a tmux session on a remote host via SSH.
@@ -2226,7 +2237,7 @@ fn execute_streaming_remote_tmux(
         eprintln!("  [remote-tmux] Stream ended. exit_status={:?}, stderr_len={}, tokens_in={}, has_result={}",
             exit_status, stderr_msg.len(), line_state.accum_input_tokens, line_state.final_result.is_some());
         if !stderr_msg.is_empty() {
-            eprintln!("  [remote-tmux] stderr: {}", &stderr_msg[..stderr_msg.len().min(500)]);
+            eprintln!("  [remote-tmux] stderr: {}", safe_prefix(&stderr_msg, 500));
         }
         let success = exit_status.map_or(true, |s| s == 0);
         if line_state.stdout_error.is_some() || (!success && line_state.final_result.is_none()) {

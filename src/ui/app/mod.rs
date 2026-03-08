@@ -1,11 +1,11 @@
-mod state;
+mod dialogs;
+mod operations;
 mod panel;
 mod remote;
-mod operations;
-mod dialogs;
+mod state;
 
-pub use state::*;
 pub use panel::*;
+pub use state::*;
 
 use std::path::{Path, PathBuf};
 

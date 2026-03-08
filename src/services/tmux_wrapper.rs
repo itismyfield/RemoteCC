@@ -13,6 +13,8 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::utils::format::safe_prefix;
+
 /// Entry point for the tmux wrapper subprocess.
 pub fn run(
     output_file: &str,
@@ -56,7 +58,9 @@ pub fn run(
             working_dir.to_string()
         }
     } else if working_dir == "~" {
-        dirs::home_dir().map(|h| h.to_string_lossy().to_string()).unwrap_or_else(|| working_dir.to_string())
+        dirs::home_dir()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_else(|| working_dir.to_string())
     } else {
         working_dir.to_string()
     };
@@ -161,8 +165,14 @@ pub fn run(
                     // Detect fatal startup errors (e.g. auth failure).
                     // If Claude reports is_error with zero cost, it failed before
                     // making any API call — no point keeping the session alive.
-                    let is_error = json.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
-                    let cost = json.get("total_cost_usd").and_then(|v| v.as_f64()).unwrap_or(1.0);
+                    let is_error = json
+                        .get("is_error")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let cost = json
+                        .get("total_cost_usd")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(1.0);
                     if is_error && cost == 0.0 {
                         eprintln!("\x1b[31m[fatal startup error — session will exit]\x1b[0m");
                         break;
@@ -294,48 +304,100 @@ fn format_tool_detail(name: &str, item: &serde_json::Value) -> String {
     match name {
         "Bash" => {
             let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            let desc = input.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            let desc = input
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if !desc.is_empty() {
-                let truncated = if cmd.len() > 120 { &cmd[..120] } else { cmd };
+                let truncated = safe_prefix(cmd, 120);
                 format!("{}: `{}`", desc, truncated)
             } else if !cmd.is_empty() {
-                let truncated = if cmd.len() > 150 { &cmd[..150] } else { cmd };
+                let truncated = safe_prefix(cmd, 150);
                 format!("`{}`", truncated)
             } else {
                 String::new()
             }
         }
-        "Read" => input.get("file_path").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        "Read" => input
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
         "Write" => {
-            let fp = input.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
-            let lines = input.get("content").and_then(|v| v.as_str()).map(|c| c.lines().count()).unwrap_or(0);
-            if lines > 0 { format!("{} ({} lines)", fp, lines) } else { fp.to_string() }
+            let fp = input
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let lines = input
+                .get("content")
+                .and_then(|v| v.as_str())
+                .map(|c| c.lines().count())
+                .unwrap_or(0);
+            if lines > 0 {
+                format!("{} ({} lines)", fp, lines)
+            } else {
+                fp.to_string()
+            }
         }
-        "Edit" => input.get("file_path").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        "Edit" => input
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
         "Glob" => {
             let pattern = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
             let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            if !path.is_empty() { format!("{} in {}", pattern, path) } else { pattern.to_string() }
+            if !path.is_empty() {
+                format!("{} in {}", pattern, path)
+            } else {
+                pattern.to_string()
+            }
         }
         "Grep" => {
             let pattern = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
             let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            if !path.is_empty() { format!("\"{}\" in {}", pattern, path) } else { format!("\"{}\"", pattern) }
+            if !path.is_empty() {
+                format!("\"{}\" in {}", pattern, path)
+            } else {
+                format!("\"{}\"", pattern)
+            }
         }
-        "WebSearch" => input.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        "WebFetch" => input.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        "WebSearch" => input
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "WebFetch" => input
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
         "Agent" => {
-            let desc = input.get("description").and_then(|v| v.as_str()).unwrap_or("");
-            let agent_type = input.get("subagent_type").and_then(|v| v.as_str()).unwrap_or("");
-            if !agent_type.is_empty() { format!("[{}] {}", agent_type, desc) } else { desc.to_string() }
+            let desc = input
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let agent_type = input
+                .get("subagent_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !agent_type.is_empty() {
+                format!("[{}] {}", agent_type, desc)
+            } else {
+                desc.to_string()
+            }
         }
-        "Skill" => input.get("skill").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        "Skill" => input
+            .get("skill")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
         _ => String::new(),
     }
 }
 
 /// Render a stream-json line as human-readable terminal output.
-fn render_for_terminal(json_line: &str) {
+pub(crate) fn render_for_terminal(json_line: &str) {
     let json: serde_json::Value = match serde_json::from_str(json_line) {
         Ok(v) => v,
         Err(_) => return,
@@ -428,5 +490,43 @@ fn render_for_terminal(json_line: &str) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_tool_detail;
+    use crate::utils::format::safe_prefix;
+    use serde_json::json;
+
+    #[test]
+    fn format_tool_detail_truncates_bash_with_description_on_char_boundary() {
+        let cmd = format!("echo {}", "한".repeat(50));
+        let item = json!({
+            "input": {
+                "command": cmd,
+                "description": "한글 설명"
+            }
+        });
+
+        let detail = format_tool_detail("Bash", &item);
+        let expected = safe_prefix(item["input"]["command"].as_str().unwrap(), 120);
+
+        assert_eq!(detail, format!("한글 설명: `{}`", expected));
+    }
+
+    #[test]
+    fn format_tool_detail_truncates_bash_without_description_on_char_boundary() {
+        let cmd = format!("printf {}", "한".repeat(80));
+        let item = json!({
+            "input": {
+                "command": cmd
+            }
+        });
+
+        let detail = format_tool_detail("Bash", &item);
+        let expected = safe_prefix(item["input"]["command"].as_str().unwrap(), 150);
+
+        assert_eq!(detail, format!("`{}`", expected));
     }
 }

@@ -5,8 +5,10 @@ use poise::serenity_prelude as serenity;
 use serenity::ChannelId;
 
 use crate::services::claude;
+use crate::services::provider::parse_provider_and_channel_from_tmux_name;
 
 use super::formatting::{format_for_discord, send_long_message_raw};
+use super::settings::{channel_supports_provider, resolve_role_binding};
 use super::{SharedData, TmuxWatcherHandle};
 
 /// Background watcher that continuously tails a tmux output file.
@@ -66,7 +68,10 @@ pub(super) async fn tmux_output_watcher(
             // Notify Discord channel that the session has ended
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             let _ = channel_id
-                .say(&http, "⚠️ 작업 세션이 종료되었습니다. 다음 메시지를 보내면 새 세션이 시작됩니다.")
+                .say(
+                    &http,
+                    "⚠️ 작업 세션이 종료되었습니다. 다음 메시지를 보내면 새 세션이 시작됩니다.",
+                )
                 .await;
             break;
         }
@@ -246,6 +251,8 @@ pub(super) fn process_watcher_lines(
 /// On startup, scan for surviving tmux sessions (remoteCC-*) and restore watchers.
 /// This handles the case where RemoteCC was restarted but tmux sessions are still alive.
 pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &Arc<SharedData>) {
+    let provider = shared.settings.read().await.provider;
+
     // List tmux sessions matching our naming convention
     let output = match tokio::task::spawn_blocking(|| {
         std::process::Command::new("tmux")
@@ -261,7 +268,11 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
     let remotecc_sessions: Vec<&str> = output
         .lines()
         .map(|l| l.trim())
-        .filter(|l| l.starts_with("remoteCC-"))
+        .filter(|l| {
+            parse_provider_and_channel_from_tmux_name(l)
+                .map(|(session_provider, _)| session_provider == provider)
+                .unwrap_or(false)
+        })
         .collect();
 
     if remotecc_sessions.is_empty() {
@@ -277,7 +288,7 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
         let data = shared.core.lock().await;
         for (&ch_id, session) in &data.sessions {
             if let Some(ref ch_name) = session.channel_name {
-                let tmux_name = claude::sanitize_tmux_session_name(ch_name);
+                let tmux_name = provider.build_tmux_session_name(ch_name);
                 name_to_channel.insert(tmux_name, (ch_id, ch_name.clone()));
             }
         }
@@ -295,7 +306,16 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
             for guild_info in &guilds {
                 if let Ok(channels) = guild_info.id.channels(http).await {
                     for (ch_id, channel) in &channels {
-                        let tmux_name = claude::sanitize_tmux_session_name(&channel.name);
+                        let role_binding = resolve_role_binding(*ch_id, Some(&channel.name));
+                        if !channel_supports_provider(
+                            provider,
+                            Some(&channel.name),
+                            false,
+                            role_binding.as_ref(),
+                        ) {
+                            continue;
+                        }
+                        let tmux_name = provider.build_tmux_session_name(&channel.name);
                         name_to_channel
                             .entry(tmux_name)
                             .or_insert((*ch_id, channel.name.clone()));
@@ -353,23 +373,22 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
             let last_path = settings.last_sessions.get(&channel_key).cloned();
             let remote_profile = settings.last_remotes.get(&channel_key).cloned();
 
-            let session = data
-                .sessions
-                .entry(pw.channel_id)
-                .or_insert_with(|| super::DiscordSession {
-                    session_id: None,
-                    current_path: None,
-                    history: Vec::new(),
-                    pending_uploads: Vec::new(),
-                    pending_interventions: Vec::new(),
-                    cleared: false,
-                    channel_name: Some(pw.channel_name.clone()),
-                    category_name: None,
-                    remote_profile_name: remote_profile,
-                    channel_id: Some(pw.channel_id.get()),
-                    silent: false,
-                    last_active: tokio::time::Instant::now(),
-                });
+            let session =
+                data.sessions
+                    .entry(pw.channel_id)
+                    .or_insert_with(|| super::DiscordSession {
+                        session_id: None,
+                        current_path: None,
+                        history: Vec::new(),
+                        pending_uploads: Vec::new(),
+                        cleared: false,
+                        channel_name: Some(pw.channel_name.clone()),
+                        category_name: None,
+                        remote_profile_name: remote_profile,
+                        channel_id: Some(pw.channel_id.get()),
+                        silent: false,
+                        last_active: tokio::time::Instant::now(),
+                    });
 
             // Restore current_path from saved settings so message handler accepts messages
             if session.current_path.is_none() {
@@ -418,6 +437,8 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
 /// Kill orphan tmux sessions (remoteCC-*) that don't map to any known channel.
 /// Called after restore_tmux_watchers to clean up sessions from renamed/deleted channels.
 pub(super) async fn cleanup_orphan_tmux_sessions(shared: &Arc<SharedData>) {
+    let provider = shared.settings.read().await.provider;
+
     let output = match tokio::task::spawn_blocking(|| {
         std::process::Command::new("tmux")
             .args(["list-sessions", "-F", "#{session_name}"])
@@ -435,7 +456,12 @@ pub(super) async fn cleanup_orphan_tmux_sessions(shared: &Arc<SharedData>) {
 
         for session_name in output.lines() {
             let session_name = session_name.trim();
-            if !session_name.starts_with("remoteCC-") {
+            let Some((session_provider, _)) =
+                parse_provider_and_channel_from_tmux_name(session_name)
+            else {
+                continue;
+            };
+            if session_provider != provider {
                 continue;
             }
 
@@ -444,7 +470,7 @@ pub(super) async fn cleanup_orphan_tmux_sessions(shared: &Arc<SharedData>) {
                 session
                     .channel_name
                     .as_ref()
-                    .map(|ch_name| claude::sanitize_tmux_session_name(ch_name) == session_name)
+                    .map(|ch_name| provider.build_tmux_session_name(ch_name) == session_name)
                     .unwrap_or(false)
             });
 

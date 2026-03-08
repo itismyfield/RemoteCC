@@ -338,7 +338,9 @@ impl SftpSession {
         };
 
         if !auth_result {
-            return Err(AppError::Ssh("Authentication rejected by server".to_string()));
+            return Err(AppError::Ssh(
+                "Authentication rejected by server".to_string(),
+            ));
         }
 
         // Open SFTP channel
@@ -366,7 +368,10 @@ impl SftpSession {
 
     /// List directory contents via SFTP
     pub fn list_dir(&self, path: &str) -> AppResult<Vec<SftpFileEntry>> {
-        let sftp = self.sftp.as_ref().ok_or(AppError::Ssh("Not connected".to_string()))?;
+        let sftp = self
+            .sftp
+            .as_ref()
+            .ok_or(AppError::Ssh("Not connected".to_string()))?;
         let path = path.to_string();
 
         self.runtime.block_on(async {
@@ -414,7 +419,10 @@ impl SftpSession {
 
     /// Remove file or directory via SFTP
     pub fn remove(&self, path: &str, is_dir: bool) -> AppResult<()> {
-        let sftp = self.sftp.as_ref().ok_or(AppError::Ssh("Not connected".to_string()))?;
+        let sftp = self
+            .sftp
+            .as_ref()
+            .ok_or(AppError::Ssh("Not connected".to_string()))?;
         let path = path.to_string();
 
         self.runtime.block_on(async {
@@ -445,9 +453,9 @@ impl SftpSession {
             if attrs.is_dir() {
                 Box::pin(Self::remove_dir_recursive(sftp, &child_path)).await?;
             } else {
-                sftp.remove_file(&child_path)
-                    .await
-                    .map_err(|e| AppError::Ssh(format!("Failed to remove '{}': {}", child_path, e)))?;
+                sftp.remove_file(&child_path).await.map_err(|e| {
+                    AppError::Ssh(format!("Failed to remove '{}': {}", child_path, e))
+                })?;
             }
         }
 
@@ -458,20 +466,26 @@ impl SftpSession {
 
     /// Rename file or directory via SFTP
     pub fn rename(&self, old_path: &str, new_path: &str) -> AppResult<()> {
-        let sftp = self.sftp.as_ref().ok_or(AppError::Ssh("Not connected".to_string()))?;
+        let sftp = self
+            .sftp
+            .as_ref()
+            .ok_or(AppError::Ssh("Not connected".to_string()))?;
         let old = old_path.to_string();
         let new = new_path.to_string();
 
         self.runtime.block_on(async {
-            sftp.rename(&old, &new)
-                .await
-                .map_err(|e| AppError::Ssh(format!("Failed to rename '{}' to '{}': {}", old, new, e)))
+            sftp.rename(&old, &new).await.map_err(|e| {
+                AppError::Ssh(format!("Failed to rename '{}' to '{}': {}", old, new, e))
+            })
         })
     }
 
     /// Create directory via SFTP
     pub fn mkdir(&self, path: &str) -> AppResult<()> {
-        let sftp = self.sftp.as_ref().ok_or(AppError::Ssh("Not connected".to_string()))?;
+        let sftp = self
+            .sftp
+            .as_ref()
+            .ok_or(AppError::Ssh("Not connected".to_string()))?;
         let path = path.to_string();
 
         self.runtime.block_on(async {
@@ -483,7 +497,10 @@ impl SftpSession {
 
     /// Create an empty file via SFTP
     pub fn create_file(&self, path: &str) -> AppResult<()> {
-        let sftp = self.sftp.as_ref().ok_or(AppError::Ssh("Not connected".to_string()))?;
+        let sftp = self
+            .sftp
+            .as_ref()
+            .ok_or(AppError::Ssh("Not connected".to_string()))?;
         let path = path.to_string();
 
         self.runtime.block_on(async {
@@ -498,7 +515,10 @@ impl SftpSession {
 
     /// Download remote file to local path via SFTP (streaming, chunked)
     pub fn download_file(&self, remote_path: &str, local_path: &str) -> AppResult<u64> {
-        let sftp = self.sftp.as_ref().ok_or(AppError::Ssh("Not connected".to_string()))?;
+        let sftp = self
+            .sftp
+            .as_ref()
+            .ok_or(AppError::Ssh("Not connected".to_string()))?;
         let remote_path = remote_path.to_string();
         let local_path = local_path.to_string();
 
@@ -515,10 +535,9 @@ impl SftpSession {
             let mut buf = vec![0u8; 64 * 1024];
             let mut total = 0u64;
             loop {
-                let n = remote_file
-                    .read(&mut buf)
-                    .await
-                    .map_err(|e| AppError::Ssh(format!("Failed to read '{}': {}", remote_path, e)))?;
+                let n = remote_file.read(&mut buf).await.map_err(|e| {
+                    AppError::Ssh(format!("Failed to read '{}': {}", remote_path, e))
+                })?;
                 if n == 0 {
                     break;
                 }
@@ -541,7 +560,10 @@ impl SftpSession {
     where
         F: Fn(u64, u64),
     {
-        let sftp = self.sftp.as_ref().ok_or(AppError::Ssh("Not connected".to_string()))?;
+        let sftp = self
+            .sftp
+            .as_ref()
+            .ok_or(AppError::Ssh("Not connected".to_string()))?;
         let remote_path = remote_path.to_string();
         let local_path = local_path.to_string();
 
@@ -563,10 +585,9 @@ impl SftpSession {
                     let _ = std::fs::remove_file(&local_path);
                     return Err(AppError::Other("Cancelled".to_string()));
                 }
-                let n = remote_file
-                    .read(&mut buf)
-                    .await
-                    .map_err(|e| AppError::Ssh(format!("Failed to read '{}': {}", remote_path, e)))?;
+                let n = remote_file.read(&mut buf).await.map_err(|e| {
+                    AppError::Ssh(format!("Failed to read '{}': {}", remote_path, e))
+                })?;
                 if n == 0 {
                     break;
                 }
@@ -580,7 +601,10 @@ impl SftpSession {
 
     /// Upload local file to remote path via SFTP (streaming, chunked)
     pub fn upload_file(&self, local_path: &str, remote_path: &str) -> AppResult<u64> {
-        let sftp = self.sftp.as_ref().ok_or(AppError::Ssh("Not connected".to_string()))?;
+        let sftp = self
+            .sftp
+            .as_ref()
+            .ok_or(AppError::Ssh("Not connected".to_string()))?;
         let remote_path = remote_path.to_string();
         let local_path = local_path.to_string();
 
@@ -601,10 +625,9 @@ impl SftpSession {
                 if n == 0 {
                     break;
                 }
-                remote_file
-                    .write_all(&buf[..n])
-                    .await
-                    .map_err(|e| AppError::Ssh(format!("Failed to write '{}': {}", remote_path, e)))?;
+                remote_file.write_all(&buf[..n]).await.map_err(|e| {
+                    AppError::Ssh(format!("Failed to write '{}': {}", remote_path, e))
+                })?;
                 total += n as u64;
             }
             remote_file

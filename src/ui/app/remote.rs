@@ -115,7 +115,10 @@ impl App {
                     let _ = tx.send(file_ops::ProgressMessage::Completed(1, 0));
                 }
                 Err(e) => {
-                    let _ = tx.send(file_ops::ProgressMessage::Error(file_name_owned, e.to_string()));
+                    let _ = tx.send(file_ops::ProgressMessage::Error(
+                        file_name_owned,
+                        e.to_string(),
+                    ));
                     let _ = tx.send(file_ops::ProgressMessage::Completed(0, 1));
                 }
             }
@@ -136,7 +139,13 @@ impl App {
     }
 
     /// Handle goto for remote path (user@host:/path)
-    pub(crate) fn execute_goto_remote(&mut self, user: &str, host: &str, port: u16, remote_path: &str) {
+    pub(crate) fn execute_goto_remote(
+        &mut self,
+        user: &str,
+        host: &str,
+        port: u16,
+        remote_path: &str,
+    ) {
         // Check if we have a matching saved profile
         if let Some(profile) =
             remote::find_matching_profile(&self.settings.remote_profiles, user, host, port)

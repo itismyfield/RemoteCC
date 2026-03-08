@@ -1,8 +1,12 @@
 pub mod claude;
+pub mod codex;
+pub mod codex_tmux_wrapper;
 pub mod dedup;
 pub mod discord;
 pub mod file_ops;
 pub mod process;
+pub mod provider;
+pub mod provider_exec;
 pub mod remote;
 pub mod remote_transfer;
 pub mod tmux_wrapper;

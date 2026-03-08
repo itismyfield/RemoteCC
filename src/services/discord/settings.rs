@@ -2,14 +2,22 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use sha2::{Digest, Sha256};
 use serenity::ChannelId;
+use sha2::{Digest, Sha256};
 
 use poise::serenity_prelude as serenity;
 
 use crate::services::claude::DEFAULT_ALLOWED_TOOLS;
+use crate::services::provider::ProviderKind;
 
+use super::formatting::normalize_allowed_tools;
 use super::DiscordBotSettings;
+
+fn json_u64(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|raw| raw.parse::<u64>().ok()))
+}
 
 /// Compute a short hash key from the bot token (first 16 chars of SHA-256 hex)
 /// Uses "discord_" prefix to namespace Discord bot entries in settings.
@@ -34,19 +42,59 @@ pub(super) fn role_map_path() -> Option<std::path::PathBuf> {
 pub(super) struct RoleBinding {
     pub role_id: String,
     pub prompt_file: String,
+    pub provider: Option<ProviderKind>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct PeerAgentInfo {
+    pub role_id: String,
+    pub display_name: String,
+    pub keywords: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiscordBotLaunchConfig {
+    pub hash_key: String,
+    pub token: String,
+    pub provider: ProviderKind,
 }
 
 pub(super) fn parse_role_binding(v: &serde_json::Value) -> Option<RoleBinding> {
     let obj = v.as_object()?;
     let role_id = obj.get("roleId")?.as_str()?.to_string();
     let prompt_file = obj.get("promptFile")?.as_str()?.to_string();
+    let provider = obj
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .and_then(ProviderKind::from_str);
     Some(RoleBinding {
         role_id,
         prompt_file,
+        provider,
     })
 }
 
-pub(super) fn resolve_role_binding(channel_id: ChannelId, channel_name: Option<&str>) -> Option<RoleBinding> {
+pub(super) fn channel_supports_provider(
+    provider: ProviderKind,
+    channel_name: Option<&str>,
+    is_dm: bool,
+    role_binding: Option<&RoleBinding>,
+) -> bool {
+    if is_dm {
+        return true;
+    }
+
+    if let Some(bound_provider) = role_binding.and_then(|binding| binding.provider) {
+        return bound_provider == provider;
+    }
+
+    provider.is_channel_supported(channel_name, is_dm)
+}
+
+pub(super) fn resolve_role_binding(
+    channel_id: ChannelId,
+    channel_name: Option<&str>,
+) -> Option<RoleBinding> {
     let path = role_map_path()?;
     let content = fs::read_to_string(path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
@@ -84,8 +132,97 @@ pub(super) fn load_role_prompt(binding: &RoleBinding) -> Option<String> {
     Some(truncated)
 }
 
+pub(super) fn load_peer_agents() -> Vec<PeerAgentInfo> {
+    let Some(path) = role_map_path() else {
+        return Vec::new();
+    };
+    let Ok(content) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return Vec::new();
+    };
+    let Some(agents) = json
+        .get("meeting")
+        .and_then(|meeting| meeting.get("available_agents"))
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    for agent in agents {
+        let Some(obj) = agent.as_object() else {
+            continue;
+        };
+        let Some(role_id) = obj.get("role_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !seen.insert(role_id.to_string()) {
+            continue;
+        }
+        let Some(display_name) = obj.get("display_name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let keywords = obj
+            .get("keywords")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        result.push(PeerAgentInfo {
+            role_id: role_id.to_string(),
+            display_name: display_name.to_string(),
+            keywords,
+        });
+    }
+
+    result
+}
+
+pub(super) fn render_peer_agent_guidance(current_role_id: &str) -> Option<String> {
+    let peers: Vec<PeerAgentInfo> = load_peer_agents()
+        .into_iter()
+        .filter(|agent| agent.role_id != current_role_id)
+        .collect();
+    if peers.is_empty() {
+        return None;
+    }
+
+    let mut lines = vec![
+        "[Peer Agent Directory]".to_string(),
+        "You are one role agent among multiple specialist agents in this workspace.".to_string(),
+        "If a request is mostly outside your scope, do not bluff ownership or silently proceed as if it were yours.".to_string(),
+        "Instead, name the 1-2 most suitable peer agents below, explain why they fit better, and suggest moving the work there.".to_string(),
+        "If the user explicitly wants your perspective anyway, answer only within your scope and mention the handoff option.".to_string(),
+        String::new(),
+        "Available peer agents:".to_string(),
+    ];
+
+    for peer in peers {
+        let keywords = if peer.keywords.is_empty() {
+            String::new()
+        } else {
+            let short = peer.keywords.iter().take(4).cloned().collect::<Vec<_>>();
+            format!(" — best for: {}", short.join(", "))
+        };
+        lines.push(format!(
+            "- {} ({}){}",
+            peer.role_id, peer.display_name, keywords
+        ));
+    }
+
+    Some(lines.join("\n"))
+}
+
 pub(super) fn discord_uploads_root() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".openclaw").join("remotecc_uploads").join("discord"))
+    dirs::home_dir().map(|h| h.join(".remotecc").join("runtime").join("discord_uploads"))
 }
 
 pub(super) fn channel_upload_dir(channel_id: ChannelId) -> Option<std::path::PathBuf> {
@@ -165,23 +302,12 @@ pub(super) fn load_bot_settings(token: &str) -> DiscordBotSettings {
     let Some(entry) = json.get(&key) else {
         return DiscordBotSettings::default();
     };
-    let owner_user_id = entry.get("owner_user_id").and_then(|v| v.as_u64());
-    let Some(tools_arr) = entry.get("allowed_tools").and_then(|v| v.as_array()) else {
-        return DiscordBotSettings {
-            owner_user_id,
-            ..DiscordBotSettings::default()
-        };
-    };
-    let tools: Vec<String> = tools_arr
-        .iter()
-        .filter_map(|v| v.as_str().map(String::from))
-        .collect();
-    if tools.is_empty() {
-        return DiscordBotSettings {
-            owner_user_id,
-            ..DiscordBotSettings::default()
-        };
-    }
+    let owner_user_id = entry.get("owner_user_id").and_then(json_u64);
+    let provider = entry
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .and_then(ProviderKind::from_str)
+        .unwrap_or(ProviderKind::Claude);
     let last_sessions = entry
         .get("last_sessions")
         .and_then(|v| v.as_object())
@@ -203,15 +329,36 @@ pub(super) fn load_bot_settings(token: &str) -> DiscordBotSettings {
     let allowed_user_ids = entry
         .get("allowed_user_ids")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
+        .map(|arr| arr.iter().filter_map(json_u64).collect())
         .unwrap_or_default();
     let allowed_bot_ids = entry
         .get("allowed_bot_ids")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
+        .map(|arr| arr.iter().filter_map(json_u64).collect())
         .unwrap_or_default();
+    let allowed_tools = match entry.get("allowed_tools") {
+        None => DEFAULT_ALLOWED_TOOLS
+            .iter()
+            .map(|tool| (*tool).to_string())
+            .collect(),
+        Some(value) => {
+            let Some(tools_arr) = value.as_array() else {
+                return DiscordBotSettings {
+                    provider,
+                    owner_user_id,
+                    last_sessions,
+                    last_remotes,
+                    allowed_user_ids,
+                    allowed_bot_ids,
+                    ..DiscordBotSettings::default()
+                };
+            };
+            normalize_allowed_tools(tools_arr.iter().filter_map(|v| v.as_str()))
+        }
+    };
     DiscordBotSettings {
-        allowed_tools: tools,
+        provider,
+        allowed_tools,
         last_sessions,
         last_remotes,
         owner_user_id,
@@ -234,9 +381,11 @@ pub(super) fn save_bot_settings(token: &str, settings: &DiscordBotSettings) {
         serde_json::json!({})
     };
     let key = discord_token_hash(token);
+    let normalized_tools = normalize_allowed_tools(&settings.allowed_tools);
     let mut entry = serde_json::json!({
         "token": token,
-        "allowed_tools": settings.allowed_tools,
+        "provider": settings.provider.as_str(),
+        "allowed_tools": normalized_tools,
         "last_sessions": settings.last_sessions,
         "last_remotes": settings.last_remotes,
         "allowed_user_ids": settings.allowed_user_ids,
@@ -251,6 +400,39 @@ pub(super) fn save_bot_settings(token: &str, settings: &DiscordBotSettings) {
     }
 }
 
+pub fn load_discord_bot_launch_configs() -> Vec<DiscordBotLaunchConfig> {
+    let Some(path) = bot_settings_path() else {
+        return Vec::new();
+    };
+    let Ok(content) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return Vec::new();
+    };
+    let Some(obj) = json.as_object() else {
+        return Vec::new();
+    };
+
+    let mut configs = Vec::new();
+    for (hash_key, entry) in obj {
+        let Some(token) = entry.get("token").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let provider = entry
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .and_then(ProviderKind::from_str)
+            .unwrap_or(ProviderKind::Claude);
+        configs.push(DiscordBotLaunchConfig {
+            hash_key: hash_key.clone(),
+            token: token.to_string(),
+            provider,
+        });
+    }
+    configs
+}
+
 /// Resolve a Discord bot token from its hash by searching bot_settings.json
 pub fn resolve_discord_token_by_hash(hash: &str) -> Option<String> {
     let path = bot_settings_path()?;
@@ -262,4 +444,260 @@ pub fn resolve_discord_token_by_hash(hash: &str) -> Option<String> {
         .get("token")
         .and_then(|v| v.as_str())
         .map(String::from)
+}
+
+pub fn resolve_discord_bot_provider(token: &str) -> ProviderKind {
+    load_bot_settings(token).provider
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::sync::{Mutex, OnceLock};
+
+    use poise::serenity_prelude::ChannelId;
+    use tempfile::TempDir;
+
+    use crate::services::provider::ProviderKind;
+
+    use super::{
+        channel_supports_provider, discord_token_hash, load_bot_settings,
+        load_discord_bot_launch_configs, load_peer_agents, render_peer_agent_guidance,
+        resolve_role_binding,
+    };
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn with_temp_home<F>(f: F)
+    where
+        F: FnOnce(&TempDir),
+    {
+        let _guard = env_lock().lock().unwrap();
+        let temp_home = TempDir::new().unwrap();
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", temp_home.path());
+        f(&temp_home);
+        match previous_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn test_load_bot_settings_keeps_explicit_empty_allowed_tools() {
+        with_temp_home(|temp_home| {
+            let settings_dir = temp_home.path().join(".remotecc");
+            fs::create_dir_all(&settings_dir).unwrap();
+            let token = "test-token";
+            let key = discord_token_hash(token);
+            let json = serde_json::json!({
+                key: {
+                    "token": token,
+                    "allowed_tools": [],
+                    "owner_user_id": 42,
+                    "allowed_user_ids": [7],
+                    "allowed_bot_ids": [9]
+                }
+            });
+            fs::write(
+                settings_dir.join("bot_settings.json"),
+                serde_json::to_string_pretty(&json).unwrap(),
+            )
+            .unwrap();
+
+            let settings = load_bot_settings(token);
+            assert!(settings.allowed_tools.is_empty());
+            assert_eq!(settings.provider, ProviderKind::Claude);
+            assert_eq!(settings.owner_user_id, Some(42));
+            assert_eq!(settings.allowed_user_ids, vec![7]);
+            assert_eq!(settings.allowed_bot_ids, vec![9]);
+        });
+    }
+
+    #[test]
+    fn test_load_bot_settings_normalizes_and_dedupes_tool_names() {
+        with_temp_home(|temp_home| {
+            let settings_dir = temp_home.path().join(".remotecc");
+            fs::create_dir_all(&settings_dir).unwrap();
+            let token = "test-token";
+            let key = discord_token_hash(token);
+            let json = serde_json::json!({
+                key: {
+                    "token": token,
+                    "allowed_tools": ["webfetch", "WebFetch", "BASH", "unknown-tool"]
+                }
+            });
+            fs::write(
+                settings_dir.join("bot_settings.json"),
+                serde_json::to_string_pretty(&json).unwrap(),
+            )
+            .unwrap();
+
+            let settings = load_bot_settings(token);
+            assert_eq!(
+                settings.allowed_tools,
+                vec!["WebFetch".to_string(), "Bash".to_string()]
+            );
+        });
+    }
+
+    #[test]
+    fn test_load_bot_launch_configs_reads_provider() {
+        with_temp_home(|temp_home| {
+            let settings_dir = temp_home.path().join(".remotecc");
+            fs::create_dir_all(&settings_dir).unwrap();
+            fs::write(
+                settings_dir.join("bot_settings.json"),
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "discord_a": { "token": "claude-token", "provider": "claude" },
+                    "discord_b": { "token": "codex-token", "provider": "codex" }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            let configs = load_discord_bot_launch_configs();
+            assert_eq!(configs.len(), 2);
+            assert_eq!(configs[0].provider, ProviderKind::Claude);
+            assert_eq!(configs[1].provider, ProviderKind::Codex);
+        });
+    }
+
+    #[test]
+    fn test_load_bot_settings_accepts_string_encoded_ids() {
+        with_temp_home(|temp_home| {
+            let settings_dir = temp_home.path().join(".remotecc");
+            fs::create_dir_all(&settings_dir).unwrap();
+            let token = "test-token";
+            let key = discord_token_hash(token);
+            let json = serde_json::json!({
+                key: {
+                    "token": token,
+                    "owner_user_id": "343742347365974000",
+                    "allowed_user_ids": ["429955158974136300"],
+                    "allowed_bot_ids": ["1479017284805722200"]
+                }
+            });
+            fs::write(
+                settings_dir.join("bot_settings.json"),
+                serde_json::to_string_pretty(&json).unwrap(),
+            )
+            .unwrap();
+
+            let settings = load_bot_settings(token);
+            assert_eq!(settings.owner_user_id, Some(343742347365974000));
+            assert_eq!(settings.allowed_user_ids, vec![429955158974136300]);
+            assert_eq!(settings.allowed_bot_ids, vec![1479017284805722200]);
+        });
+    }
+
+    #[test]
+    fn test_resolve_role_binding_reads_optional_provider() {
+        with_temp_home(|temp_home| {
+            let settings_dir = temp_home.path().join(".remotecc");
+            fs::create_dir_all(&settings_dir).unwrap();
+            fs::write(
+                settings_dir.join("role_map.json"),
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "version": 1,
+                    "byChannelId": {
+                        "123": {
+                            "roleId": "family-routine",
+                            "promptFile": "/tmp/family-routine.prompt.md",
+                            "provider": "codex"
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            let binding = resolve_role_binding(ChannelId::new(123), Some("쇼핑도우미")).unwrap();
+            assert_eq!(binding.role_id, "family-routine");
+            assert_eq!(binding.provider, Some(ProviderKind::Codex));
+            assert!(channel_supports_provider(
+                ProviderKind::Codex,
+                Some("쇼핑도우미"),
+                false,
+                Some(&binding)
+            ));
+            assert!(!channel_supports_provider(
+                ProviderKind::Claude,
+                Some("쇼핑도우미"),
+                false,
+                Some(&binding)
+            ));
+        });
+    }
+
+    #[test]
+    fn test_load_peer_agents_reads_meeting_config() {
+        with_temp_home(|temp_home| {
+            let settings_dir = temp_home.path().join(".remotecc");
+            fs::create_dir_all(&settings_dir).unwrap();
+            let json = serde_json::json!({
+                "meeting": {
+                    "available_agents": [
+                        {
+                            "role_id": "ch-td",
+                            "display_name": "TD (테크니컬 디렉터)",
+                            "keywords": ["아키텍처", "코드", "성능"]
+                        },
+                        {
+                            "role_id": "ch-pd",
+                            "display_name": "PD (프로덕트 디렉터)",
+                            "keywords": ["제품", "로드맵"]
+                        }
+                    ]
+                }
+            });
+            fs::write(
+                settings_dir.join("role_map.json"),
+                serde_json::to_string_pretty(&json).unwrap(),
+            )
+            .unwrap();
+
+            let agents = load_peer_agents();
+            assert_eq!(agents.len(), 2);
+            assert_eq!(agents[0].role_id, "ch-td");
+            assert_eq!(agents[1].display_name, "PD (프로덕트 디렉터)");
+        });
+    }
+
+    #[test]
+    fn test_render_peer_agent_guidance_excludes_current_role() {
+        with_temp_home(|temp_home| {
+            let settings_dir = temp_home.path().join(".remotecc");
+            fs::create_dir_all(&settings_dir).unwrap();
+            let json = serde_json::json!({
+                "meeting": {
+                    "available_agents": [
+                        {
+                            "role_id": "ch-td",
+                            "display_name": "TD (테크니컬 디렉터)",
+                            "keywords": ["아키텍처", "코드", "성능"]
+                        },
+                        {
+                            "role_id": "ch-pd",
+                            "display_name": "PD (프로덕트 디렉터)",
+                            "keywords": ["제품", "로드맵"]
+                        }
+                    ]
+                }
+            });
+            fs::write(
+                settings_dir.join("role_map.json"),
+                serde_json::to_string_pretty(&json).unwrap(),
+            )
+            .unwrap();
+
+            let rendered = render_peer_agent_guidance("ch-pd").unwrap();
+            assert!(rendered.contains("ch-td"));
+            assert!(!rendered.contains("ch-pd (PD"));
+            assert!(rendered.contains("name the 1-2 most suitable peer agents"));
+        });
+    }
 }
