@@ -8,6 +8,7 @@ use crate::services::claude;
 use crate::services::provider::parse_provider_and_channel_from_tmux_name;
 
 use super::formatting::{format_for_discord, send_long_message_raw};
+use super::settings::{channel_supports_provider, resolve_role_binding};
 use super::{SharedData, TmuxWatcherHandle};
 
 /// Background watcher that continuously tails a tmux output file.
@@ -305,7 +306,13 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
             for guild_info in &guilds {
                 if let Ok(channels) = guild_info.id.channels(http).await {
                     for (ch_id, channel) in &channels {
-                        if !provider.is_channel_supported(Some(&channel.name), false) {
+                        let role_binding = resolve_role_binding(*ch_id, Some(&channel.name));
+                        if !channel_supports_provider(
+                            provider,
+                            Some(&channel.name),
+                            false,
+                            role_binding.as_ref(),
+                        ) {
                             continue;
                         }
                         let tmux_name = provider.build_tmux_session_name(&channel.name);
@@ -374,7 +381,6 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
                         current_path: None,
                         history: Vec::new(),
                         pending_uploads: Vec::new(),
-                        pending_interventions: Vec::new(),
                         cleared: false,
                         channel_name: Some(pw.channel_name.clone()),
                         category_name: None,

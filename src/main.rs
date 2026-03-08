@@ -25,6 +25,7 @@ use crate::ui::app::{App, Screen};
 use crate::utils::markdown::{is_line_empty, render_markdown, MarkdownTheme};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const REMOTECC_DCSERVER_LAUNCHD_LABEL: &str = "com.itismyfield.remotecc.dcserver";
 
 fn print_help() {
     println!("RemoteCC {} - Multi-panel terminal file manager", VERSION);
@@ -46,6 +47,8 @@ fn print_help() {
         "    --restart-dcserver      Restart Discord bot tmux session (reads bot_settings.json)"
     );
     println!("    --discord-sendfile <PATH> --channel <ID> --key <HASH>");
+    println!("    --discord-sendmessage --channel <ID> --message <TEXT> [--key <HASH>]");
+    println!("    --discord-senddm --user <ID> --message <TEXT> [--key <HASH>]");
     println!(
         "                            Send file via Discord bot (internal use, HASH = token hash)"
     );
@@ -294,6 +297,41 @@ fn kill_remotecc_tmux_sessions_remote(profile: &services::remote::RemoteProfile)
     }
 }
 
+fn current_launchd_domain() -> Option<String> {
+    let output = std::process::Command::new("id").arg("-u").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let uid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if uid.is_empty() {
+        return None;
+    }
+    Some(format!("gui/{}", uid))
+}
+
+fn is_launchd_job_loaded(label: &str) -> bool {
+    let output = match std::process::Command::new("launchctl").arg("list").output() {
+        Ok(output) if output.status.success() => output,
+        _ => return false,
+    };
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.split_whitespace().last() == Some(label))
+}
+
+fn kickstart_launchd_job(label: &str) -> bool {
+    let Some(domain) = current_launchd_domain() else {
+        return false;
+    };
+    let target = format!("{}/{}", domain, label);
+    std::process::Command::new("launchctl")
+        .args(["kickstart", "-k", &target])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 fn handle_restart_dcserver() {
     use services::discord::load_discord_bot_launch_configs;
 
@@ -319,6 +357,21 @@ fn handle_restart_dcserver() {
 
     println!("🔄 Restarting Discord bot server...");
     println!("   Configured bots: {}", configs.len());
+
+    if is_launchd_job_loaded(REMOTECC_DCSERVER_LAUNCHD_LABEL) {
+        println!(
+            "   launchd service detected: {}",
+            REMOTECC_DCSERVER_LAUNCHD_LABEL
+        );
+        if kickstart_launchd_job(REMOTECC_DCSERVER_LAUNCHD_LABEL) {
+            println!(
+                "✅ Discord bot restarted via launchd '{}'",
+                REMOTECC_DCSERVER_LAUNCHD_LABEL
+            );
+            return;
+        }
+        eprintln!("⚠ launchd kickstart failed, falling back to tmux restart");
+    }
 
     // Kill existing dcserver processes (match any binary name with --dcserver arg)
     let pgrep_output = std::process::Command::new("pgrep")
@@ -498,6 +551,100 @@ fn handle_discord_sendfile(path: &str, channel_id: u64, hash_key: &str) {
                 std::process::exit(1);
             }
         }
+    });
+}
+
+fn handle_discord_sendmessage(message: &str, channel_id: u64, hash_key: Option<&str>) {
+    use crate::services::discord::{
+        load_discord_bot_launch_configs, resolve_discord_token_by_hash,
+    };
+
+    let tokens: Vec<String> = match hash_key {
+        Some(key) => match resolve_discord_token_by_hash(key) {
+            Some(token) => vec![token],
+            None => {
+                eprintln!("Error: no Discord bot token found for hash key: {}", key);
+                std::process::exit(1);
+            }
+        },
+        None => load_discord_bot_launch_configs()
+            .into_iter()
+            .map(|cfg| cfg.token)
+            .collect(),
+    };
+
+    if tokens.is_empty() {
+        eprintln!("Error: no Discord bot tokens found in ~/.remotecc/bot_settings.json");
+        std::process::exit(1);
+    }
+
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+    rt.block_on(async {
+        let mut last_error: Option<String> = None;
+        for token in tokens {
+            match services::discord::send_message_to_channel(&token, channel_id, message).await {
+                Ok(_) => {
+                    println!("Message sent to channel {}", channel_id);
+                    return;
+                }
+                Err(err) => {
+                    last_error = Some(err.to_string());
+                }
+            }
+        }
+
+        eprintln!(
+            "Failed to send message: {}",
+            last_error.unwrap_or_else(|| "unknown error".to_string())
+        );
+        std::process::exit(1);
+    });
+}
+
+fn handle_discord_senddm(message: &str, user_id: u64, hash_key: Option<&str>) {
+    use crate::services::discord::{
+        load_discord_bot_launch_configs, resolve_discord_token_by_hash,
+    };
+
+    let tokens: Vec<String> = match hash_key {
+        Some(key) => match resolve_discord_token_by_hash(key) {
+            Some(token) => vec![token],
+            None => {
+                eprintln!("Error: no Discord bot token found for hash key: {}", key);
+                std::process::exit(1);
+            }
+        },
+        None => load_discord_bot_launch_configs()
+            .into_iter()
+            .map(|cfg| cfg.token)
+            .collect(),
+    };
+
+    if tokens.is_empty() {
+        eprintln!("Error: no Discord bot tokens found in ~/.remotecc/bot_settings.json");
+        std::process::exit(1);
+    }
+
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+    rt.block_on(async {
+        let mut last_error: Option<String> = None;
+        for token in tokens {
+            match services::discord::send_message_to_user(&token, user_id, message).await {
+                Ok(_) => {
+                    println!("Message sent to user {}", user_id);
+                    return;
+                }
+                Err(err) => {
+                    last_error = Some(err.to_string());
+                }
+            }
+        }
+
+        eprintln!(
+            "Failed to send DM: {}",
+            last_error.unwrap_or_else(|| "unknown error".to_string())
+        );
+        std::process::exit(1);
     });
 }
 
@@ -683,6 +830,108 @@ fn main() -> io::Result<()> {
                         eprintln!("Error: --discord-sendfile requires <PATH>, --channel <ID>, and --key <HASH>");
                         eprintln!(
                             "Usage: remotecc --discord-sendfile <PATH> --channel <ID> --key <HASH>"
+                        );
+                    }
+                }
+                return Ok(());
+            }
+            "--discord-sendmessage" => {
+                let mut message: Option<String> = None;
+                let mut channel_id: Option<u64> = None;
+                let mut key: Option<String> = None;
+                let mut j = i + 1;
+                while j < args.len() {
+                    match args[j].as_str() {
+                        "--channel" => {
+                            if j + 1 < args.len() {
+                                channel_id = args[j + 1].parse().ok();
+                                j += 2;
+                            } else {
+                                j += 1;
+                            }
+                        }
+                        "--message" => {
+                            if j + 1 < args.len() {
+                                message = Some(args[j + 1].clone());
+                                j += 2;
+                            } else {
+                                j += 1;
+                            }
+                        }
+                        "--key" => {
+                            if j + 1 < args.len() {
+                                key = Some(args[j + 1].clone());
+                                j += 2;
+                            } else {
+                                j += 1;
+                            }
+                        }
+                        _ => {
+                            j += 1;
+                        }
+                    }
+                }
+                match (message, channel_id) {
+                    (Some(msg), Some(cid)) => {
+                        handle_discord_sendmessage(&msg, cid, key.as_deref());
+                    }
+                    _ => {
+                        eprintln!(
+                            "Error: --discord-sendmessage requires --channel <ID> and --message <TEXT>"
+                        );
+                        eprintln!(
+                            "Usage: remotecc --discord-sendmessage --channel <ID> --message <TEXT> [--key <HASH>]"
+                        );
+                    }
+                }
+                return Ok(());
+            }
+            "--discord-senddm" => {
+                let mut message: Option<String> = None;
+                let mut user_id: Option<u64> = None;
+                let mut key: Option<String> = None;
+                let mut j = i + 1;
+                while j < args.len() {
+                    match args[j].as_str() {
+                        "--user" => {
+                            if j + 1 < args.len() {
+                                user_id = args[j + 1].parse().ok();
+                                j += 2;
+                            } else {
+                                j += 1;
+                            }
+                        }
+                        "--message" => {
+                            if j + 1 < args.len() {
+                                message = Some(args[j + 1].clone());
+                                j += 2;
+                            } else {
+                                j += 1;
+                            }
+                        }
+                        "--key" => {
+                            if j + 1 < args.len() {
+                                key = Some(args[j + 1].clone());
+                                j += 2;
+                            } else {
+                                j += 1;
+                            }
+                        }
+                        _ => {
+                            j += 1;
+                        }
+                    }
+                }
+                match (message, user_id) {
+                    (Some(msg), Some(uid)) => {
+                        handle_discord_senddm(&msg, uid, key.as_deref());
+                    }
+                    _ => {
+                        eprintln!(
+                            "Error: --discord-senddm requires --user <ID> and --message <TEXT>"
+                        );
+                        eprintln!(
+                            "Usage: remotecc --discord-senddm --user <ID> --message <TEXT> [--key <HASH>]"
                         );
                     }
                 }

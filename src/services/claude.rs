@@ -29,12 +29,28 @@ fn resolve_claude_path() -> Option<String> {
     }
 
     // Fallback: use login shell to resolve PATH
-    if let Ok(output) = Command::new("bash").args(["-lc", "which claude"]).output() {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Some(path);
+    for shell in &["zsh", "bash"] {
+        if let Ok(output) = Command::new(shell).args(["-lc", "which claude"]).output() {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path.is_empty() {
+                    return Some(path);
+                }
             }
+        }
+    }
+
+    // Fallback: check known installation paths
+    let home = dirs::home_dir().unwrap_or_default();
+    let known_paths = [
+        home.join(".local/bin/claude"),
+        home.join("bin/claude"),
+        std::path::PathBuf::from("/usr/local/bin/claude"),
+        std::path::PathBuf::from("/opt/homebrew/bin/claude"),
+    ];
+    for path in &known_paths {
+        if path.is_file() {
+            return Some(path.display().to_string());
         }
     }
 

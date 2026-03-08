@@ -1,11 +1,13 @@
 mod formatting;
 mod meeting;
 mod settings;
+mod shared_memory;
 mod tmux;
 
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -27,9 +29,11 @@ use formatting::{
     send_long_message_ctx, send_long_message_raw, tool_info, truncate_str, BUILTIN_SKILLS,
 };
 use settings::{
-    channel_upload_dir, cleanup_channel_uploads, cleanup_old_uploads, discord_token_hash,
-    load_bot_settings, load_role_prompt, resolve_role_binding, save_bot_settings,
+    channel_supports_provider, channel_upload_dir, cleanup_channel_uploads, cleanup_old_uploads,
+    discord_token_hash, load_bot_settings, load_role_prompt, render_peer_agent_guidance,
+    resolve_role_binding, save_bot_settings, RoleBinding,
 };
+use shared_memory::{append_shared_memory_turn, build_shared_memory_context};
 use tmux::{cleanup_orphan_tmux_sessions, restore_tmux_watchers, tmux_output_watcher};
 
 pub use settings::{
@@ -45,6 +49,8 @@ const UPLOAD_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const UPLOAD_MAX_AGE: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 const SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60); // 1 hour
 const SESSION_MAX_IDLE: Duration = Duration::from_secs(7 * 24 * 60 * 60); // 7 days
+const FAMILY_DM_ROLE_CHANNEL_NAME: &str = "윤호키우기";
+const FAMILY_DM_USER_IDS: &[u64] = &[343742347365974026, 429955158974136340];
 
 /// Per-channel session state
 pub(super) struct DiscordSession {
@@ -52,7 +58,6 @@ pub(super) struct DiscordSession {
     pub(super) current_path: Option<String>,
     pub(super) history: Vec<HistoryItem>,
     pub(super) pending_uploads: Vec<String>,
-    pub(super) pending_interventions: Vec<String>,
     pub(super) cleared: bool,
     /// Remote profile name for SSH execution (None = local)
     pub(super) remote_profile_name: Option<String>,
@@ -494,6 +499,288 @@ async fn check_owner(user_id: UserId, shared: &Arc<SharedData>) -> bool {
     settings.owner_user_id == Some(user_id.get())
 }
 
+fn family_profile_probe_script_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| {
+        h.join("ObsidianVault")
+            .join("RemoteVault")
+            .join("99_Skills")
+            .join("family-profile-probe")
+            .join("scripts")
+            .join("select_profile_probe.py")
+    })
+}
+
+fn family_profile_probe_state_paths() -> Vec<std::path::PathBuf> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    vec![
+        home.join(".local")
+            .join("state")
+            .join("family-profile-probe")
+            .join("profile_probe_state.json"),
+        home.join(".openclaw")
+            .join("workspace")
+            .join("state")
+            .join("profile_probe_state.json"),
+    ]
+}
+
+fn profile_probe_target_user_id(target: &str) -> Option<u64> {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    for prefix in ["user:", "dm:"] {
+        if let Some(raw) = trimmed.strip_prefix(prefix) {
+            return raw.trim().parse::<u64>().ok();
+        }
+    }
+
+    trimmed.parse::<u64>().ok()
+}
+
+fn pending_family_profile_probe_for_user(user_id: u64) -> Option<(String, String)> {
+    for path in family_profile_probe_state_paths() {
+        let Ok(content) = fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        let Some(pending) = json.get("pending").and_then(|v| v.as_object()) else {
+            continue;
+        };
+
+        for (target, entry) in pending {
+            if profile_probe_target_user_id(target) != Some(user_id) {
+                continue;
+            }
+            let Some(topic_key) = entry.get("topicKey").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            return Some((topic_key.to_string(), target.to_string()));
+        }
+    }
+
+    None
+}
+
+fn record_family_profile_probe_answer(
+    topic_key: &str,
+    target: &str,
+    answer: &str,
+) -> Result<bool, String> {
+    let Some(script_path) = family_profile_probe_script_path() else {
+        return Err("family_profile_probe_script_missing".to_string());
+    };
+    if !script_path.exists() {
+        return Err(format!(
+            "family_profile_probe_script_not_found:{}",
+            script_path.display()
+        ));
+    }
+
+    let output = Command::new("/usr/bin/python3")
+        .arg(script_path)
+        .arg("--record-answer")
+        .arg("--topic-key")
+        .arg(topic_key)
+        .arg("--target")
+        .arg(target)
+        .arg("--answer")
+        .arg(answer)
+        .output()
+        .map_err(|err| err.to_string())?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() {
+        return Err(if stderr.is_empty() { stdout } else { stderr });
+    }
+
+    let payload = serde_json::from_str::<serde_json::Value>(&stdout)
+        .map_err(|err| format!("record_answer_parse_failed:{err}: {stdout}"))?;
+    Ok(payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(false))
+}
+
+async fn try_handle_family_profile_probe_reply(
+    ctx: &serenity::Context,
+    msg: &serenity::Message,
+    shared: &Arc<SharedData>,
+    provider: ProviderKind,
+) -> Result<bool, Error> {
+    if provider != ProviderKind::Claude || msg.author.bot || msg.guild_id.is_some() {
+        return Ok(false);
+    }
+
+    let answer = msg.content.trim();
+    if answer.is_empty() {
+        return Ok(false);
+    }
+
+    let Some((topic_key, target)) = pending_family_profile_probe_for_user(msg.author.id.get()) else {
+        return Ok(false);
+    };
+
+    let topic_key_owned = topic_key.clone();
+    let target_owned = target.clone();
+    let answer_owned = answer.to_string();
+    let recorded = tokio::task::spawn_blocking(move || {
+        record_family_profile_probe_answer(&topic_key_owned, &target_owned, &answer_owned)
+    })
+    .await
+    .map_err(|err| format!("profile_probe_join_failed:{err}"))?;
+
+    let response = match recorded {
+        Ok(true) => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ✓ Recorded family profile probe answer: user={} topic={}",
+                msg.author.id.get(),
+                topic_key
+            );
+            "답변 고마워요. 프로필에 반영해둘게요."
+        }
+        Ok(false) => {
+            eprintln!(
+                "  [profile-probe] record_answer returned false for user={} topic={}",
+                msg.author.id.get(),
+                topic_key
+            );
+            "답변은 받았는데 저장 대상에 바로 반영하지 못했어요. 제가 다시 확인할게요."
+        }
+        Err(err) => {
+            eprintln!(
+                "  [profile-probe] failed to record answer for user={} topic={} error={}",
+                msg.author.id.get(),
+                topic_key,
+                err
+            );
+            "답변은 받았는데 저장 중 오류가 있었어요. 다시 확인해서 반영할게요."
+        }
+    };
+
+    rate_limit_wait(shared, msg.channel_id).await;
+    let _ = msg.channel_id.say(&ctx.http, response).await;
+    Ok(true)
+}
+
+fn is_family_dm_user(user_id: UserId) -> bool {
+    FAMILY_DM_USER_IDS.contains(&user_id.get())
+}
+
+fn default_dm_workspace() -> Option<String> {
+    let home = dirs::home_dir()?;
+    let remote_vault = home.join("ObsidianVault").join("RemoteVault");
+    let base = if remote_vault.is_dir() {
+        remote_vault
+    } else {
+        home
+    };
+    Some(
+        base.canonicalize()
+            .unwrap_or(base)
+            .display()
+            .to_string(),
+    )
+}
+
+fn resolve_effective_role_binding(
+    channel_id: ChannelId,
+    channel_name: Option<&str>,
+    is_dm: bool,
+    provider: ProviderKind,
+    user_id: UserId,
+) -> Option<RoleBinding> {
+    if let Some(binding) = resolve_role_binding(channel_id, channel_name) {
+        return Some(binding);
+    }
+
+    if is_dm && provider == ProviderKind::Claude && is_family_dm_user(user_id) {
+        return resolve_role_binding(channel_id, Some(FAMILY_DM_ROLE_CHANNEL_NAME));
+    }
+
+    None
+}
+
+async fn ensure_default_dm_session(
+    shared: &Arc<SharedData>,
+    channel_id: ChannelId,
+    user_id: UserId,
+    provider: ProviderKind,
+    token: &str,
+) {
+    if provider != ProviderKind::Claude || !is_family_dm_user(user_id) {
+        return;
+    }
+
+    let Some(default_path) = default_dm_workspace() else {
+        return;
+    };
+    let existing = load_existing_session(&default_path, Some(channel_id.get()));
+
+    {
+        let mut data = shared.core.lock().await;
+        if data
+            .sessions
+            .get(&channel_id)
+            .and_then(|s| s.current_path.as_ref())
+            .is_some()
+        {
+            return;
+        }
+
+        let session = data
+            .sessions
+            .entry(channel_id)
+            .or_insert_with(|| DiscordSession {
+                session_id: None,
+                current_path: None,
+                history: Vec::new(),
+                pending_uploads: Vec::new(),
+                cleared: false,
+                remote_profile_name: None,
+                channel_id: Some(channel_id.get()),
+                channel_name: None,
+                category_name: None,
+                silent: false,
+                last_active: tokio::time::Instant::now(),
+            });
+
+        session.channel_id = Some(channel_id.get());
+        session.channel_name = None;
+        session.category_name = None;
+        session.remote_profile_name = None;
+        session.current_path = Some(default_path.clone());
+        session.last_active = tokio::time::Instant::now();
+
+        if let Some((session_data, _)) = existing {
+            session.session_id = Some(session_data.session_id.clone());
+            session.history = session_data.history.clone();
+        } else {
+            session.session_id = None;
+            session.history.clear();
+        }
+    }
+
+    {
+        let mut settings = shared.settings.write().await;
+        settings
+            .last_sessions
+            .insert(channel_id.get().to_string(), default_path.clone());
+        settings.last_remotes.remove(&channel_id.get().to_string());
+        save_bot_settings(token, &settings);
+    }
+
+    let new_skills = scan_skills(provider, Some(&default_path));
+    *shared.skills_cache.write().await = new_skills;
+
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    println!("  [{ts}] ↻ Auto-started DM session: {}", default_path);
+}
+
 /// Rate limit helper — ensures minimum 1s gap between API calls per channel
 pub(super) async fn rate_limit_wait(shared: &Arc<SharedData>, channel_id: ChannelId) {
     let min_gap = tokio::time::Duration::from_millis(1000);
@@ -665,9 +952,20 @@ async fn handle_event(
             let channel_id = new_message.channel_id;
             let is_dm = new_message.guild_id.is_none();
             let (channel_name, _) = resolve_channel_category(ctx, channel_id).await;
-            if !data
-                .provider
-                .is_channel_supported(channel_name.as_deref(), is_dm)
+            let role_binding = resolve_role_binding(channel_id, channel_name.as_deref());
+            if !channel_supports_provider(
+                data.provider,
+                channel_name.as_deref(),
+                is_dm,
+                role_binding.as_ref(),
+            ) {
+                return Ok(());
+            }
+
+            let text = new_message.content.trim();
+            if !text.is_empty()
+                && try_handle_family_profile_probe_reply(ctx, new_message, &data.shared, data.provider)
+                    .await?
             {
                 return Ok(());
             }
@@ -691,7 +989,6 @@ async fn handle_event(
                 handle_file_upload(ctx, new_message, &data.shared).await?;
             }
 
-            let text = new_message.content.trim();
             if text.is_empty() {
                 return Ok(());
             }
@@ -1002,7 +1299,6 @@ async fn cmd_start(
                 current_path: None,
                 history: Vec::new(),
                 pending_uploads: Vec::new(),
-                pending_interventions: Vec::new(),
                 cleared: false,
                 channel_name: None,
                 category_name: None,
@@ -1218,7 +1514,6 @@ async fn cmd_clear(ctx: Context<'_>) -> Result<(), Error> {
             session.session_id = None;
             session.history.clear();
             session.pending_uploads.clear();
-            session.pending_interventions.clear();
             session.cleared = true;
         }
         data.cancel_tokens.remove(&channel_id);
@@ -1774,7 +2069,6 @@ async fn cmd_cc(
                     session.session_id = None;
                     session.history.clear();
                     session.pending_uploads.clear();
-                    session.pending_interventions.clear();
                     session.cleared = true;
                 }
                 cleanup_channel_uploads(channel_id);
@@ -2050,8 +2344,8 @@ async fn handle_text_message(
     shared: &Arc<SharedData>,
     token: &str,
 ) -> Result<(), Error> {
-    // Get session info, allowed tools, pending uploads, and pending steering notes
-    let (session_info, provider, allowed_tools, pending_uploads, pending_interventions) = {
+    // Get session info, allowed tools, and pending uploads
+    let (session_info, provider, allowed_tools, pending_uploads) = {
         let mut data = shared.core.lock().await;
         let info = data.sessions.get(&channel_id).and_then(|session| {
             session.current_path.as_ref().map(|_| {
@@ -2061,15 +2355,12 @@ async fn handle_text_message(
                 )
             })
         });
-        let (uploads, interventions) = data
+        let uploads = data
             .sessions
             .get_mut(&channel_id)
             .map(|s| {
                 s.cleared = false;
-                (
-                    std::mem::take(&mut s.pending_uploads),
-                    std::mem::take(&mut s.pending_interventions),
-                )
+                std::mem::take(&mut s.pending_uploads)
             })
             .unwrap_or_default();
         drop(data);
@@ -2079,7 +2370,6 @@ async fn handle_text_message(
             settings.provider,
             settings.allowed_tools.clone(),
             uploads,
-            interventions,
         )
     };
 
@@ -2107,16 +2397,24 @@ async fn handle_text_message(
     // Sanitize input
     let sanitized_input = ai_screen::sanitize_user_input(user_text);
 
-    // Prepend pending file uploads + steering notes
+    let role_binding = {
+        let data = shared.core.lock().await;
+        let ch_name = data
+            .sessions
+            .get(&channel_id)
+            .and_then(|s| s.channel_name.as_deref());
+        resolve_role_binding(channel_id, ch_name)
+    };
+
+    // Prepend pending file uploads
     let mut context_chunks = Vec::new();
     if !pending_uploads.is_empty() {
         context_chunks.push(pending_uploads.join("\n"));
     }
-    if !pending_interventions.is_empty() {
-        context_chunks.push(format!(
-            "[Queued steering notes]\n{}",
-            pending_interventions.join("\n")
-        ));
+    if let Some(shared_memory) = role_binding.as_ref().and_then(|binding| {
+        build_shared_memory_context(&binding.role_id, provider, channel_id, session_id.is_some())
+    }) {
+        context_chunks.push(shared_memory);
     }
     context_chunks.push(sanitized_input);
     let context_prompt = context_chunks.join("\n\n");
@@ -2215,15 +2513,7 @@ async fn handle_text_message(
     );
 
     // Append role identity context from ~/.remotecc/role_map.json (channel-id first)
-    let role_binding = {
-        let data = shared.core.lock().await;
-        let ch_name = data
-            .sessions
-            .get(&channel_id)
-            .and_then(|s| s.channel_name.as_deref());
-        resolve_role_binding(channel_id, ch_name)
-    };
-    if let Some(binding) = role_binding {
+    if let Some(binding) = role_binding.as_ref() {
         match load_role_prompt(&binding) {
             Some(role_prompt) => {
                 system_prompt_owned.push_str(
@@ -2248,6 +2538,10 @@ async fn handle_text_message(
                     channel_id.get()
                 );
             }
+        }
+        if let Some(peer_guidance) = render_peer_agent_guidance(&binding.role_id) {
+            system_prompt_owned.push_str("\n\n");
+            system_prompt_owned.push_str(&peer_guidance);
         }
     }
 
@@ -2379,6 +2673,7 @@ async fn handle_text_message(
         let mut accumulated_tokens: u64 = 0;
         let mut new_session_id: Option<String> = None;
         let mut tmux_last_offset: Option<u64> = None;
+        let mut tmux_input_fifo: Option<String> = None;
         let mut spin_idx: usize = 0;
         let mut current_msg_id = placeholder_msg_id;
         let mut current_msg_len: usize = 0;
@@ -2493,12 +2788,13 @@ async fn handle_text_message(
                             }
                             StreamMessage::TmuxReady {
                                 output_path,
-                                input_fifo_path: _,
+                                input_fifo_path,
                                 tmux_session_name,
                                 last_offset,
                             } => {
-                                // Record offset so we can resume watcher from here
+                                // Record offset and FIFO path for command queuing
                                 tmux_last_offset = Some(last_offset);
+                                tmux_input_fifo = Some(input_fifo_path);
                                 // Start background tmux watcher for terminal→Discord relay
                                 let already_watching =
                                     shared_owned.tmux_watchers.contains_key(&channel_id);
@@ -2624,8 +2920,8 @@ async fn handle_text_message(
         )
         .await;
 
-        // Remove active token/owner and flush queued soft steering notes
-        let queued_soft_count = {
+        // Remove active token/owner and collect queued commands for auto-processing
+        let queued_commands: Vec<String> = {
             let mut data = shared_owned.core.lock().await;
             data.cancel_tokens.remove(&channel_id);
             data.active_request_owner.remove(&channel_id);
@@ -2634,30 +2930,11 @@ async fn handle_text_message(
                 .intervention_queue
                 .remove(&channel_id)
                 .unwrap_or_default();
-            let soft_notes: Vec<String> = queued
+            queued
                 .into_iter()
                 .filter(|i| i.mode == InterventionMode::Soft)
-                .map(|i| format!("[Steering] {}", i.text))
-                .collect();
-
-            if !soft_notes.is_empty() {
-                if let Some(session) = data.sessions.get_mut(&channel_id) {
-                    session.pending_interventions.extend(soft_notes);
-                    if session.pending_interventions.len() > MAX_INTERVENTIONS_PER_CHANNEL {
-                        let overflow =
-                            session.pending_interventions.len() - MAX_INTERVENTIONS_PER_CHANNEL;
-                        session.pending_interventions.drain(0..overflow);
-                    }
-                    if let Some(ref path) = session.current_path {
-                        save_session_to_file(session, path);
-                    }
-                }
-            }
-
-            data.sessions
-                .get(&channel_id)
-                .map(|s| s.pending_interventions.len())
-                .unwrap_or(0)
+                .map(|i| i.text)
+                .collect()
         };
 
         // Remove hourglass reaction
@@ -2703,29 +2980,53 @@ async fn handle_text_message(
                     }
                     session.history.push(HistoryItem {
                         item_type: HistoryType::User,
-                        content: user_text_owned,
+                        content: user_text_owned.clone(),
                     });
                     session.history.push(HistoryItem {
                         item_type: HistoryType::Assistant,
-                        content: stopped_response,
+                        content: stopped_response.clone(),
                     });
-                    if let Some(ref path) = session.current_path {
+                    let current_path = session.current_path.clone();
+                    let channel_name = session.channel_name.clone();
+                    if let Some(ref path) = current_path {
+                        if let Some(binding) = role_binding.as_ref() {
+                            if let Err(e) = append_shared_memory_turn(
+                                &binding.role_id,
+                                provider,
+                                channel_id,
+                                channel_name.as_deref(),
+                                path,
+                                &user_text_owned,
+                                &stopped_response,
+                            ) {
+                                let ts = chrono::Local::now().format("%H:%M:%S");
+                                println!("  [{ts}]   ⚠ shared memory save failed: {e}");
+                            }
+                        }
                         save_session_to_file(session, path);
                     }
                 }
             }
 
-            if queued_soft_count > 0 {
-                rate_limit_wait(&shared_owned, channel_id).await;
-                let _ = channel_id
-                    .say(
-                        &http,
-                        format!(
-                            "✅ steering 반영 준비 완료 ({}개). 다음 요청에 자동 반영될게.",
-                            queued_soft_count
-                        ),
-                    )
-                    .await;
+            // Process queued commands even after cancellation
+            if !queued_commands.is_empty() {
+                if let Some(ref fifo_path) = tmux_input_fifo {
+                    let cmd_count = queued_commands.len();
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    println!("  [{ts}] 📋 Processing {cmd_count} queued command(s) after cancel");
+                    rate_limit_wait(&shared_owned, channel_id).await;
+                    let _ = channel_id
+                        .say(&http, format!("📋 큐잉된 명령 처리 중 ({cmd_count}개)..."))
+                        .await;
+                    for cmd in &queued_commands {
+                        let fifo = fifo_path.clone();
+                        let cmd_text = cmd.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            write_command_to_fifo(&fifo, &cmd_text)
+                        })
+                        .await;
+                    }
+                }
             }
 
             return;
@@ -2770,36 +3071,83 @@ async fn handle_text_message(
                     }
                     session.history.push(HistoryItem {
                         item_type: HistoryType::User,
-                        content: user_text_owned,
+                        content: user_text_owned.clone(),
                     });
                     session.history.push(HistoryItem {
                         item_type: HistoryType::Assistant,
-                        content: full_response,
+                        content: full_response.clone(),
                     });
-                    if let Some(ref path) = session.current_path {
+                    let current_path = session.current_path.clone();
+                    let channel_name = session.channel_name.clone();
+                    if let Some(ref path) = current_path {
+                        if let Some(binding) = role_binding.as_ref() {
+                            if let Err(e) = append_shared_memory_turn(
+                                &binding.role_id,
+                                provider,
+                                channel_id,
+                                channel_name.as_deref(),
+                                path,
+                                &user_text_owned,
+                                &full_response,
+                            ) {
+                                let ts = chrono::Local::now().format("%H:%M:%S");
+                                println!("  [{ts}]   ⚠ shared memory save failed: {e}");
+                            }
+                        }
                         save_session_to_file(session, path);
                     }
                 }
             }
         }
 
-        if queued_soft_count > 0 {
-            rate_limit_wait(&shared_owned, channel_id).await;
-            let _ = channel_id
-                .say(
-                    &http,
-                    format!(
-                        "✅ steering 반영 준비 완료 ({}개). 다음 요청에 자동 반영될게.",
-                        queued_soft_count
-                    ),
-                )
-                .await;
-        }
-
         let ts = chrono::Local::now().format("%H:%M:%S");
         println!("  [{ts}] ▶ Response sent");
+
+        // Auto-process queued commands via FIFO (command queuing)
+        if !queued_commands.is_empty() {
+            if let Some(ref fifo_path) = tmux_input_fifo {
+                let cmd_count = queued_commands.len();
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!("  [{ts}] 📋 Processing {cmd_count} queued command(s)");
+                rate_limit_wait(&shared_owned, channel_id).await;
+                let _ = channel_id
+                    .say(&http, format!("📋 큐잉된 명령 처리 중 ({cmd_count}개)..."))
+                    .await;
+                for cmd in &queued_commands {
+                    let fifo = fifo_path.clone();
+                    let cmd_text = cmd.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        write_command_to_fifo(&fifo, &cmd_text)
+                    })
+                    .await;
+                }
+            }
+        }
     });
 
+    Ok(())
+}
+
+/// Write a command to the tmux FIFO pipe for command queuing.
+/// Called from spawn_blocking since FIFO write can block.
+fn write_command_to_fifo(fifo_path: &str, command: &str) -> Result<(), String> {
+    use std::io::Write;
+    let msg = serde_json::json!({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": command
+        }
+    });
+    let mut fifo = std::fs::OpenOptions::new()
+        .write(true)
+        .open(fifo_path)
+        .map_err(|e| format!("Failed to open FIFO: {}", e))?;
+    writeln!(fifo, "{}", msg).map_err(|e| format!("Failed to write to FIFO: {}", e))?;
+    fifo.flush()
+        .map_err(|e| format!("Failed to flush FIFO: {}", e))?;
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    println!("  [{ts}] 📋 Queued command sent to FIFO: {}", &command[..command.len().min(80)]);
     Ok(())
 }
 
@@ -3024,6 +3372,39 @@ pub async fn send_file_to_channel(
     Ok(())
 }
 
+/// Send a text message to a Discord channel (called from CLI --discord-sendmessage)
+pub async fn send_message_to_channel(
+    token: &str,
+    channel_id: u64,
+    message: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let http = serenity::Http::new(token);
+    let channel = ChannelId::new(channel_id);
+
+    channel
+        .send_message(&http, CreateMessage::new().content(message))
+        .await?;
+
+    Ok(())
+}
+
+/// Send a text message to a Discord user DM (called from CLI --discord-senddm)
+pub async fn send_message_to_user(
+    token: &str,
+    user_id: u64,
+    message: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let http = serenity::Http::new(token);
+    let dm_channel = UserId::new(user_id).create_dm_channel(&http).await?;
+
+    dm_channel
+        .id
+        .send_message(&http, CreateMessage::new().content(message))
+        .await?;
+
+    Ok(())
+}
+
 // ─── Session persistence ─────────────────────────────────────────────────────
 
 /// Auto-restore session from bot_settings.json if not in memory
@@ -3068,7 +3449,6 @@ async fn auto_restore_session(
                     current_path: None,
                     history: Vec::new(),
                     pending_uploads: Vec::new(),
-                    pending_interventions: Vec::new(),
                     cleared: false,
                     channel_id: Some(channel_id.get()),
                     channel_name: ch_name,

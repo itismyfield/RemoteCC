@@ -800,6 +800,7 @@ async fn execute_agent_turn(
         load_role_prompt(&RoleBinding {
             role_id: participant.role_id.clone(),
             prompt_file: participant.prompt_file.clone(),
+            provider: None,
         })
         .unwrap_or_default()
     } else {
@@ -1002,6 +1003,7 @@ async fn conclude_meeting(
         load_role_prompt(&RoleBinding {
             role_id: config.summary_agent.clone(),
             prompt_file: summary_prompt_file,
+            provider: None,
         })
         .unwrap_or_default()
     } else {

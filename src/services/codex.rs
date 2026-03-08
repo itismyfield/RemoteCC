@@ -84,7 +84,11 @@ pub fn execute_command_simple(prompt: &str) -> Result<String, String> {
         if item.get("type").and_then(|v| v.as_str()) != Some("agent_message") {
             continue;
         }
-        let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let text = item
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
         if text.is_empty() {
             continue;
         }

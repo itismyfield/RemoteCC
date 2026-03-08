@@ -42,6 +42,14 @@ pub(super) fn role_map_path() -> Option<std::path::PathBuf> {
 pub(super) struct RoleBinding {
     pub role_id: String,
     pub prompt_file: String,
+    pub provider: Option<ProviderKind>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct PeerAgentInfo {
+    pub role_id: String,
+    pub display_name: String,
+    pub keywords: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,10 +63,32 @@ pub(super) fn parse_role_binding(v: &serde_json::Value) -> Option<RoleBinding> {
     let obj = v.as_object()?;
     let role_id = obj.get("roleId")?.as_str()?.to_string();
     let prompt_file = obj.get("promptFile")?.as_str()?.to_string();
+    let provider = obj
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .and_then(ProviderKind::from_str);
     Some(RoleBinding {
         role_id,
         prompt_file,
+        provider,
     })
+}
+
+pub(super) fn channel_supports_provider(
+    provider: ProviderKind,
+    channel_name: Option<&str>,
+    is_dm: bool,
+    role_binding: Option<&RoleBinding>,
+) -> bool {
+    if is_dm {
+        return true;
+    }
+
+    if let Some(bound_provider) = role_binding.and_then(|binding| binding.provider) {
+        return bound_provider == provider;
+    }
+
+    provider.is_channel_supported(channel_name, is_dm)
 }
 
 pub(super) fn resolve_role_binding(
@@ -102,8 +132,97 @@ pub(super) fn load_role_prompt(binding: &RoleBinding) -> Option<String> {
     Some(truncated)
 }
 
+pub(super) fn load_peer_agents() -> Vec<PeerAgentInfo> {
+    let Some(path) = role_map_path() else {
+        return Vec::new();
+    };
+    let Ok(content) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return Vec::new();
+    };
+    let Some(agents) = json
+        .get("meeting")
+        .and_then(|meeting| meeting.get("available_agents"))
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    for agent in agents {
+        let Some(obj) = agent.as_object() else {
+            continue;
+        };
+        let Some(role_id) = obj.get("role_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !seen.insert(role_id.to_string()) {
+            continue;
+        }
+        let Some(display_name) = obj.get("display_name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let keywords = obj
+            .get("keywords")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        result.push(PeerAgentInfo {
+            role_id: role_id.to_string(),
+            display_name: display_name.to_string(),
+            keywords,
+        });
+    }
+
+    result
+}
+
+pub(super) fn render_peer_agent_guidance(current_role_id: &str) -> Option<String> {
+    let peers: Vec<PeerAgentInfo> = load_peer_agents()
+        .into_iter()
+        .filter(|agent| agent.role_id != current_role_id)
+        .collect();
+    if peers.is_empty() {
+        return None;
+    }
+
+    let mut lines = vec![
+        "[Peer Agent Directory]".to_string(),
+        "You are one role agent among multiple specialist agents in this workspace.".to_string(),
+        "If a request is mostly outside your scope, do not bluff ownership or silently proceed as if it were yours.".to_string(),
+        "Instead, name the 1-2 most suitable peer agents below, explain why they fit better, and suggest moving the work there.".to_string(),
+        "If the user explicitly wants your perspective anyway, answer only within your scope and mention the handoff option.".to_string(),
+        String::new(),
+        "Available peer agents:".to_string(),
+    ];
+
+    for peer in peers {
+        let keywords = if peer.keywords.is_empty() {
+            String::new()
+        } else {
+            let short = peer.keywords.iter().take(4).cloned().collect::<Vec<_>>();
+            format!(" — best for: {}", short.join(", "))
+        };
+        lines.push(format!(
+            "- {} ({}){}",
+            peer.role_id, peer.display_name, keywords
+        ));
+    }
+
+    Some(lines.join("\n"))
+}
+
 pub(super) fn discord_uploads_root() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".openclaw").join("remotecc_uploads").join("discord"))
+    dirs::home_dir().map(|h| h.join(".remotecc").join("runtime").join("discord_uploads"))
 }
 
 pub(super) fn channel_upload_dir(channel_id: ChannelId) -> Option<std::path::PathBuf> {
@@ -336,11 +455,16 @@ mod tests {
     use std::fs;
     use std::sync::{Mutex, OnceLock};
 
+    use poise::serenity_prelude::ChannelId;
     use tempfile::TempDir;
 
     use crate::services::provider::ProviderKind;
 
-    use super::{discord_token_hash, load_bot_settings, load_discord_bot_launch_configs};
+    use super::{
+        channel_supports_provider, discord_token_hash, load_bot_settings,
+        load_discord_bot_launch_configs, load_peer_agents, render_peer_agent_guidance,
+        resolve_role_binding,
+    };
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -467,6 +591,113 @@ mod tests {
             assert_eq!(settings.owner_user_id, Some(343742347365974000));
             assert_eq!(settings.allowed_user_ids, vec![429955158974136300]);
             assert_eq!(settings.allowed_bot_ids, vec![1479017284805722200]);
+        });
+    }
+
+    #[test]
+    fn test_resolve_role_binding_reads_optional_provider() {
+        with_temp_home(|temp_home| {
+            let settings_dir = temp_home.path().join(".remotecc");
+            fs::create_dir_all(&settings_dir).unwrap();
+            fs::write(
+                settings_dir.join("role_map.json"),
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "version": 1,
+                    "byChannelId": {
+                        "123": {
+                            "roleId": "family-routine",
+                            "promptFile": "/tmp/family-routine.prompt.md",
+                            "provider": "codex"
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            let binding = resolve_role_binding(ChannelId::new(123), Some("쇼핑도우미")).unwrap();
+            assert_eq!(binding.role_id, "family-routine");
+            assert_eq!(binding.provider, Some(ProviderKind::Codex));
+            assert!(channel_supports_provider(
+                ProviderKind::Codex,
+                Some("쇼핑도우미"),
+                false,
+                Some(&binding)
+            ));
+            assert!(!channel_supports_provider(
+                ProviderKind::Claude,
+                Some("쇼핑도우미"),
+                false,
+                Some(&binding)
+            ));
+        });
+    }
+
+    #[test]
+    fn test_load_peer_agents_reads_meeting_config() {
+        with_temp_home(|temp_home| {
+            let settings_dir = temp_home.path().join(".remotecc");
+            fs::create_dir_all(&settings_dir).unwrap();
+            let json = serde_json::json!({
+                "meeting": {
+                    "available_agents": [
+                        {
+                            "role_id": "ch-td",
+                            "display_name": "TD (테크니컬 디렉터)",
+                            "keywords": ["아키텍처", "코드", "성능"]
+                        },
+                        {
+                            "role_id": "ch-pd",
+                            "display_name": "PD (프로덕트 디렉터)",
+                            "keywords": ["제품", "로드맵"]
+                        }
+                    ]
+                }
+            });
+            fs::write(
+                settings_dir.join("role_map.json"),
+                serde_json::to_string_pretty(&json).unwrap(),
+            )
+            .unwrap();
+
+            let agents = load_peer_agents();
+            assert_eq!(agents.len(), 2);
+            assert_eq!(agents[0].role_id, "ch-td");
+            assert_eq!(agents[1].display_name, "PD (프로덕트 디렉터)");
+        });
+    }
+
+    #[test]
+    fn test_render_peer_agent_guidance_excludes_current_role() {
+        with_temp_home(|temp_home| {
+            let settings_dir = temp_home.path().join(".remotecc");
+            fs::create_dir_all(&settings_dir).unwrap();
+            let json = serde_json::json!({
+                "meeting": {
+                    "available_agents": [
+                        {
+                            "role_id": "ch-td",
+                            "display_name": "TD (테크니컬 디렉터)",
+                            "keywords": ["아키텍처", "코드", "성능"]
+                        },
+                        {
+                            "role_id": "ch-pd",
+                            "display_name": "PD (프로덕트 디렉터)",
+                            "keywords": ["제품", "로드맵"]
+                        }
+                    ]
+                }
+            });
+            fs::write(
+                settings_dir.join("role_map.json"),
+                serde_json::to_string_pretty(&json).unwrap(),
+            )
+            .unwrap();
+
+            let rendered = render_peer_agent_guidance("ch-pd").unwrap();
+            assert!(rendered.contains("ch-td"));
+            assert!(!rendered.contains("ch-pd (PD"));
+            assert!(rendered.contains("name the 1-2 most suitable peer agents"));
         });
     }
 }
