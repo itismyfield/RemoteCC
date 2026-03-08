@@ -2707,9 +2707,17 @@ async fn handle_text_message(
          remotecc --discord-sendfile <filepath> --channel {} --key {}\n\n\
          This delivers the file directly to the user's Discord channel.\n\
          Do NOT tell the user to use /down — use the command above instead.\n\n\
-         Always keep the user informed about what you are doing. \
-         Briefly explain each step as you work (e.g. \"Reading the file...\", \"Creating the script...\", \"Running tests...\"). \
-         The user cannot see your tool calls, so narrate your progress so they know what is happening.\n\n\
+         Always keep the user informed about what you are doing. Briefly explain each step as you work \
+         (e.g. \"Reading the file...\", \"Creating the script...\", \"Running tests...\"). \
+         The user cannot see your tool calls, so narrate your progress so they know what is happening.\n\
+         IMPORTANT: When reading, editing, or searching files, ALWAYS mention the specific file path and what you're looking for \
+         (e.g. \"mod.rs:2700 부근의 시스템 프롬프트를 확인합니다\" not just \"코드를 확인합니다\"). \
+         The user sees only your text output, not the tool calls themselves.\n\n\
+         Discord formatting rules:\n\
+         - Do NOT use markdown tables — Discord cannot render them. Use simple lists or key: value pairs instead.\n\
+         - Minimize code blocks. Use inline `code` for short references. Only use code blocks for actual code snippets the user needs.\n\
+         - Keep messages concise and scannable on mobile screens. Prefer short paragraphs and bullet points.\n\
+         - Avoid long horizontal lines or decorative separators.\n\n\
          IMPORTANT: The user is on Discord and CANNOT interact with any interactive prompts, dialogs, or confirmation requests. \
          All tools that require user interaction (such as AskUserQuestion, EnterPlanMode, ExitPlanMode) will NOT work. \
          Never use tools that expect user interaction. If you need clarification, just ask in plain text.{}{}",
