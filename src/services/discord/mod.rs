@@ -19,7 +19,9 @@ use tokio::sync::Mutex;
 use poise::serenity_prelude as serenity;
 use serenity::{ChannelId, CreateAttachment, CreateMessage, EditMessage, MessageId, UserId};
 
-use crate::services::claude::{self, CancelToken, StreamMessage, DEFAULT_ALLOWED_TOOLS};
+use crate::services::claude::{
+    self, CancelToken, ReadOutputResult, StreamMessage, DEFAULT_ALLOWED_TOOLS,
+};
 use crate::services::codex;
 use crate::services::provider::ProviderKind;
 use crate::ui::ai_screen::{self, HistoryItem, HistoryType, SessionData};
@@ -30,8 +32,7 @@ use formatting::{
     send_long_message_ctx, send_long_message_raw, tool_info, truncate_str, BUILTIN_SKILLS,
 };
 use inflight::{
-    clear_inflight_state, has_inflight_state, load_inflight_states, save_inflight_state,
-    InflightTurnState,
+    clear_inflight_state, load_inflight_states, save_inflight_state, InflightTurnState,
 };
 use settings::{
     channel_supports_provider, channel_upload_dir, cleanup_channel_uploads, cleanup_old_uploads,
@@ -73,6 +74,19 @@ pub(super) struct DiscordSession {
     pub(super) silent: bool,
     /// Last time this session was actively used (for TTL cleanup)
     pub(super) last_active: tokio::time::Instant,
+    /// If this session runs in a git worktree, store the info here
+    pub(super) worktree: Option<WorktreeInfo>,
+}
+
+/// Worktree info for sessions that were auto-redirected to avoid conflicts
+#[derive(Clone, Debug)]
+pub(super) struct WorktreeInfo {
+    /// The original repo path that was conflicted
+    pub original_path: String,
+    /// The worktree directory path
+    pub worktree_path: String,
+    /// The branch name created for this worktree
+    pub branch_name: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -518,7 +532,12 @@ fn cancel_active_token(token: &Arc<CancelToken>, cleanup_tmux: bool) {
 
     if cleanup_tmux {
         if child_pid.is_some() {
-            if let Some(name) = token.tmux_session.lock().ok().and_then(|guard| guard.clone()) {
+            if let Some(name) = token
+                .tmux_session
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone())
+            {
                 let _ = std::process::Command::new("tmux")
                     .args(["kill-session", "-t", &name])
                     .output();
@@ -667,7 +686,8 @@ async fn try_handle_family_profile_probe_reply(
         return Ok(false);
     }
 
-    let Some((topic_key, target)) = pending_family_profile_probe_for_user(msg.author.id.get()) else {
+    let Some((topic_key, target)) = pending_family_profile_probe_for_user(msg.author.id.get())
+    else {
         return Ok(false);
     };
 
@@ -726,12 +746,7 @@ fn default_dm_workspace() -> Option<String> {
     } else {
         home
     };
-    Some(
-        base.canonicalize()
-            .unwrap_or(base)
-            .display()
-            .to_string(),
-    )
+    Some(base.canonicalize().unwrap_or(base).display().to_string())
 }
 
 fn resolve_effective_role_binding(
@@ -794,6 +809,7 @@ async fn ensure_default_dm_session(
                 category_name: None,
                 silent: false,
                 last_active: tokio::time::Instant::now(),
+                worktree: None,
             });
 
         session.channel_id = Some(channel_id.get());
@@ -945,6 +961,12 @@ async fn maybe_cleanup_sessions(shared: &Arc<SharedData>) {
     {
         let mut data = shared.core.lock().await;
         for ch in &expired {
+            // Clean up worktree if session had one
+            if let Some(session) = data.sessions.get(ch) {
+                if let Some(ref wt) = session.worktree {
+                    cleanup_git_worktree(wt);
+                }
+            }
             data.sessions.remove(ch);
             data.cancel_tokens.remove(ch);
             data.active_request_owner.remove(ch);
@@ -1011,8 +1033,13 @@ async fn handle_event(
 
             let text = new_message.content.trim();
             if !text.is_empty()
-                && try_handle_family_profile_probe_reply(ctx, new_message, &data.shared, data.provider)
-                    .await?
+                && try_handle_family_profile_probe_reply(
+                    ctx,
+                    new_message,
+                    &data.shared,
+                    data.provider,
+                )
+                .await?
             {
                 return Ok(());
             }
@@ -1317,12 +1344,54 @@ async fn cmd_start(
             .unwrap_or_else(|_| expanded)
     };
 
-    // Try to load existing session for this path
-    let existing = load_existing_session(&canonical_path, Some(ctx.channel_id().get()));
-
     // Resolve channel/category names before taking the lock
     let (ch_name, cat_name) =
         resolve_channel_category(ctx.serenity_context(), ctx.channel_id()).await;
+
+    // Check for worktree conflict (another channel using same git repo path)
+    let worktree_info = {
+        let data = ctx.data().shared.core.lock().await;
+        let conflict =
+            detect_worktree_conflict(&data.sessions, &canonical_path, ctx.channel_id());
+        drop(data);
+        if let Some(conflicting_channel) = conflict {
+            let provider_str = {
+                let settings = ctx.data().shared.settings.read().await;
+                settings.provider.as_str().to_string()
+            };
+            let ch = ch_name.as_deref().unwrap_or("unknown");
+            match create_git_worktree(&canonical_path, ch, &provider_str) {
+                Ok((wt_path, branch)) => {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    println!(
+                        "  [{ts}] 🌿 Worktree conflict: {} already uses {}. Created worktree.",
+                        conflicting_channel, canonical_path
+                    );
+                    Some(WorktreeInfo {
+                        original_path: canonical_path.clone(),
+                        worktree_path: wt_path,
+                        branch_name: branch,
+                    })
+                }
+                Err(e) => {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    println!("  [{ts}] 🌿 Worktree creation skipped: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
+    // Use worktree path if created, otherwise original
+    let effective_path = worktree_info
+        .as_ref()
+        .map(|wt| wt.worktree_path.clone())
+        .unwrap_or_else(|| canonical_path.clone());
+
+    // Try to load existing session for this path
+    let existing = load_existing_session(&effective_path, Some(ctx.channel_id().get()));
 
     let mut response_lines = Vec::new();
 
@@ -1348,6 +1417,7 @@ async fn cmd_start(
                 channel_id: Some(channel_id.get()),
                 silent: false,
                 last_active: tokio::time::Instant::now(),
+                worktree: None,
             });
         session.channel_id = Some(channel_id.get());
         session.channel_name = ch_name;
@@ -1363,8 +1433,11 @@ async fn cmd_start(
             }
         }
 
+        // Apply worktree info if created
+        session.worktree = worktree_info.clone();
+
         if let Some((session_data, _)) = &existing {
-            session.current_path = Some(canonical_path.clone());
+            session.current_path = Some(effective_path.clone());
             session.history = session_data.history.clone();
             // Only restore remote_profile_name from file if session is newly created.
             // If session already existed in memory, the user may have explicitly set
@@ -1388,10 +1461,10 @@ async fn cmd_start(
                 .as_ref()
                 .map(|n| format!(" (remote: {})", n))
                 .unwrap_or_default();
-            println!("  [{ts}] ▶ Session restored: {canonical_path}{remote_info}");
+            println!("  [{ts}] ▶ Session restored: {effective_path}{remote_info}");
             response_lines.push(format!(
                 "Session restored at `{}`{}.",
-                canonical_path, remote_info
+                effective_path, remote_info
             ));
             response_lines.push(String::new());
 
@@ -1417,7 +1490,7 @@ async fn cmd_start(
             }
         } else {
             session.session_id = None;
-            session.current_path = Some(canonical_path.clone());
+            session.current_path = Some(effective_path.clone());
             session.history.clear();
 
             let ts = chrono::Local::now().format("%H:%M:%S");
@@ -1426,11 +1499,20 @@ async fn cmd_start(
                 .as_ref()
                 .map(|n| format!(" (remote: {})", n))
                 .unwrap_or_default();
-            println!("  [{ts}] ▶ Session started: {canonical_path}{remote_info}");
+            println!("  [{ts}] ▶ Session started: {effective_path}{remote_info}");
             response_lines.push(format!(
                 "Session started at `{}`{}.",
-                canonical_path, remote_info
+                effective_path, remote_info
             ));
+        }
+
+        // Notify about worktree if created
+        if let Some(ref wt) = session.worktree {
+            response_lines.push(format!(
+                "🌿 Worktree: `{}` 가 이미 사용 중이라 분리된 worktree에서 작업합니다.",
+                wt.original_path
+            ));
+            response_lines.push(format!("Branch: `{}`", wt.branch_name));
         }
 
         // Persist channel → path mapping for auto-restore
@@ -1468,7 +1550,7 @@ async fn cmd_start(
         drop(settings);
 
         // Rescan skills with project path to pick up project-level commands
-        let new_skills = scan_skills(ctx.data().provider, Some(&canonical_path));
+        let new_skills = scan_skills(ctx.data().provider, Some(&effective_path));
         *ctx.data().shared.skills_cache.write().await = new_skills;
     }
 
@@ -2405,8 +2487,7 @@ async fn handle_text_message(
                     .get(&channel_id)
                     .and_then(|s| s.channel_name.clone())
             };
-            let workspace =
-                settings::resolve_workspace(channel_id, ch_name.as_deref());
+            let workspace = settings::resolve_workspace(channel_id, ch_name.as_deref());
             if let Some(ws_path) = workspace {
                 let ws = std::path::Path::new(&ws_path);
                 if ws.is_dir() {
@@ -2414,67 +2495,93 @@ async fn handle_text_message(
                         .canonicalize()
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|_| ws_path.clone());
+                    // Check worktree conflict
+                    let wt_info = {
+                        let data = shared.core.lock().await;
+                        let conflict = detect_worktree_conflict(
+                            &data.sessions,
+                            &canonical,
+                            channel_id,
+                        );
+                        drop(data);
+                        if let Some(conflicting) = conflict {
+                            let ch = ch_name.as_deref().unwrap_or("unknown");
+                            match create_git_worktree(&canonical, ch, provider.as_str()) {
+                                Ok((wt_path, branch)) => {
+                                    let ts = chrono::Local::now().format("%H:%M:%S");
+                                    println!(
+                                        "  [{ts}] 🌿 Auto-start worktree: {} uses {}",
+                                        conflicting, canonical
+                                    );
+                                    Some(WorktreeInfo {
+                                        original_path: canonical.clone(),
+                                        worktree_path: wt_path,
+                                        branch_name: branch,
+                                    })
+                                }
+                                Err(_) => None,
+                            }
+                        } else {
+                            None
+                        }
+                    };
+                    let eff_path = wt_info
+                        .as_ref()
+                        .map(|wt| wt.worktree_path.clone())
+                        .unwrap_or_else(|| canonical.clone());
                     let (ch_name_resolved, cat_name) =
                         resolve_channel_category(ctx, channel_id).await;
-                    let existing =
-                        load_existing_session(&canonical, Some(channel_id.get()));
+                    let existing = load_existing_session(&eff_path, Some(channel_id.get()));
                     {
                         let mut data = shared.core.lock().await;
-                        let session = data
-                            .sessions
-                            .entry(channel_id)
-                            .or_insert_with(|| DiscordSession {
-                                session_id: None,
-                                current_path: None,
-                                history: Vec::new(),
-                                pending_uploads: Vec::new(),
-                                cleared: false,
-                                channel_name: None,
-                                category_name: None,
-                                remote_profile_name: None,
-                                channel_id: Some(channel_id.get()),
-                                silent: false,
-                                last_active: tokio::time::Instant::now(),
-                            });
-                        session.current_path = Some(canonical.clone());
+                        let session =
+                            data.sessions
+                                .entry(channel_id)
+                                .or_insert_with(|| DiscordSession {
+                                    session_id: None,
+                                    current_path: None,
+                                    history: Vec::new(),
+                                    pending_uploads: Vec::new(),
+                                    cleared: false,
+                                    channel_name: None,
+                                    category_name: None,
+                                    remote_profile_name: None,
+                                    channel_id: Some(channel_id.get()),
+                                    silent: false,
+                                    last_active: tokio::time::Instant::now(),
+                                    worktree: None,
+                                });
+                        session.current_path = Some(eff_path.clone());
                         session.channel_name = ch_name_resolved;
                         session.category_name = cat_name;
                         session.channel_id = Some(channel_id.get());
                         session.last_active = tokio::time::Instant::now();
+                        session.worktree = wt_info;
                         if let Some((session_data, _)) = &existing {
                             session.history = session_data.history.clone();
-                            session.session_id =
-                                Some(session_data.session_id.clone());
+                            session.session_id = Some(session_data.session_id.clone());
                         }
                     }
                     let ts = chrono::Local::now().format("%H:%M:%S");
-                    println!(
-                        "  [{ts}] ▶ Auto-started session from workspace: {canonical}"
-                    );
+                    println!("  [{ts}] ▶ Auto-started session from workspace: {eff_path}");
                     let sid = {
                         let data = shared.core.lock().await;
                         data.sessions
                             .get(&channel_id)
                             .and_then(|s| s.session_id.clone())
                     };
-                    (sid, canonical)
+                    (sid, eff_path)
                 } else {
                     rate_limit_wait(shared, channel_id).await;
                     let _ = channel_id
-                        .say(
-                            &ctx.http,
-                            "No active session. Use `/start <path>` first.",
-                        )
+                        .say(&ctx.http, "No active session. Use `/start <path>` first.")
                         .await;
                     return Ok(());
                 }
             } else {
                 rate_limit_wait(shared, channel_id).await;
                 let _ = channel_id
-                    .say(
-                        &ctx.http,
-                        "No active session. Use `/start <path>` first.",
-                    )
+                    .say(&ctx.http, "No active session. Use `/start <path>` first.")
                     .await;
                 return Ok(());
             }
@@ -2691,7 +2798,9 @@ async fn handle_text_message(
                     .map(|s| s.success())
                     .unwrap_or(false);
                 let last_offset = if session_exists {
-                    std::fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0)
+                    std::fs::metadata(&output_path)
+                        .map(|m| m.len())
+                        .unwrap_or(0)
                 } else {
                     0
                 };
@@ -2822,6 +2931,151 @@ async fn handle_text_message(
     Ok(())
 }
 
+/// Check if a path is a git repo and if another channel already uses it.
+/// Returns the conflicting channel's name if found.
+fn detect_worktree_conflict(
+    sessions: &HashMap<ChannelId, DiscordSession>,
+    path: &str,
+    my_channel: ChannelId,
+) -> Option<String> {
+    let norm = path.trim_end_matches('/');
+    for (cid, session) in sessions {
+        if *cid == my_channel {
+            continue;
+        }
+        let other_path = if let Some(ref wt) = session.worktree {
+            &wt.original_path
+        } else {
+            match &session.current_path {
+                Some(p) => p.as_str(),
+                None => continue,
+            }
+        };
+        if other_path.trim_end_matches('/') == norm {
+            return session
+                .channel_name
+                .clone()
+                .or_else(|| Some(cid.get().to_string()));
+        }
+    }
+    None
+}
+
+/// Create a git worktree for the given repo path.
+/// Returns (worktree_path, branch_name) on success.
+fn create_git_worktree(
+    repo_path: &str,
+    channel_name: &str,
+    provider: &str,
+) -> Result<(String, String), String> {
+    let git_check = std::process::Command::new("git")
+        .args(["-C", repo_path, "rev-parse", "--is-inside-work-tree"])
+        .output()
+        .map_err(|e| format!("git check failed: {}", e))?;
+    if !git_check.status.success() {
+        return Err(format!("{} is not a git repository", repo_path));
+    }
+
+    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let safe_name = channel_name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let branch = format!("wt/{}-{}-{}", provider, safe_name, ts);
+
+    let home = dirs::home_dir().ok_or("Cannot determine home dir")?;
+    let wt_base = home.join(".remotecc").join("worktrees");
+    std::fs::create_dir_all(&wt_base)
+        .map_err(|e| format!("Failed to create worktree base dir: {}", e))?;
+    let wt_dir = wt_base.join(format!("{}-{}-{}", provider, safe_name, ts));
+    let wt_path = wt_dir.display().to_string();
+
+    let output = std::process::Command::new("git")
+        .args(["-C", repo_path, "worktree", "add", &wt_path, "-b", &branch])
+        .output()
+        .map_err(|e| format!("git worktree add failed: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("git worktree add failed: {}", stderr));
+    }
+
+    let ts_log = chrono::Local::now().format("%H:%M:%S");
+    println!(
+        "  [{ts_log}] 🌿 Created worktree: {} (branch: {})",
+        wt_path, branch
+    );
+    Ok((wt_path, branch))
+}
+
+/// Clean up a git worktree after session ends.
+fn cleanup_git_worktree(wt_info: &WorktreeInfo) {
+    let ts = chrono::Local::now().format("%H:%M:%S");
+
+    let status = std::process::Command::new("git")
+        .args(["-C", &wt_info.worktree_path, "status", "--porcelain"])
+        .output();
+    let has_changes = match &status {
+        Ok(out) => !out.stdout.is_empty(),
+        Err(_) => false,
+    };
+
+    // Check if branch has new commits
+    let diff = std::process::Command::new("git")
+        .args([
+            "-C",
+            &wt_info.original_path,
+            "log",
+            "--oneline",
+            &format!("HEAD..{}", wt_info.branch_name),
+        ])
+        .output();
+    let has_commits = match &diff {
+        Ok(out) => !out.stdout.is_empty(),
+        Err(_) => false,
+    };
+
+    if has_changes || has_commits {
+        println!(
+            "  [{ts}] 🌿 Worktree {} has changes/commits — keeping for manual merge",
+            wt_info.worktree_path
+        );
+        println!(
+            "  [{ts}] 🌿 Branch: {} | Original: {}",
+            wt_info.branch_name, wt_info.original_path
+        );
+    } else {
+        let _ = std::process::Command::new("git")
+            .args([
+                "-C",
+                &wt_info.original_path,
+                "worktree",
+                "remove",
+                &wt_info.worktree_path,
+            ])
+            .output();
+        let _ = std::process::Command::new("git")
+            .args([
+                "-C",
+                &wt_info.original_path,
+                "branch",
+                "-d",
+                &wt_info.branch_name,
+            ])
+            .output();
+        println!(
+            "  [{ts}] 🌿 Cleaned up worktree: {} (no changes)",
+            wt_info.worktree_path
+        );
+    }
+}
+
 /// Write a command to the tmux FIFO pipe for command queuing.
 /// Called from spawn_blocking since FIFO write can block.
 fn write_command_to_fifo(fifo_path: &str, command: &str) -> Result<(), String> {
@@ -2841,7 +3095,10 @@ fn write_command_to_fifo(fifo_path: &str, command: &str) -> Result<(), String> {
     fifo.flush()
         .map_err(|e| format!("Failed to flush FIFO: {}", e))?;
     let ts = chrono::Local::now().format("%H:%M:%S");
-    println!("  [{ts}] 📋 Queued command sent to FIFO: {}", &command[..command.len().min(80)]);
+    println!(
+        "  [{ts}] 📋 Queued command sent to FIFO: {}",
+        &command[..command.len().min(80)]
+    );
     Ok(())
 }
 
@@ -2867,7 +3124,7 @@ fn spawn_turn_bridge(
     shared_owned: Arc<SharedData>,
     cancel_token: Arc<CancelToken>,
     rx: mpsc::Receiver<StreamMessage>,
-    mut bridge: TurnBridgeContext,
+    bridge: TurnBridgeContext,
 ) {
     tokio::spawn(async move {
         const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -3009,12 +3266,9 @@ fn spawn_turn_bridge(
                             let already_watching =
                                 shared_owned.tmux_watchers.contains_key(&channel_id);
                             if !already_watching {
-                                let cancel =
-                                    Arc::new(std::sync::atomic::AtomicBool::new(false));
-                                let paused =
-                                    Arc::new(std::sync::atomic::AtomicBool::new(false));
-                                let resume_offset =
-                                    Arc::new(std::sync::Mutex::new(None::<u64>));
+                                let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                let resume_offset = Arc::new(std::sync::Mutex::new(None::<u64>));
                                 let handle = TmuxWatcherHandle {
                                     cancel: cancel.clone(),
                                     paused: paused.clone(),
@@ -3251,7 +3505,8 @@ fn spawn_turn_bridge(
         rate_limit_wait(&shared_owned, channel_id).await;
         let _ = channel_id.delete_message(&http, current_msg_id).await;
 
-        if let Err(e) = send_long_message_raw(&http, channel_id, &full_response, &shared_owned).await
+        if let Err(e) =
+            send_long_message_raw(&http, channel_id, &full_response, &shared_owned).await
         {
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!("  [{ts}]   ⚠ send_long_message failed: {e}");
@@ -3381,8 +3636,10 @@ async fn restore_inflight_turns(
                 .edit_message(
                     http,
                     current_msg_id,
-                    EditMessage::new()
-                        .content(truncate_str(&stale_inflight_message(&state.full_response), DISCORD_MSG_LIMIT)),
+                    EditMessage::new().content(truncate_str(
+                        &stale_inflight_message(&state.full_response),
+                        DISCORD_MSG_LIMIT,
+                    )),
                 )
                 .await;
             clear_inflight_state(provider, state.channel_id);
@@ -3415,23 +3672,23 @@ async fn restore_inflight_turns(
 
         {
             let mut data = shared.core.lock().await;
-            let session =
-                data.sessions
-                    .entry(channel_id)
-                    .or_insert_with(|| DiscordSession {
-                        session_id: state.session_id.clone(),
-                        current_path: None,
-                        history: Vec::new(),
-                        pending_uploads: Vec::new(),
-                        pending_interventions: Vec::new(),
-                        cleared: false,
-                        remote_profile_name: saved_remote.clone(),
-                        channel_id: Some(channel_id.get()),
-                        channel_name: channel_name.clone(),
-                        category_name: None,
-                        silent: false,
-                        last_active: tokio::time::Instant::now(),
-                    });
+            let session = data
+                .sessions
+                .entry(channel_id)
+                .or_insert_with(|| DiscordSession {
+                    session_id: state.session_id.clone(),
+                    current_path: None,
+                    history: Vec::new(),
+                    pending_uploads: Vec::new(),
+                    cleared: false,
+                    remote_profile_name: saved_remote.clone(),
+                    channel_id: Some(channel_id.get()),
+                    channel_name: channel_name.clone(),
+                    category_name: None,
+                    silent: false,
+                    last_active: tokio::time::Instant::now(),
+                    worktree: None,
+                });
             session.channel_id = Some(channel_id.get());
             session.last_active = tokio::time::Instant::now();
             if session.current_path.is_none() {
@@ -3458,6 +3715,7 @@ async fn restore_inflight_turns(
         let input_for_reader = input_fifo_path.clone();
         let tmux_for_reader = tmux_session_name.clone();
         let start_offset = state.last_offset;
+        let recovery_session_id = state.session_id.clone();
         std::thread::spawn(move || {
             match claude::read_output_file_until_result(
                 &output_for_reader,
@@ -3479,7 +3737,7 @@ async fn restore_inflight_turns(
                     let _ = tx.send(StreamMessage::Done {
                         result: "⚠️ RemoteCC 재시작 중 진행되던 세션을 복구하지 못했습니다."
                             .to_string(),
-                        session_id: state.session_id.clone(),
+                        session_id: recovery_session_id,
                     });
                 }
                 Err(e) => {
@@ -3823,6 +4081,7 @@ async fn auto_restore_session(
                     remote_profile_name: saved_remote.clone(),
                     silent: false,
                     last_active: tokio::time::Instant::now(),
+                    worktree: None,
                 });
             session.channel_id = Some(channel_id.get());
             session.last_active = tokio::time::Instant::now();
