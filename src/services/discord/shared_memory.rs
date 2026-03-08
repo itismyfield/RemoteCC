@@ -22,6 +22,8 @@ struct SharedAgentTurn {
     channel_id: u64,
     channel_name: Option<String>,
     current_path: String,
+    #[serde(default)]
+    user_name: Option<String>,
     user: String,
     assistant: String,
 }
@@ -131,8 +133,14 @@ fn build_context_from_store(
             "[{}] provider={} channel={} path={}",
             turn.created_at, turn.provider, channel_label, turn.current_path
         ));
+        let user_label = turn
+            .user_name
+            .as_deref()
+            .map(|name| format!("User({name}): "))
+            .unwrap_or_else(|| "User: ".to_string());
         sections.push(format!(
-            "User: {}",
+            "{}{}",
+            user_label,
             truncate_chars(&turn.user, MAX_CONTEXT_USER_CHARS)
         ));
         sections.push(format!(
@@ -177,6 +185,7 @@ pub(super) fn append_shared_memory_turn(
     channel_id: ChannelId,
     channel_name: Option<&str>,
     current_path: &str,
+    user_name: Option<&str>,
     user_text: &str,
     assistant_text: &str,
 ) -> Result<(), String> {
@@ -190,6 +199,7 @@ pub(super) fn append_shared_memory_turn(
         channel_id,
         channel_name,
         current_path,
+        user_name,
         user_text,
         assistant_text,
     )
@@ -202,6 +212,7 @@ fn append_shared_memory_turn_at_root(
     channel_id: ChannelId,
     channel_name: Option<&str>,
     current_path: &str,
+    user_name: Option<&str>,
     user_text: &str,
     assistant_text: &str,
 ) -> Result<(), String> {
@@ -214,6 +225,7 @@ fn append_shared_memory_turn_at_root(
         channel_id: channel_id.get(),
         channel_name: channel_name.map(str::to_string),
         current_path: current_path.to_string(),
+        user_name: user_name.map(str::to_string),
         user: normalize_for_storage(user_text, MAX_STORED_USER_CHARS),
         assistant: normalize_for_storage(assistant_text, MAX_STORED_ASSISTANT_CHARS),
     };
@@ -270,6 +282,7 @@ mod tests {
             channel_id: 1,
             channel_name: Some("cookingheart-pm-cc".to_string()),
             current_path: "/repo".to_string(),
+            user_name: None,
             user: "same-channel".to_string(),
             assistant: "claude remembered".to_string(),
         });
@@ -279,6 +292,7 @@ mod tests {
             channel_id: 2,
             channel_name: Some("cookingheart-pm-cdx".to_string()),
             current_path: "/repo".to_string(),
+            user_name: None,
             user: "other-provider".to_string(),
             assistant: "codex remembered".to_string(),
         });
@@ -304,6 +318,7 @@ mod tests {
             ChannelId::new(10),
             Some("cookingheart-dev-cc"),
             "/repo",
+            Some("testuser"),
             "next",
             "follow-up",
         );
@@ -324,6 +339,7 @@ mod tests {
             ChannelId::new(30),
             Some("cookingheart-test-cdx"),
             "/repo",
+            Some("tester"),
             "what happened?",
             "I ran the tests.",
         )
