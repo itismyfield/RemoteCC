@@ -2915,6 +2915,7 @@ async fn handle_text_message(
             channel_id,
             user_msg_id,
             user_text_owned: user_text.to_string(),
+            request_owner_name: request_owner_name.to_string(),
             role_binding: role_binding.clone(),
             pcd_session_key,
             current_msg_id: placeholder_msg_id,
@@ -3107,6 +3108,7 @@ struct TurnBridgeContext {
     channel_id: ChannelId,
     user_msg_id: MessageId,
     user_text_owned: String,
+    request_owner_name: String,
     role_binding: Option<RoleBinding>,
     pcd_session_key: Option<String>,
     current_msg_id: MessageId,
@@ -3132,6 +3134,7 @@ fn spawn_turn_bridge(
         let provider = bridge.provider;
         let user_msg_id = bridge.user_msg_id;
         let user_text_owned = bridge.user_text_owned.clone();
+        let request_owner_name = bridge.request_owner_name.clone();
         let role_binding = bridge.role_binding.clone();
         let pcd_session_key = bridge.pcd_session_key.clone();
 
@@ -3461,6 +3464,7 @@ fn spawn_turn_bridge(
                                 channel_id,
                                 channel_name.as_deref(),
                                 path,
+                                Some(request_owner_name.as_str()),
                                 &user_text_owned,
                                 &stopped_response,
                             ) {
@@ -3546,6 +3550,7 @@ fn spawn_turn_bridge(
                                 channel_id,
                                 channel_name.as_deref(),
                                 path,
+                                Some(request_owner_name.as_str()),
                                 &user_text_owned,
                                 &full_response,
                             ) {
@@ -3761,6 +3766,7 @@ async fn restore_inflight_turns(
                 channel_id,
                 user_msg_id,
                 user_text_owned: state.user_text.clone(),
+                request_owner_name: String::new(),
                 role_binding,
                 pcd_session_key,
                 current_msg_id,
