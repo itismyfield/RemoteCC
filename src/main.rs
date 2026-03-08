@@ -332,6 +332,35 @@ fn kickstart_launchd_job(label: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Kill all existing dcserver processes (prevents duplicates from different paths).
+fn kill_existing_dcserver_processes() {
+    let pgrep_output = std::process::Command::new("pgrep")
+        .args(["-f", "remotecc --dcserver"])
+        .output();
+
+    if let Ok(output) = pgrep_output {
+        if output.status.success() {
+            let pids = String::from_utf8_lossy(&output.stdout);
+            let my_pid = std::process::id();
+            let mut killed = 0;
+            for pid_str in pids.lines() {
+                if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                    if pid != my_pid {
+                        println!("   Killing existing dcserver (PID {})", pid);
+                        let _ = std::process::Command::new("kill")
+                            .arg(pid.to_string())
+                            .status();
+                        killed += 1;
+                    }
+                }
+            }
+            if killed > 0 {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+        }
+    }
+}
+
 fn handle_restart_dcserver() {
     use services::discord::load_discord_bot_launch_configs;
 
@@ -358,6 +387,9 @@ fn handle_restart_dcserver() {
     println!("🔄 Restarting Discord bot server...");
     println!("   Configured bots: {}", configs.len());
 
+    // Kill ALL existing dcserver processes first (prevents duplicates)
+    kill_existing_dcserver_processes();
+
     if is_launchd_job_loaded(REMOTECC_DCSERVER_LAUNCHD_LABEL) {
         println!(
             "   launchd service detected: {}",
@@ -371,30 +403,6 @@ fn handle_restart_dcserver() {
             return;
         }
         eprintln!("⚠ launchd kickstart failed, falling back to tmux restart");
-    }
-
-    // Kill existing dcserver processes (match any binary name with --dcserver arg)
-    let pgrep_output = std::process::Command::new("pgrep")
-        .args(["-f", " --dcserver"])
-        .output();
-
-    if let Ok(output) = pgrep_output {
-        if output.status.success() {
-            let pids = String::from_utf8_lossy(&output.stdout);
-            let my_pid = std::process::id();
-            for pid_str in pids.lines() {
-                if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                    if pid != my_pid {
-                        println!("   Killing existing dcserver (PID {})", pid);
-                        let _ = std::process::Command::new("kill")
-                            .arg(pid.to_string())
-                            .status();
-                    }
-                }
-            }
-            // Wait for old process to die
-            std::thread::sleep(std::time::Duration::from_secs(2));
-        }
     }
 
     // NOTE: We intentionally do NOT kill remoteCC-* Claude work sessions here.
@@ -478,6 +486,15 @@ fn handle_restart_dcserver() {
 }
 
 fn handle_dcserver(token: Option<String>) {
+    // Single-instance guard: kill any existing dcserver before starting
+    kill_existing_dcserver_processes();
+
+    // Write PID file for future instance detection
+    if let Some(home) = dirs::home_dir() {
+        let pid_file = home.join(".remotecc").join("dcserver.pid");
+        let _ = std::fs::write(&pid_file, std::process::id().to_string());
+    }
+
     // Prevent CLAUDECODE from leaking into child tmux sessions
     std::env::remove_var("CLAUDECODE");
 
