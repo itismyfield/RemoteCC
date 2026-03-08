@@ -2916,6 +2916,9 @@ async fn handle_text_message(
             user_msg_id,
             user_text_owned: user_text.to_string(),
             request_owner_name: request_owner_name.to_string(),
+            request_owner: Some(request_owner),
+            serenity_ctx: Some(ctx.clone()),
+            token: Some(token.to_string()),
             role_binding: role_binding.clone(),
             pcd_session_key,
             current_msg_id: placeholder_msg_id,
@@ -3109,6 +3112,9 @@ struct TurnBridgeContext {
     user_msg_id: MessageId,
     user_text_owned: String,
     request_owner_name: String,
+    request_owner: Option<UserId>,
+    serenity_ctx: Option<serenity::Context>,
+    token: Option<String>,
     role_binding: Option<RoleBinding>,
     pcd_session_key: Option<String>,
     current_msg_id: MessageId,
@@ -3135,6 +3141,9 @@ fn spawn_turn_bridge(
         let user_msg_id = bridge.user_msg_id;
         let user_text_owned = bridge.user_text_owned.clone();
         let request_owner_name = bridge.request_owner_name.clone();
+        let request_owner = bridge.request_owner;
+        let serenity_ctx = bridge.serenity_ctx.clone();
+        let token = bridge.token.clone();
         let role_binding = bridge.role_binding.clone();
         let pcd_session_key = bridge.pcd_session_key.clone();
 
@@ -3477,26 +3486,36 @@ fn spawn_turn_bridge(
                 }
             }
 
+            clear_inflight_state(provider, channel_id.get());
+            shared_owned.recovering_channels.remove(&channel_id);
+
             if !queued_commands.is_empty() {
-                if let Some(ref fifo_path) = tmux_input_fifo {
+                if let (Some(ctx), Some(owner), Some(tok)) =
+                    (serenity_ctx.as_ref(), request_owner, token.as_deref())
+                {
                     let cmd_count = queued_commands.len();
-                    rate_limit_wait(&shared_owned, channel_id).await;
-                    let _ = channel_id
-                        .say(&http, format!("📋 큐잉된 명령 처리 중 ({cmd_count}개)..."))
-                        .await;
-                    for cmd in &queued_commands {
-                        let fifo = fifo_path.clone();
-                        let cmd_text = cmd.clone();
-                        let _ = tokio::task::spawn_blocking(move || {
-                            write_command_to_fifo(&fifo, &cmd_text)
-                        })
-                        .await;
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    println!("  [{ts}] 📋 Processing {cmd_count} queued command(s)");
+                    for cmd in queued_commands {
+                        if let Err(e) = handle_text_message(
+                            ctx,
+                            channel_id,
+                            user_msg_id,
+                            owner,
+                            &request_owner_name,
+                            &cmd,
+                            &shared_owned,
+                            tok,
+                        )
+                        .await
+                        {
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            println!("  [{ts}]   ⚠ queued command failed: {e}");
+                        }
                     }
                 }
             }
 
-            clear_inflight_state(provider, channel_id.get());
-            shared_owned.recovering_channels.remove(&channel_id);
             return;
         }
 
@@ -3567,26 +3586,35 @@ fn spawn_turn_bridge(
         let ts = chrono::Local::now().format("%H:%M:%S");
         println!("  [{ts}] ▶ Response sent");
 
+        clear_inflight_state(provider, channel_id.get());
+        shared_owned.recovering_channels.remove(&channel_id);
+
         if !queued_commands.is_empty() {
-            if let Some(ref fifo_path) = tmux_input_fifo {
+            if let (Some(ctx), Some(owner), Some(tok)) =
+                (serenity_ctx.as_ref(), request_owner, token.as_deref())
+            {
                 let cmd_count = queued_commands.len();
-                rate_limit_wait(&shared_owned, channel_id).await;
-                let _ = channel_id
-                    .say(&http, format!("📋 큐잉된 명령 처리 중 ({cmd_count}개)..."))
-                    .await;
-                for cmd in &queued_commands {
-                    let fifo = fifo_path.clone();
-                    let cmd_text = cmd.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        write_command_to_fifo(&fifo, &cmd_text)
-                    })
-                    .await;
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!("  [{ts}] 📋 Processing {cmd_count} queued command(s)");
+                for cmd in queued_commands {
+                    if let Err(e) = handle_text_message(
+                        ctx,
+                        channel_id,
+                        user_msg_id,
+                        owner,
+                        &request_owner_name,
+                        &cmd,
+                        &shared_owned,
+                        tok,
+                    )
+                    .await
+                    {
+                        let ts = chrono::Local::now().format("%H:%M:%S");
+                        println!("  [{ts}]   ⚠ queued command failed: {e}");
+                    }
                 }
             }
         }
-
-        clear_inflight_state(provider, channel_id.get());
-        shared_owned.recovering_channels.remove(&channel_id);
     });
 }
 
@@ -3767,6 +3795,9 @@ async fn restore_inflight_turns(
                 user_msg_id,
                 user_text_owned: state.user_text.clone(),
                 request_owner_name: String::new(),
+                request_owner: None,
+                serenity_ctx: None,
+                token: None,
                 role_binding,
                 pcd_session_key,
                 current_msg_id,
