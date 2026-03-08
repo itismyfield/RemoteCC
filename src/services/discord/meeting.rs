@@ -9,6 +9,7 @@ use crate::services::provider::ProviderKind;
 use crate::services::provider_exec;
 
 use super::formatting::send_long_message_raw;
+use super::role_map::load_meeting_config as load_meeting_config_from_role_map;
 use super::settings::{load_role_prompt, RoleBinding};
 use super::{rate_limit_wait, SharedData};
 
@@ -40,7 +41,6 @@ pub(super) enum MeetingStatus {
 
 pub(super) struct Meeting {
     pub id: String,
-    pub channel_id: ChannelId,
     pub agenda: String,
     pub primary_provider: ProviderKind,
     pub reviewer_provider: ProviderKind,
@@ -230,51 +230,7 @@ async fn cleanup_meeting_if_current(
 
 /// Load meeting config from role_map.json "meeting" section
 pub(super) fn load_meeting_config() -> Option<MeetingConfig> {
-    let path = dirs::home_dir()?.join(".remotecc").join("role_map.json");
-    let content = fs::read_to_string(path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-    let meeting = json.get("meeting")?;
-
-    let channel_name = meeting.get("channel_name")?.as_str()?.to_string();
-    let max_rounds = meeting
-        .get("max_rounds")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(3) as u32;
-    let summary_agent = meeting.get("summary_agent")?.as_str()?.to_string();
-
-    let agents_arr = meeting.get("available_agents")?.as_array()?;
-    let mut available_agents = Vec::new();
-    for agent in agents_arr {
-        let role_id = agent.get("role_id")?.as_str()?.to_string();
-        let display_name = agent.get("display_name")?.as_str()?.to_string();
-        let prompt_file = agent
-            .get("prompt_file")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let keywords = agent
-            .get("keywords")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        available_agents.push(MeetingAgentConfig {
-            role_id,
-            display_name,
-            keywords,
-            prompt_file,
-        });
-    }
-
-    Some(MeetingConfig {
-        channel_name,
-        max_rounds,
-        summary_agent,
-        available_agents,
-    })
+    load_meeting_config_from_role_map()
 }
 
 /// Check if a channel name matches the configured meeting channel
@@ -311,7 +267,6 @@ pub(super) async fn start_meeting(
             channel_id,
             Meeting {
                 id: meeting_id.clone(),
-                channel_id,
                 agenda: agenda.to_string(),
                 primary_provider,
                 reviewer_provider,
@@ -1455,7 +1410,6 @@ mod tests {
         build_pcd_payload, effective_round_count, meeting_slot_state, parse_meeting_start_text,
         ActiveMeetingSlot, Meeting, MeetingStatus, MeetingUtterance, ProviderKind,
     };
-    use poise::serenity_prelude::ChannelId;
     use serde_json::json;
 
     #[test]
@@ -1482,7 +1436,6 @@ mod tests {
     fn fixture_meeting(id: &str, status: MeetingStatus) -> Meeting {
         Meeting {
             id: id.to_string(),
-            channel_id: ChannelId::new(1),
             agenda: "test".to_string(),
             primary_provider: ProviderKind::Claude,
             reviewer_provider: ProviderKind::Codex,

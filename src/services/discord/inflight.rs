@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::services::provider::ProviderKind;
+use super::runtime_store::{atomic_write, discord_inflight_root};
 
 const INFLIGHT_STATE_VERSION: u32 = 1;
 
@@ -73,7 +74,7 @@ impl InflightTurnState {
 }
 
 pub(super) fn inflight_runtime_root() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".remotecc").join("runtime").join("discord_inflight"))
+    discord_inflight_root()
 }
 
 fn inflight_provider_dir(root: &Path, provider: ProviderKind) -> PathBuf {
@@ -106,7 +107,7 @@ fn save_inflight_state_in_root(root: &Path, state: &InflightTurnState) -> Result
     let mut updated = state.clone();
     updated.updated_at = now_string();
     let json = serde_json::to_string_pretty(&updated).map_err(|e| e.to_string())?;
-    fs::write(path, json).map_err(|e| e.to_string())
+    atomic_write(&path, &json)
 }
 
 pub(super) fn clear_inflight_state(provider: ProviderKind, channel_id: u64) {
@@ -115,13 +116,6 @@ pub(super) fn clear_inflight_state(provider: ProviderKind, channel_id: u64) {
     };
     let path = inflight_state_path(&root, provider, channel_id);
     let _ = fs::remove_file(path);
-}
-
-pub(super) fn has_inflight_state(provider: ProviderKind, channel_id: u64) -> bool {
-    let Some(root) = inflight_runtime_root() else {
-        return false;
-    };
-    inflight_state_path(&root, provider, channel_id).is_file()
 }
 
 pub(super) fn load_inflight_states(provider: ProviderKind) -> Vec<InflightTurnState> {

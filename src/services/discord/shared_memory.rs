@@ -5,6 +5,7 @@ use poise::serenity_prelude::ChannelId;
 use serde::{Deserialize, Serialize};
 
 use crate::services::provider::ProviderKind;
+use super::runtime_store::{atomic_write, shared_agent_memory_root};
 
 const SHARED_MEMORY_VERSION: u32 = 1;
 const MAX_STORED_TURNS: usize = 40;
@@ -36,10 +37,6 @@ struct SharedAgentMemoryStore {
     turns: Vec<SharedAgentTurn>,
 }
 
-fn shared_agent_memory_root() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".remotecc").join("shared_agent_memory"))
-}
-
 fn shared_agent_memory_path(root: &Path, role_id: &str) -> PathBuf {
     root.join(format!("{role_id}.json"))
 }
@@ -55,7 +52,8 @@ fn truncate_chars(input: &str, max_chars: usize) -> String {
         return trimmed.to_string();
     }
 
-    let mut truncated: String = trimmed.chars().take(max_chars).collect();
+    let take = max_chars.saturating_sub(3);
+    let mut truncated: String = trimmed.chars().take(take).collect();
     truncated.push_str("...");
     truncated
 }
@@ -87,7 +85,7 @@ fn save_store_to_path(path: &Path, store: &SharedAgentMemoryStore) -> Result<(),
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let json = serde_json::to_string_pretty(store).map_err(|e| e.to_string())?;
-    fs::write(path, json).map_err(|e| e.to_string())
+    atomic_write(path, &json)
 }
 
 fn build_context_from_store(

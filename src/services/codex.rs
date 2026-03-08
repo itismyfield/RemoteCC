@@ -40,10 +40,6 @@ fn get_codex_path() -> Option<&'static str> {
     CODEX_PATH.get_or_init(resolve_codex_path).as_deref()
 }
 
-pub fn is_codex_available() -> bool {
-    get_codex_path().is_some()
-}
-
 pub fn execute_command_simple(prompt: &str) -> Result<String, String> {
     let codex_bin = get_codex_path().ok_or_else(|| "Codex CLI not found".to_string())?;
     let args = base_exec_args(None, prompt);
@@ -179,7 +175,7 @@ fn execute_streaming_direct(
     cancel_token: Option<std::sync::Arc<CancelToken>>,
 ) -> Result<(), String> {
     let codex_bin = get_codex_path().ok_or_else(|| "Codex CLI not found".to_string())?;
-    let mut args = base_exec_args(session_id, prompt);
+    let args = base_exec_args(session_id, prompt);
 
     let mut child = Command::new(codex_bin)
         .args(&args)
@@ -192,6 +188,15 @@ fn execute_streaming_direct(
 
     if let Some(ref token) = cancel_token {
         *token.child_pid.lock().unwrap() = Some(child.id());
+        // Race condition fix: if /stop arrived before PID was stored, kill now
+        if token
+            .cancelled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            claude::kill_child_tree(&mut child);
+            let _ = child.wait();
+            return Ok(());
+        }
     }
 
     let stdout = child
@@ -225,7 +230,7 @@ fn execute_streaming_direct(
             &mut final_text,
             started_at,
         )? {
-            saw_done = done;
+            saw_done = saw_done || done;
         }
     }
 
