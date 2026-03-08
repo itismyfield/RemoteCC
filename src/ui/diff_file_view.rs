@@ -37,7 +37,9 @@ pub struct DiffLine {
 }
 
 pub struct DiffFileViewState {
+    #[allow(dead_code)]
     pub left_path: PathBuf,
+    #[allow(dead_code)]
     pub right_path: PathBuf,
     pub diff_lines: Vec<DiffLine>,
     pub scroll: usize, // visual row offset (0-based)

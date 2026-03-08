@@ -18,6 +18,7 @@ const PASSWORD_STORAGE_SALT: &[u8; 16] = b"rmtcc_pwd_store!";
 const PASSWORD_STORAGE_PASSPHRASE: &[u8] = b"remotecc_aes256_password_storage_v1";
 
 /// Encrypt a string for storage using AES-256-CBC (prefixed with "aes:")
+#[allow(unsafe_code)]
 pub fn obfuscate(plaintext: &str) -> String {
     use aes::Aes256;
     use base64::Engine;
@@ -58,6 +59,7 @@ pub fn obfuscate(plaintext: &str) -> String {
 }
 
 /// Decrypt a stored string. Supports "aes:" (AES-256-CBC), "enc:" (legacy XOR), and plaintext fallback.
+#[allow(unsafe_code)]
 pub fn deobfuscate(stored: &str) -> String {
     if let Some(encoded) = stored.strip_prefix("aes:") {
         use aes::Aes256;
@@ -222,7 +224,7 @@ pub struct SftpFileEntry {
 #[derive(Debug, Clone)]
 pub enum ConnectionStatus {
     Connected,
-    Disconnected(String),
+    Disconnected(#[allow(dead_code)] String),
 }
 
 /// Remote context attached to a panel
@@ -514,6 +516,7 @@ impl SftpSession {
     }
 
     /// Download remote file to local path via SFTP (streaming, chunked)
+    #[allow(dead_code)]
     pub fn download_file(&self, remote_path: &str, local_path: &str) -> AppResult<u64> {
         let sftp = self
             .sftp
@@ -650,6 +653,7 @@ impl SftpSession {
     }
 
     /// Check if session is still connected
+    #[allow(dead_code)]
     pub fn is_connected(&self) -> bool {
         self.sftp.is_some()
     }

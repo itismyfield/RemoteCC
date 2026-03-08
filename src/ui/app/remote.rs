@@ -215,7 +215,7 @@ impl App {
         thread::spawn(move || {
             let result = match remote::SftpSession::connect(&profile_clone) {
                 Ok(session) => {
-                    let mut ctx = RemoteContext {
+                    let ctx = RemoteContext {
                         profile: profile_clone.clone(),
                         session,
                         status: ConnectionStatus::Connected,
@@ -280,7 +280,7 @@ impl App {
             return;
         }
         let panel_idx = self.active_panel_index;
-        let mut ctx = match self.panels[panel_idx].remote_ctx.take() {
+        let ctx = match self.panels[panel_idx].remote_ctx.take() {
             Some(ctx) => ctx,
             None => return,
         };
@@ -317,7 +317,7 @@ impl App {
         if self.remote_spinner.is_some() {
             return;
         }
-        let mut ctx = match self.panels[panel_idx].remote_ctx.take() {
+        let ctx = match self.panels[panel_idx].remote_ctx.take() {
             Some(ctx) => ctx,
             None => return,
         };

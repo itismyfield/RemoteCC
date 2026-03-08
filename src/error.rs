@@ -10,9 +10,6 @@ pub enum AppError {
     #[error("SSH error: {0}")]
     Ssh(String),
 
-    #[error("Claude error: {0}")]
-    Claude(String),
-
     #[error("Encryption error: {0}")]
     Encryption(#[from] CokacencError),
 

@@ -183,13 +183,10 @@ pub fn kill_process_with_verification(pid: i32, starttime: Option<u64>) -> Resul
     let command = get_process_command(pid);
     is_protected_pid(pid, command.as_deref())?;
 
-    // Verify process identity if starttime is provided (Linux only)
-    #[cfg(target_os = "linux")]
     verify_process_identity(pid, starttime)?;
-    #[cfg(not(target_os = "linux"))]
-    let _ = starttime; // Suppress unused warning
 
     // Use libc kill for safety
+    #[allow(unsafe_code)]
     let result = unsafe { libc::kill(pid, libc::SIGTERM) };
     if result == 0 {
         Ok(())
@@ -220,12 +217,9 @@ pub fn force_kill_process_with_verification(
     let command = get_process_command(pid);
     is_protected_pid(pid, command.as_deref())?;
 
-    // Verify process identity if starttime is provided (Linux only)
-    #[cfg(target_os = "linux")]
     verify_process_identity(pid, starttime)?;
-    #[cfg(not(target_os = "linux"))]
-    let _ = starttime; // Suppress unused warning
 
+    #[allow(unsafe_code)]
     let result = unsafe { libc::kill(pid, libc::SIGKILL) };
     if result == 0 {
         Ok(())

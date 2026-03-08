@@ -11,6 +11,7 @@ use super::theme::*;
 
 #[derive(Debug, Deserialize)]
 pub struct ThemeJson {
+    #[allow(dead_code)]
     pub name: String,
     #[serde(default)]
     pub palette: PaletteJson,
@@ -998,6 +999,7 @@ fn default_22() -> u8 {
 fn default_24() -> u8 {
     24
 }
+#[allow(dead_code)]
 fn default_25() -> u8 {
     25
 }
@@ -1046,9 +1048,11 @@ fn default_161() -> u8 {
 fn default_166() -> u8 {
     166
 }
+#[allow(dead_code)]
 fn default_189() -> u8 {
     189
 }
+#[allow(dead_code)]
 fn default_194() -> u8 {
     194
 }
@@ -1061,9 +1065,11 @@ fn default_208() -> u8 {
 fn default_220() -> u8 {
     220
 }
+#[allow(dead_code)]
 fn default_222() -> u8 {
     222
 }
+#[allow(dead_code)]
 fn default_230() -> u8 {
     230
 }

@@ -12,7 +12,6 @@ use std::path::PathBuf;
 use unicode_width::UnicodeWidthStr;
 
 use super::theme::Theme;
-use crate::utils::format::safe_suffix;
 
 /// 검색 결과 아이템
 #[derive(Debug, Clone)]

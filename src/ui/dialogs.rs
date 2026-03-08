@@ -607,11 +607,9 @@ fn draw_binary_file_handler_dialog(frame: &mut Frame, dialog: &Dialog, area: Rec
             // Check if cursor would overflow current line
             if current_line_len + 1 > input_width && current_line_len > 0 {
                 lines.push(Line::from(std::mem::take(&mut current_line_spans)));
-                current_line_len = 0;
             }
             cursor_line = lines.len(); // Cursor is on this line
             current_line_spans.push(Span::styled(" ", cursor_style));
-            current_line_len += 1;
         }
 
         // Push remaining spans
@@ -737,7 +735,7 @@ fn get_handler_placeholder(extension: &str) -> String {
         // Programming - Web/JS
         "js" | "mjs" | "cjs" => "vim {{FILEPATH}}",
         "jsx" => "vim {{FILEPATH}}",
-        "ts" | "mts" | "cts" => "vim {{FILEPATH}}",
+        "cts" => "vim {{FILEPATH}}",
         "tsx" => "vim {{FILEPATH}}",
         "vue" | "svelte" => "vim {{FILEPATH}}",
         "coffee" => "vim {{FILEPATH}}",
@@ -764,7 +762,7 @@ fn get_handler_placeholder(extension: &str) -> String {
         "ada" | "adb" | "ads" => "vim {{FILEPATH}}",
         "f" | "f90" | "f95" | "f03" | "f08" | "for" => "vim {{FILEPATH}}",
         "cob" | "cbl" => "vim {{FILEPATH}}",
-        "pro" | "pl" => "vim {{FILEPATH}}",
+        "pro" => "vim {{FILEPATH}}",
 
         // Markup/Config - Web
         "html" | "htm" | "xhtml" | "shtml" => "firefox {{FILEPATH}}",
@@ -895,7 +893,7 @@ fn draw_simple_input_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, them
 
         // Find scroll_start (char index) such that cursor is visible
         let mut scroll_start = 0;
-        let mut width_before_cursor = cursor_display_pos;
+        let width_before_cursor = cursor_display_pos;
         if width_before_cursor > visible_width {
             let target_skip = width_before_cursor.saturating_sub(visible_width) + 1;
             let mut skipped_width = 0;
@@ -3080,7 +3078,7 @@ fn handle_goto_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifier
                                         return false;
                                     }
                                     let panel_idx = app.active_panel_index;
-                                    let mut ctx = match app.panels[panel_idx].remote_ctx.take() {
+                                    let ctx = match app.panels[panel_idx].remote_ctx.take() {
                                         Some(ctx) => ctx,
                                         None => return false,
                                     };
@@ -4471,7 +4469,7 @@ fn draw_remote_connect_dialog(frame: &mut Frame, app: &App, area: Rect, theme: &
 
 /// Handle input for the remote connect dialog
 fn handle_remote_connect_input(app: &mut App, code: KeyCode) -> bool {
-    use super::app::{RemoteAuthType, RemoteField};
+    
 
     if app.remote_connect_state.is_none() {
         app.dialog = None;

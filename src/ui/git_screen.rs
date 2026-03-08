@@ -70,6 +70,7 @@ pub struct GitScreenState {
     // Status tab
     pub status_files: Vec<GitFileEntry>,
     pub status_selected: usize,
+    #[allow(dead_code)]
     pub status_scroll: usize,
 
     // Commit tab
@@ -902,7 +903,7 @@ fn draw_log_list(
             } else {
                 Style::default()
             };
-            let mut spans = vec![
+            let spans = vec![
                 Span::styled(marker, marker_style),
                 Span::styled(&entry.hash, Style::default().fg(colors.log_hash)),
                 Span::styled(" ", Style::default()),

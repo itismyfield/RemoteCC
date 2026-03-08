@@ -356,9 +356,12 @@ const MAX_HISTORY_ITEMS: usize = 500;
 /// Session data structure for file persistence
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionData {
+    #[serde(default)]
     pub session_id: String,
+    #[serde(default)]
     pub history: Vec<HistoryItem>,
     pub current_path: String,
+    #[serde(default)]
     pub created_at: String,
     /// Discord channel ID (optional, set by Discord bot)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1720,12 +1723,10 @@ fn draw_input(frame: &mut Frame, state: &AIScreenState, area: Rect, theme: &Them
                             };
                             line_spans.extend(std::mem::take(&mut current_line_spans));
                             all_lines.push(Line::from(line_spans));
-                            current_line_len = 0;
                             is_first_wrap = false;
                         }
                         cursor_display_line = all_lines.len();
                         current_line_spans.push(Span::styled(" ", cursor_style));
-                        current_line_len += 1;
                     }
 
                     // Push remaining spans
@@ -2949,7 +2950,7 @@ Let me know what you'd like to do!
         let inner = block.inner(area);
 
         let visible_height = inner.height as usize;
-        let width = inner.width as usize;
+        let _width = inner.width as usize;
 
         // Calculate total lines using Paragraph::line_count()
         let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });

@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
@@ -83,6 +83,7 @@ pub struct ViewerState {
 }
 
 impl ViewerState {
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self {
             file_path: PathBuf::new(),
@@ -118,6 +119,7 @@ impl ViewerState {
     }
 
     /// 테마의 syntax colors 설정
+    #[allow(dead_code)]
     pub fn set_syntax_colors(&mut self, colors: crate::ui::theme::SyntaxColors) {
         self.syntax_colors = colors;
         // 하이라이터가 있으면 새 색상으로 재생성
@@ -1305,6 +1307,7 @@ fn render_wrapped_line_with_syntax_and_search(
 }
 
 /// 문법 강조된 라인 렌더링
+#[allow(dead_code)]
 fn render_syntax_highlighted_line(
     line: &str,
     highlighter: &mut SyntaxHighlighter,

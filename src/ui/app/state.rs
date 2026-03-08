@@ -155,6 +155,7 @@ pub enum Screen {
     ProcessManager,
     Help,
     AIScreen,
+    #[allow(dead_code)]
     SystemInfo,
     ImageViewer,
     SearchResult,
@@ -339,6 +340,7 @@ pub struct RemoteConnectState {
 }
 
 impl RemoteConnectState {
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self {
             selected_field: RemoteField::Host,
@@ -823,6 +825,7 @@ pub fn sort_order_to_string(sort_order: SortOrder) -> String {
 /// Remote operation spinner — shows a spinning indicator while a remote operation runs in background
 pub struct RemoteSpinner {
     pub message: String,
+    #[allow(dead_code)]
     pub started_at: Instant,
     pub receiver: Receiver<RemoteSpinnerResult>,
 }

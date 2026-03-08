@@ -11,6 +11,12 @@ use crate::services::claude::DEFAULT_ALLOWED_TOOLS;
 use crate::services::provider::ProviderKind;
 
 use super::formatting::normalize_allowed_tools;
+use super::role_map::{
+    load_peer_agents as load_peer_agents_from_role_map,
+    resolve_role_binding as resolve_role_binding_from_role_map,
+    resolve_workspace as resolve_workspace_from_role_map,
+};
+use super::runtime_store::{bot_settings_path, discord_uploads_root};
 use super::DiscordBotSettings;
 
 fn json_u64(value: &serde_json::Value) -> Option<u64> {
@@ -26,16 +32,6 @@ pub(super) fn discord_token_hash(token: &str) -> String {
     hasher.update(token.as_bytes());
     let result = hasher.finalize();
     format!("discord_{}", hex::encode(&result[..8]))
-}
-
-/// Path to bot settings file: ~/.remotecc/bot_settings.json
-pub(super) fn bot_settings_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".remotecc").join("bot_settings.json"))
-}
-
-/// Path to role map file: ~/.remotecc/role_map.json
-pub(super) fn role_map_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".remotecc").join("role_map.json"))
 }
 
 #[derive(Clone, Debug)]
@@ -59,21 +55,6 @@ pub struct DiscordBotLaunchConfig {
     pub provider: ProviderKind,
 }
 
-pub(super) fn parse_role_binding(v: &serde_json::Value) -> Option<RoleBinding> {
-    let obj = v.as_object()?;
-    let role_id = obj.get("roleId")?.as_str()?.to_string();
-    let prompt_file = obj.get("promptFile")?.as_str()?.to_string();
-    let provider = obj
-        .get("provider")
-        .and_then(|v| v.as_str())
-        .and_then(ProviderKind::from_str);
-    Some(RoleBinding {
-        role_id,
-        prompt_file,
-        provider,
-    })
-}
-
 pub(super) fn channel_supports_provider(
     provider: ProviderKind,
     channel_name: Option<&str>,
@@ -95,31 +76,7 @@ pub(super) fn resolve_role_binding(
     channel_id: ChannelId,
     channel_name: Option<&str>,
 ) -> Option<RoleBinding> {
-    let path = role_map_path()?;
-    let content = fs::read_to_string(path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-
-    // 1) Primary: exact channel ID match
-    if let Some(by_id) = json.get("byChannelId").and_then(|v| v.as_object()) {
-        let key = channel_id.get().to_string();
-        if let Some(binding) = by_id.get(&key).and_then(parse_role_binding) {
-            return Some(binding);
-        }
-    }
-
-    // 2) Optional fallback: exact channel name match
-    let fallback_enabled = json
-        .get("fallbackByChannelName")
-        .and_then(|v| v.get("enabled"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if !fallback_enabled {
-        return None;
-    }
-
-    let cname = channel_name?;
-    let by_name = json.get("byChannelName").and_then(|v| v.as_object())?;
-    by_name.get(cname).and_then(parse_role_binding)
+    resolve_role_binding_from_role_map(channel_id, channel_name)
 }
 
 /// Resolve workspace path from role_map.json for a given channel.
@@ -127,36 +84,7 @@ pub(super) fn resolve_workspace(
     channel_id: ChannelId,
     channel_name: Option<&str>,
 ) -> Option<String> {
-    let path = role_map_path()?;
-    let content = fs::read_to_string(path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-
-    // 1) Primary: exact channel ID match
-    if let Some(by_id) = json.get("byChannelId").and_then(|v| v.as_object()) {
-        let key = channel_id.get().to_string();
-        if let Some(entry) = by_id.get(&key) {
-            if let Some(ws) = entry.get("workspace").and_then(|v| v.as_str()) {
-                return Some(ws.to_string());
-            }
-        }
-    }
-
-    // 2) Fallback: channel name match
-    let fallback_enabled = json
-        .get("fallbackByChannelName")
-        .and_then(|v| v.get("enabled"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if !fallback_enabled {
-        return None;
-    }
-    let cname = channel_name?;
-    let by_name = json.get("byChannelName").and_then(|v| v.as_object())?;
-    by_name
-        .get(cname)
-        .and_then(|entry| entry.get("workspace"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+    resolve_workspace_from_role_map(channel_id, channel_name)
 }
 
 pub(super) fn load_role_prompt(binding: &RoleBinding) -> Option<String> {
@@ -170,57 +98,7 @@ pub(super) fn load_role_prompt(binding: &RoleBinding) -> Option<String> {
 }
 
 pub(super) fn load_peer_agents() -> Vec<PeerAgentInfo> {
-    let Some(path) = role_map_path() else {
-        return Vec::new();
-    };
-    let Ok(content) = fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return Vec::new();
-    };
-    let Some(agents) = json
-        .get("meeting")
-        .and_then(|meeting| meeting.get("available_agents"))
-        .and_then(|v| v.as_array())
-    else {
-        return Vec::new();
-    };
-
-    let mut seen = std::collections::HashSet::new();
-    let mut result = Vec::new();
-    for agent in agents {
-        let Some(obj) = agent.as_object() else {
-            continue;
-        };
-        let Some(role_id) = obj.get("role_id").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        if !seen.insert(role_id.to_string()) {
-            continue;
-        }
-        let Some(display_name) = obj.get("display_name").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let keywords = obj
-            .get("keywords")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
-        result.push(PeerAgentInfo {
-            role_id: role_id.to_string(),
-            display_name: display_name.to_string(),
-            keywords,
-        });
-    }
-
-    result
+    load_peer_agents_from_role_map()
 }
 
 pub(super) fn render_peer_agent_guidance(current_role_id: &str) -> Option<String> {
@@ -256,10 +134,6 @@ pub(super) fn render_peer_agent_guidance(current_role_id: &str) -> Option<String
     }
 
     Some(lines.join("\n"))
-}
-
-pub(super) fn discord_uploads_root() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".remotecc").join("runtime").join("discord_uploads"))
 }
 
 pub(super) fn channel_upload_dir(channel_id: ChannelId) -> Option<std::path::PathBuf> {

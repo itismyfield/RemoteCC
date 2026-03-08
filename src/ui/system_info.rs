@@ -6,7 +6,6 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
-use unicode_width::UnicodeWidthStr;
 
 use super::theme::Theme;
 use crate::utils::format::pad_to_display_width;

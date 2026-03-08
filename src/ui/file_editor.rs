@@ -302,6 +302,7 @@ impl EditorState {
     }
 
     /// 메시지 클리어
+    #[allow(dead_code)]
     pub fn clear_message(&mut self) {
         self.message = None;
         self.message_timer = 0;
@@ -338,6 +339,7 @@ impl EditorState {
     /// Visual Column -> 버퍼 위치(char index)
     /// 주어진 visual column에 해당하는 문자 인덱스를 반환
     /// Wide characters (한글 등)는 2칸으로 계산됨
+    #[allow(dead_code)]
     pub fn visual_to_char(&self, line: &str, visual_col: usize) -> usize {
         let mut current_visual = 0;
         for (i, c) in line.chars().enumerate() {
@@ -365,6 +367,7 @@ impl EditorState {
     /// TAB을 visual column 기반으로 확장한 문자열 생성
     /// 각 TAB은 현재 visual column 위치에서 다음 tab_size 배수까지 스페이스로 확장됨
     /// Wide characters (한글 등)는 2칸으로 계산됨
+    #[allow(dead_code)]
     pub fn expand_tabs_visual(&self, line: &str) -> String {
         let mut result = String::new();
         let mut visual_col = 0;
@@ -2012,6 +2015,7 @@ impl EditorState {
     }
 
     /// 줄 복사 위로 (Shift+Alt+Up)
+    #[allow(dead_code)]
     pub fn copy_line_up(&mut self) {
         let line_content = self.lines[self.cursor_line].clone();
         self.lines.insert(self.cursor_line, line_content.clone());
@@ -2024,6 +2028,7 @@ impl EditorState {
     }
 
     /// 줄 복사 아래로 (Shift+Alt+Down)
+    #[allow(dead_code)]
     pub fn copy_line_down(&mut self) {
         let line_content = self.lines[self.cursor_line].clone();
         self.lines
@@ -3211,7 +3216,7 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                             .unwrap_or(false);
 
                         if is_connected {
-                            let mut ctx = match app.panels[panel_idx].remote_ctx.take() {
+                            let ctx = match app.panels[panel_idx].remote_ctx.take() {
                                 Some(ctx) => ctx,
                                 None => {
                                     if let Some(ref mut editor) = app.editor_state {

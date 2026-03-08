@@ -1,0 +1,195 @@
+use super::*;
+use super::turn_bridge::stale_inflight_message;
+
+pub(super) async fn restore_inflight_turns(
+    http: &Arc<serenity::Http>,
+    shared: &Arc<SharedData>,
+    provider: ProviderKind,
+) {
+    let states = load_inflight_states(provider);
+    if states.is_empty() {
+        return;
+    }
+
+    let settings_snapshot = shared.settings.read().await.clone();
+
+    for state in states {
+        let channel_id = ChannelId::new(state.channel_id);
+        let current_msg_id = MessageId::new(state.current_msg_id);
+        let user_msg_id = MessageId::new(state.user_msg_id);
+        let channel_name = state.channel_name.clone();
+        let tmux_session_name = state.tmux_session_name.clone().or_else(|| {
+            channel_name
+                .as_ref()
+                .map(|name| provider.build_tmux_session_name(name))
+        });
+        let (fallback_output, fallback_input) = tmux_session_name
+            .as_deref()
+            .map(tmux_runtime_paths)
+            .unwrap_or_else(|| (String::new(), String::new()));
+        let output_path = state
+            .output_path
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| (!fallback_output.is_empty()).then_some(fallback_output.clone()));
+        let input_fifo_path = state
+            .input_fifo_path
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| (!fallback_input.is_empty()).then_some(fallback_input.clone()));
+
+        let can_recover = tmux_session_name.as_deref().map_or(false, |name| {
+            std::process::Command::new("tmux")
+                .args(["has-session", "-t", name])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        });
+
+        if !can_recover {
+            rate_limit_wait(shared, channel_id).await;
+            let _ = channel_id
+                .edit_message(
+                    http,
+                    current_msg_id,
+                    EditMessage::new().content(truncate_str(
+                        &stale_inflight_message(&state.full_response),
+                        DISCORD_MSG_LIMIT,
+                    )),
+                )
+                .await;
+            clear_inflight_state(provider, state.channel_id);
+            continue;
+        }
+
+        let Some(tmux_session_name) = tmux_session_name else {
+            clear_inflight_state(provider, state.channel_id);
+            continue;
+        };
+        let Some(output_path) = output_path else {
+            clear_inflight_state(provider, state.channel_id);
+            continue;
+        };
+        let Some(input_fifo_path) = input_fifo_path else {
+            clear_inflight_state(provider, state.channel_id);
+            continue;
+        };
+
+        shared.recovering_channels.insert(channel_id, ());
+
+        let channel_key = channel_id.get().to_string();
+        let last_path = settings_snapshot.last_sessions.get(&channel_key).cloned();
+        let saved_remote = settings_snapshot.last_remotes.get(&channel_key).cloned();
+
+        let cancel_token = Arc::new(CancelToken::new());
+        if let Ok(mut guard) = cancel_token.tmux_session.lock() {
+            *guard = Some(tmux_session_name.clone());
+        }
+
+        {
+            let mut data = shared.core.lock().await;
+            let session = data
+                .sessions
+                .entry(channel_id)
+                .or_insert_with(|| DiscordSession {
+                    session_id: state.session_id.clone(),
+                    current_path: None,
+                    history: Vec::new(),
+                    pending_uploads: Vec::new(),
+                    cleared: false,
+                    remote_profile_name: saved_remote.clone(),
+                    channel_id: Some(channel_id.get()),
+                    channel_name: channel_name.clone(),
+                    category_name: None,
+                    last_active: tokio::time::Instant::now(),
+                    worktree: None,
+                });
+            session.channel_id = Some(channel_id.get());
+            session.last_active = tokio::time::Instant::now();
+            if session.current_path.is_none() {
+                session.current_path = last_path;
+            }
+            if session.channel_name.is_none() {
+                session.channel_name = channel_name.clone();
+            }
+            if session.remote_profile_name.is_none() {
+                session.remote_profile_name = saved_remote;
+            }
+            data.cancel_tokens.insert(channel_id, cancel_token.clone());
+            data.active_request_owner
+                .insert(channel_id, UserId::new(state.request_owner_user_id));
+        }
+
+        let role_binding = resolve_role_binding(channel_id, channel_name.as_deref());
+        let pcd_session_key = build_pcd_session_key(shared, channel_id, provider).await;
+        post_pcd_session_status(pcd_session_key.as_deref(), "working", provider, None).await;
+
+        let (tx, rx) = mpsc::channel();
+        let cancel_for_reader = cancel_token.clone();
+        let output_for_reader = output_path.clone();
+        let input_for_reader = input_fifo_path.clone();
+        let tmux_for_reader = tmux_session_name.clone();
+        let start_offset = state.last_offset;
+        let recovery_session_id = state.session_id.clone();
+        std::thread::spawn(move || {
+            match claude::read_output_file_until_result(
+                &output_for_reader,
+                start_offset,
+                tx.clone(),
+                Some(cancel_for_reader),
+                &tmux_for_reader,
+            ) {
+                Ok(ReadOutputResult::Completed { offset })
+                | Ok(ReadOutputResult::Cancelled { offset }) => {
+                    let _ = tx.send(StreamMessage::TmuxReady {
+                        output_path: output_for_reader,
+                        input_fifo_path: input_for_reader,
+                        tmux_session_name: tmux_for_reader,
+                        last_offset: offset,
+                    });
+                }
+                Ok(ReadOutputResult::SessionDied { .. }) => {
+                    let _ = tx.send(StreamMessage::Done {
+                        result: "⚠️ RemoteCC 재시작 중 진행되던 세션을 복구하지 못했습니다."
+                            .to_string(),
+                        session_id: recovery_session_id,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(StreamMessage::Error {
+                        message: e,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        exit_code: None,
+                    });
+                }
+            }
+        });
+
+        spawn_turn_bridge(
+            http.clone(),
+            shared.clone(),
+            cancel_token,
+            rx,
+            TurnBridgeContext {
+                provider,
+                channel_id,
+                user_msg_id,
+                user_text_owned: state.user_text.clone(),
+                request_owner_name: String::new(),
+                request_owner: None,
+                serenity_ctx: None,
+                token: None,
+                role_binding,
+                pcd_session_key,
+                current_msg_id,
+                current_msg_len: state.current_msg_len,
+                response_sent_offset: state.response_sent_offset,
+                full_response: state.full_response.clone(),
+                tmux_last_offset: Some(state.last_offset),
+                new_session_id: state.session_id.clone(),
+                inflight_state: state,
+            },
+        );
+    }
+}

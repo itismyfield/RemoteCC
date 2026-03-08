@@ -2321,6 +2321,7 @@ impl Theme {
             .add_modifier(Modifier::BOLD)
     }
 
+    #[allow(dead_code)]
     pub fn border_style(&self, active: bool) -> Style {
         if active {
             Style::default().fg(self.panel.border_active)
@@ -2329,16 +2330,19 @@ impl Theme {
         }
     }
 
+    #[allow(dead_code)]
     pub fn warning_style(&self) -> Style {
         Style::default()
             .fg(self.state.warning)
             .add_modifier(Modifier::BOLD)
     }
 
+    #[allow(dead_code)]
     pub fn error_style(&self) -> Style {
         Style::default().fg(self.state.error)
     }
 
+    #[allow(dead_code)]
     pub fn success_style(&self) -> Style {
         Style::default().fg(self.state.success)
     }
@@ -2353,6 +2357,7 @@ impl Theme {
             .bg(self.status_bar.bg)
     }
 
+    #[allow(dead_code)]
     pub fn info_style(&self) -> Style {
         Style::default().fg(self.state.info)
     }

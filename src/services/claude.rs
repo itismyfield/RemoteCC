@@ -6,7 +6,6 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
 use std::sync::OnceLock;
 
-use crate::services::provider::ProviderKind;
 use crate::services::remote::RemoteProfile;
 use crate::utils::format::safe_prefix;
 
@@ -82,11 +81,6 @@ pub fn toggle_debug() -> bool {
     !prev
 }
 
-/// Check if debug mode is currently enabled.
-pub fn is_debug_enabled() -> bool {
-    DEBUG_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// Debug logging helper — active when DEBUG_ENABLED is true.
 fn debug_log(msg: &str) {
     if !DEBUG_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
@@ -110,6 +104,7 @@ pub fn debug_log_to(filename: &str, msg: &str) {
 
 /// Kill a process tree by PID.
 /// On Unix, sends SIGTERM to the process group, then SIGKILL as fallback.
+#[allow(unsafe_code)]
 pub fn kill_pid_tree(pid: u32) {
     #[cfg(unix)]
     unsafe {
@@ -145,6 +140,7 @@ pub fn kill_child_tree(child: &mut std::process::Child) {
 pub struct ClaudeResponse {
     pub success: bool,
     pub response: Option<String>,
+    #[allow(dead_code)]
     pub session_id: Option<String>,
     pub error: Option<String>,
 }
@@ -174,8 +170,10 @@ pub enum StreamMessage {
     /// Error
     Error {
         message: String,
+        #[allow(dead_code)]
         stdout: String,
         stderr: String,
+        #[allow(dead_code)]
         exit_code: Option<i32>,
     },
     /// Statusline info extracted from result/assistant events
@@ -183,7 +181,9 @@ pub enum StreamMessage {
         model: Option<String>,
         cost_usd: Option<f64>,
         total_cost_usd: Option<f64>,
+        #[allow(dead_code)]
         duration_ms: Option<u64>,
+        #[allow(dead_code)]
         num_turns: Option<u32>,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
@@ -1513,12 +1513,6 @@ pub fn is_tmux_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Sanitize a name for use as a tmux session name.
-/// Replaces non-alphanumeric characters (except - and _) with -.
-pub fn sanitize_tmux_session_name(channel_name: &str) -> String {
-    ProviderKind::Claude.build_tmux_session_name(channel_name)
-}
-
 /// Execute Claude inside a local tmux session with bidirectional input.
 ///
 /// If a tmux session with this name already exists, sends the prompt as a
@@ -2057,7 +2051,7 @@ fn execute_streaming_remote_tmux(
         eprintln!("  [remote-tmux] SSH authenticated");
 
         let claude_bin = profile.claude_path.as_deref().unwrap_or("claude");
-        let escaped_args: Vec<String> = args.iter().map(|a| shell_escape(a)).collect();
+        let _escaped_args: Vec<String> = args.iter().map(|a| shell_escape(a)).collect();
 
         let cd_part = if working_dir == "~" {
             String::new()

@@ -42,7 +42,7 @@ pub(super) async fn tmux_output_watcher(
         if paused.load(Ordering::Relaxed) {
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
             // Check if resumed with a new offset
-            if let Some(new_offset) = resume_offset.lock().unwrap().take() {
+            if let Some(new_offset) = resume_offset.lock().ok().and_then(|mut g| g.take()) {
                 current_offset = new_offset;
             }
             continue;
@@ -390,7 +390,7 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
                         category_name: None,
                         remote_profile_name: remote_profile,
                         channel_id: Some(pw.channel_id.get()),
-                        silent: false,
+
                         last_active: tokio::time::Instant::now(),
                         worktree: None,
                     });
@@ -419,7 +419,6 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
         shared.tmux_watchers.insert(
             pw.channel_id,
             TmuxWatcherHandle {
-                cancel: cancel.clone(),
                 paused: paused.clone(),
                 resume_offset: resume_offset.clone(),
             },

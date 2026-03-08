@@ -333,6 +333,7 @@ impl DiffState {
     }
 
     /// Build the flat diff list by recursively comparing both directory trees (synchronous)
+    #[allow(dead_code)]
     pub fn build_diff_list(&mut self) {
         self.all_entries.clear();
         let left_root = self.left_root.clone();
@@ -839,6 +840,7 @@ impl DiffState {
 // Recursive diff tree builder
 // ═══════════════════════════════════════════════════════════════════════════════
 
+#[allow(dead_code)]
 fn build_recursive(
     left_root: &Path,
     right_root: &Path,
@@ -914,7 +916,7 @@ fn build_recursive(
             // Both sides exist
             if left_is_dir && right_is_dir {
                 // Both are directories - recurse and check children
-                let child_start = entries.len();
+                let _child_start = entries.len();
 
                 // Placeholder index for this directory entry
                 let dir_index = entries.len();
