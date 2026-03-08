@@ -195,6 +195,8 @@ pub enum StreamMessage {
         tmux_session_name: String,
         last_offset: u64,
     },
+    /// Latest read offset in a growing tmux output file
+    OutputOffset { offset: u64 },
 }
 
 /// Result from reading a tmux output file until completion or session death.
@@ -906,6 +908,9 @@ IMPORTANT: Format your responses using Markdown for better readability:
                     }
                     StreamMessage::TmuxReady { .. } => {
                         debug_log("  >>> TmuxReady (ignored in direct execution)");
+                    }
+                    StreamMessage::OutputOffset { offset } => {
+                        debug_log(&format!("  >>> OutputOffset: {offset}"));
                     }
                 }
 
@@ -1904,6 +1909,9 @@ pub(crate) fn read_output_file_until_result(
             Ok(n) => {
                 no_data_count = 0;
                 current_offset += n as u64;
+                let _ = sender.send(StreamMessage::OutputOffset {
+                    offset: current_offset,
+                });
                 partial_line.push_str(&String::from_utf8_lossy(&buf[..n]));
 
                 // Process complete lines
