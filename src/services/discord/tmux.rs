@@ -85,10 +85,22 @@ pub(super) async fn tmux_output_watcher(
         .unwrap_or(false);
 
         if !alive {
+            // Re-check shutdown/cancel — SIGTERM handler may have set the flag
+            // between the top-of-loop check and here
+            if cancel.load(Ordering::Relaxed) || shared.shutting_down.load(Ordering::Relaxed) {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!("  [{ts}] 👁 tmux session {tmux_session_name} ended during shutdown, exiting quietly");
+                break;
+            }
+            // Extra grace: wait briefly and re-check, since SIGTERM handler is async
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            if cancel.load(Ordering::Relaxed) || shared.shutting_down.load(Ordering::Relaxed) {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!("  [{ts}] 👁 tmux session {tmux_session_name} ended during shutdown, exiting quietly");
+                break;
+            }
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!("  [{ts}] 👁 tmux session {tmux_session_name} ended, watcher stopping");
-            // Notify Discord channel that the session has ended
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             let _ = channel_id
                 .say(
                     &http,
@@ -145,7 +157,10 @@ pub(super) async fn tmux_output_watcher(
             let turn_timeout = tokio::time::Duration::from_secs(600); // 10 min max
 
             while !found_result && turn_start.elapsed() < turn_timeout {
-                if cancel.load(Ordering::Relaxed) || paused.load(Ordering::Relaxed) {
+                if cancel.load(Ordering::Relaxed)
+                    || paused.load(Ordering::Relaxed)
+                    || shared.shutting_down.load(Ordering::Relaxed)
+                {
                     break;
                 }
 
