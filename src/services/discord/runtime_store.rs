@@ -2,7 +2,16 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+const REMOTECC_ROOT_DIR_ENV: &str = "REMOTECC_ROOT_DIR";
+
 pub(super) fn remotecc_root() -> Option<PathBuf> {
+    if let Ok(override_root) = std::env::var(REMOTECC_ROOT_DIR_ENV) {
+        let trimmed = override_root.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+
     dirs::home_dir().map(|h| h.join(".remotecc"))
 }
 
@@ -32,6 +41,10 @@ pub(super) fn discord_uploads_root() -> Option<PathBuf> {
 
 pub(super) fn discord_inflight_root() -> Option<PathBuf> {
     runtime_root().map(|root| root.join("discord_inflight"))
+}
+
+pub(super) fn discord_restart_reports_root() -> Option<PathBuf> {
+    runtime_root().map(|root| root.join("discord_restart_reports"))
 }
 
 pub(super) fn shared_agent_memory_root() -> Option<PathBuf> {

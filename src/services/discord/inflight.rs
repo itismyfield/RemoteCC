@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::services::provider::ProviderKind;
 use super::runtime_store::{atomic_write, discord_inflight_root};
+use crate::services::provider::ProviderKind;
 
 const INFLIGHT_STATE_VERSION: u32 = 1;
 
@@ -138,12 +138,29 @@ fn load_inflight_states_from_root(root: &Path, provider: ProviderKind) -> Vec<In
             continue;
         }
         let Ok(content) = fs::read_to_string(&path) else {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ⚠ failed to read inflight state file: {}",
+                path.display()
+            );
             continue;
         };
         let Ok(state) = serde_json::from_str::<InflightTurnState>(&content) else {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ⚠ removing malformed inflight state file: {}",
+                path.display()
+            );
+            let _ = fs::remove_file(&path);
             continue;
         };
         if state.provider_kind() != Some(provider) {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ⚠ removing inflight state with provider mismatch: {}",
+                path.display()
+            );
+            let _ = fs::remove_file(&path);
             continue;
         }
         states.push(state);

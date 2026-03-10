@@ -16,8 +16,10 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::env;
+use std::fs;
 use std::io;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::keybindings::PanelAction;
 use crate::services::claude;
@@ -26,6 +28,8 @@ use crate::utils::markdown::{is_line_empty, render_markdown, MarkdownTheme};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const REMOTECC_DCSERVER_LAUNCHD_LABEL: &str = "com.itismyfield.remotecc.dcserver";
+const REMOTECC_DCSERVER_LABEL_ENV: &str = "REMOTECC_DCSERVER_LABEL";
+const REMOTECC_ROOT_DIR_ENV: &str = "REMOTECC_ROOT_DIR";
 
 fn print_help() {
     println!("RemoteCC {} - Multi-panel terminal file manager", VERSION);
@@ -44,7 +48,7 @@ fn print_help() {
     println!("    --base64 <TEXT>         Decode base64 and print (internal use)");
     println!("    --dcserver [TOKEN]      Start Discord bot server(s); without TOKEN uses bot_settings.json");
     println!(
-        "    --restart-dcserver      Restart Discord bot tmux session (reads bot_settings.json)"
+        "    --restart-dcserver [--report-channel-id <ID> --report-provider <claude|codex> [--report-message-id <ID>]]"
     );
     println!("    --discord-sendfile <PATH> --channel <ID> --key <HASH>");
     println!("    --discord-sendmessage --channel <ID> --message <TEXT> [--key <HASH>]");
@@ -76,6 +80,166 @@ fn handle_base64(encoded: &str) {
         Err(_) => {
             std::process::exit(1);
         }
+    }
+}
+
+fn parse_restart_dcserver_report_context(
+    args: &[String],
+    start_index: usize,
+) -> Result<Option<services::discord::restart_report::RestartReportContext>, String> {
+    use services::discord::restart_report::{
+        restart_report_context_from_env, RestartReportContext,
+    };
+    use services::provider::ProviderKind;
+
+    let mut report_channel_id: Option<u64> = None;
+    let mut report_provider: Option<String> = None;
+    let mut report_message_id: Option<u64> = None;
+    let mut i = start_index;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--report-channel-id" => {
+                let raw = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--report-channel-id requires a numeric ID".to_string())?;
+                report_channel_id = Some(
+                    raw.parse::<u64>()
+                        .map_err(|_| format!("invalid value for --report-channel-id: {raw}"))?,
+                );
+                i += 2;
+            }
+            "--report-provider" => {
+                let raw = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--report-provider requires one of: claude, codex".to_string())?
+                    .clone();
+                report_provider = Some(raw);
+                i += 2;
+            }
+            "--report-message-id" => {
+                let raw = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--report-message-id requires a numeric ID".to_string())?;
+                report_message_id = Some(
+                    raw.parse::<u64>()
+                        .map_err(|_| format!("invalid value for --report-message-id: {raw}"))?,
+                );
+                i += 2;
+            }
+            other => {
+                return Err(format!("unknown option for --restart-dcserver: {other}"));
+            }
+        }
+    }
+
+    match (report_provider, report_channel_id, report_message_id) {
+        (None, None, None) => Ok(restart_report_context_from_env()),
+        (None, None, Some(_)) => Err(
+            "--report-message-id requires --report-channel-id and --report-provider".to_string(),
+        ),
+        (Some(_), None, _) => Err("--report-provider requires --report-channel-id".to_string()),
+        (None, Some(_), _) => Err("--report-channel-id requires --report-provider".to_string()),
+        (Some(provider_raw), Some(channel_id), current_msg_id) => {
+            let provider = ProviderKind::from_str(&provider_raw).ok_or_else(|| {
+                format!(
+                    "invalid value for --report-provider: {} (expected claude or codex)",
+                    provider_raw
+                )
+            })?;
+            Ok(Some(RestartReportContext {
+                provider,
+                channel_id,
+                current_msg_id,
+            }))
+        }
+    }
+}
+
+#[cfg(test)]
+mod restart_dcserver_cli_tests {
+    use super::parse_restart_dcserver_report_context;
+    use crate::services::provider::ProviderKind;
+
+    #[test]
+    fn parses_explicit_restart_report_context() {
+        let args = vec![
+            "remotecc".to_string(),
+            "--restart-dcserver".to_string(),
+            "--report-channel-id".to_string(),
+            "1479671301387059200".to_string(),
+            "--report-provider".to_string(),
+            "codex".to_string(),
+        ];
+
+        let context = parse_restart_dcserver_report_context(&args, 2)
+            .unwrap()
+            .expect("expected restart report context");
+        assert_eq!(context.channel_id, 1479671301387059200);
+        assert_eq!(context.provider, ProviderKind::Codex);
+        assert_eq!(context.current_msg_id, None);
+    }
+
+    #[test]
+    fn parses_restart_report_message_id() {
+        let args = vec![
+            "remotecc".to_string(),
+            "--restart-dcserver".to_string(),
+            "--report-channel-id".to_string(),
+            "1479671301387059200".to_string(),
+            "--report-provider".to_string(),
+            "codex".to_string(),
+            "--report-message-id".to_string(),
+            "1480460000000000000".to_string(),
+        ];
+
+        let context = parse_restart_dcserver_report_context(&args, 2)
+            .unwrap()
+            .expect("expected restart report context");
+        assert_eq!(context.current_msg_id, Some(1480460000000000000));
+    }
+
+    #[test]
+    fn rejects_partial_restart_report_context() {
+        let args = vec![
+            "remotecc".to_string(),
+            "--restart-dcserver".to_string(),
+            "--report-channel-id".to_string(),
+            "1479671301387059200".to_string(),
+        ];
+
+        let err = parse_restart_dcserver_report_context(&args, 2).unwrap_err();
+        assert!(err.contains("--report-channel-id requires --report-provider"));
+    }
+
+    #[test]
+    fn rejects_restart_report_message_id_without_context() {
+        let args = vec![
+            "remotecc".to_string(),
+            "--restart-dcserver".to_string(),
+            "--report-message-id".to_string(),
+            "1480460000000000000".to_string(),
+        ];
+
+        let err = parse_restart_dcserver_report_context(&args, 2).unwrap_err();
+        assert!(
+            err.contains("--report-message-id requires --report-channel-id and --report-provider")
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_restart_report_provider() {
+        let args = vec![
+            "remotecc".to_string(),
+            "--restart-dcserver".to_string(),
+            "--report-channel-id".to_string(),
+            "1479671301387059200".to_string(),
+            "--report-provider".to_string(),
+            "openclaw".to_string(),
+        ];
+
+        let err = parse_restart_dcserver_report_context(&args, 2).unwrap_err();
+        assert!(err.contains("invalid value for --report-provider"));
     }
 }
 
@@ -332,48 +496,250 @@ fn kickstart_launchd_job(label: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Kill all existing dcserver processes (prevents duplicates from different paths).
-fn kill_existing_dcserver_processes() {
-    let pgrep_output = std::process::Command::new("pgrep")
-        .args(["-f", "remotecc --dcserver"])
-        .output();
-
-    if let Ok(output) = pgrep_output {
-        if output.status.success() {
-            let pids = String::from_utf8_lossy(&output.stdout);
-            let my_pid = std::process::id();
-            let mut killed = 0;
-            for pid_str in pids.lines() {
-                if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                    if pid != my_pid {
-                        println!("   Killing existing dcserver (PID {})", pid);
-                        let _ = std::process::Command::new("kill")
-                            .arg(pid.to_string())
-                            .status();
-                        killed += 1;
-                    }
-                }
-            }
-            if killed > 0 {
-                std::thread::sleep(std::time::Duration::from_secs(2));
-            }
+fn remotecc_runtime_root() -> Option<PathBuf> {
+    if let Ok(override_root) = env::var(REMOTECC_ROOT_DIR_ENV) {
+        let trimmed = override_root.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
         }
+    }
+
+    dirs::home_dir().map(|h| h.join(".remotecc"))
+}
+
+fn current_dcserver_launchd_label() -> String {
+    env::var(REMOTECC_DCSERVER_LABEL_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| REMOTECC_DCSERVER_LAUNCHD_LABEL.to_string())
+}
+
+fn current_dcserver_root_marker() -> Option<String> {
+    env::var(REMOTECC_ROOT_DIR_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn dcserver_process_command(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["eww", "-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if command.is_empty() {
+        return None;
+    }
+    Some(command)
+}
+
+fn dcserver_process_matches_instance(command: &str) -> bool {
+    if !command.contains("remotecc --dcserver") {
+        return false;
+    }
+
+    match current_dcserver_root_marker() {
+        Some(root) => command.contains(&format!("{REMOTECC_ROOT_DIR_ENV}={root}")),
+        None => !command.contains(&format!("{REMOTECC_ROOT_DIR_ENV}=")),
     }
 }
 
-fn handle_restart_dcserver() {
+fn dcserver_instance_pids() -> Vec<u32> {
+    let output = match std::process::Command::new("pgrep")
+        .args(["-f", "remotecc --dcserver"])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .filter(|pid| {
+            dcserver_process_command(*pid)
+                .as_deref()
+                .map(dcserver_process_matches_instance)
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+fn instance_bot_settings_path() -> Option<PathBuf> {
+    remotecc_runtime_root().map(|root| root.join("bot_settings.json"))
+}
+
+fn dcserver_stdout_log_path() -> Option<PathBuf> {
+    remotecc_runtime_root().map(|root| root.join("dcserver.stdout.log"))
+}
+
+fn current_release_link_path() -> Option<PathBuf> {
+    remotecc_runtime_root().map(|root| root.join("releases").join("current"))
+}
+
+fn previous_release_link_path() -> Option<PathBuf> {
+    remotecc_runtime_root().map(|root| root.join("releases").join("previous"))
+}
+
+fn read_release_link_target(path: &Path) -> Option<PathBuf> {
+    fs::symlink_metadata(path).ok()?;
+    fs::read_link(path).ok()
+}
+
+#[cfg(unix)]
+fn update_release_link(link_path: &Path, target: &Path) -> Result<(), String> {
+    use std::os::unix::fs::symlink;
+
+    if fs::symlink_metadata(link_path).is_ok() {
+        fs::remove_file(link_path).map_err(|e| format!("remove old symlink failed: {e}"))?;
+    }
+    symlink(target, link_path).map_err(|e| format!("create symlink failed: {e}"))
+}
+
+fn dcserver_process_running() -> bool {
+    !dcserver_instance_pids().is_empty()
+}
+
+fn verify_dcserver_ready_since(start_offset: u64, timeout: Duration) -> Result<(), String> {
+    let stdout_path =
+        dcserver_stdout_log_path().ok_or_else(|| "dcserver stdout log path missing".to_string())?;
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        if !dcserver_process_running() {
+            if Instant::now() >= deadline {
+                return Err("dcserver process is not running".to_string());
+            }
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+
+        let recent = match fs::read(&stdout_path) {
+            Ok(bytes) if (start_offset as usize) < bytes.len() => {
+                String::from_utf8_lossy(&bytes[start_offset as usize..]).to_string()
+            }
+            Ok(_) => String::new(),
+            Err(_) => String::new(),
+        };
+
+        if recent.contains("Bot connected — Registered commands")
+            || recent.contains("✓ Bot connected")
+        {
+            return Ok(());
+        }
+
+        if recent.contains(" bot error:") || recent.contains("Error: no bot tokens found") {
+            return Err("dcserver emitted startup error".to_string());
+        }
+
+        if Instant::now() >= deadline {
+            return Err("timed out waiting for dcserver ready log".to_string());
+        }
+
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn restart_launchd_dcserver_and_verify(label: &str, timeout: Duration) -> Result<(), String> {
+    let stdout_path =
+        dcserver_stdout_log_path().ok_or_else(|| "dcserver stdout log path missing".to_string())?;
+    let start_offset = fs::metadata(&stdout_path).map(|m| m.len()).unwrap_or(0);
+
+    if !kickstart_launchd_job(label) {
+        return Err("launchd kickstart failed".to_string());
+    }
+
+    verify_dcserver_ready_since(start_offset, timeout)
+}
+
+fn rollback_to_previous_release(label: &str, timeout: Duration) -> Result<PathBuf, String> {
+    let previous_link =
+        previous_release_link_path().ok_or_else(|| "previous release link missing".to_string())?;
+    let current_link =
+        current_release_link_path().ok_or_else(|| "current release link missing".to_string())?;
+    let previous_target = read_release_link_target(&previous_link)
+        .ok_or_else(|| format!("no rollback target found at {}", previous_link.display()))?;
+
+    if !previous_target.join("remotecc").exists() {
+        return Err(format!(
+            "rollback target missing binary: {}",
+            previous_target.join("remotecc").display()
+        ));
+    }
+
+    update_release_link(&current_link, &previous_target)?;
+    restart_launchd_dcserver_and_verify(label, timeout)?;
+    Ok(previous_target)
+}
+
+/// Kill all existing dcserver processes (prevents duplicates from different paths).
+fn kill_existing_dcserver_processes() {
+    let my_pid = std::process::id();
+    let mut killed = 0;
+    for pid in dcserver_instance_pids() {
+        if pid == my_pid {
+            continue;
+        }
+        println!("   Killing existing dcserver (PID {})", pid);
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status();
+        killed += 1;
+    }
+    if killed > 0 {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
+fn handle_restart_dcserver(
+    report_context_override: Option<services::discord::restart_report::RestartReportContext>,
+) {
     use services::discord::load_discord_bot_launch_configs;
+    use services::discord::restart_report::{
+        load_restart_report, restart_report_context_from_env, save_restart_report,
+        RestartCompletionReport,
+    };
+    const READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+    let report_context = report_context_override.or_else(restart_report_context_from_env);
+    if report_context.is_none() {
+        eprintln!(
+            "ℹ no restart follow-up target configured; pass --report-channel-id/--report-provider or set REMOTECC_REPORT_* to send a Discord completion message"
+        );
+    }
+    let write_restart_report = |status: &str, summary: String| {
+        let Some(context) = report_context.as_ref() else {
+            return;
+        };
+        let mut report =
+            RestartCompletionReport::new(context.provider, context.channel_id, status, summary);
+        if let Some(existing) = load_restart_report(context.provider, context.channel_id) {
+            report.current_msg_id = existing.current_msg_id;
+        }
+        if report.current_msg_id.is_none() {
+            report.current_msg_id = context.current_msg_id;
+        }
+        if let Err(e) = save_restart_report(&report) {
+            eprintln!("⚠ failed to save restart follow-up report: {e}");
+        }
+    };
 
     // Read bot_settings.json to find stored token(s)
-    let settings_path = dirs::home_dir()
-        .map(|h| h.join(".remotecc").join("bot_settings.json"))
-        .expect("Cannot determine home directory");
+    let settings_path = instance_bot_settings_path().expect("Cannot determine runtime root");
 
     match std::fs::read_to_string(&settings_path) {
         Ok(_) => {}
         Err(_) => {
-            eprintln!("Error: ~/.remotecc/bot_settings.json not found.");
+            eprintln!("Error: {} not found.", settings_path.display());
             eprintln!("Run 'remotecc --dcserver' after configuring bot_settings.json.");
+            write_restart_report(
+                "failed",
+                "bot_settings.json이 없어서 dcserver restart를 시작하지 못했습니다.".to_string(),
+            );
             return;
         }
     }
@@ -381,28 +747,108 @@ fn handle_restart_dcserver() {
     let configs = load_discord_bot_launch_configs();
     if configs.is_empty() {
         eprintln!("Error: no bot tokens found in bot_settings.json");
+        write_restart_report(
+            "failed",
+            "bot_settings.json에 bot token이 없어서 dcserver restart를 시작하지 못했습니다."
+                .to_string(),
+        );
         return;
     }
 
     println!("🔄 Restarting Discord bot server...");
     println!("   Configured bots: {}", configs.len());
 
+    let previous_release = previous_release_link_path()
+        .as_deref()
+        .and_then(read_release_link_target);
+
+    if let Some(context) = report_context.as_ref() {
+        let mut pending_report = RestartCompletionReport::new(
+            context.provider,
+            context.channel_id,
+            "pending",
+            "dcserver restart requested; 새 프로세스가 completion follow-up을 이어받는 중입니다.",
+        );
+        if let Some(existing) = load_restart_report(context.provider, context.channel_id) {
+            pending_report.current_msg_id = existing.current_msg_id;
+        }
+        if pending_report.current_msg_id.is_none() {
+            pending_report.current_msg_id = context.current_msg_id;
+        }
+        if let Err(e) = save_restart_report(&pending_report) {
+            eprintln!("⚠ failed to save pending restart follow-up report: {e}");
+        }
+    }
+
     // Kill ALL existing dcserver processes first (prevents duplicates)
     kill_existing_dcserver_processes();
 
-    if is_launchd_job_loaded(REMOTECC_DCSERVER_LAUNCHD_LABEL) {
-        println!(
-            "   launchd service detected: {}",
-            REMOTECC_DCSERVER_LAUNCHD_LABEL
-        );
-        if kickstart_launchd_job(REMOTECC_DCSERVER_LAUNCHD_LABEL) {
-            println!(
-                "✅ Discord bot restarted via launchd '{}'",
-                REMOTECC_DCSERVER_LAUNCHD_LABEL
-            );
-            return;
+    let launchd_label = current_dcserver_launchd_label();
+    if is_launchd_job_loaded(&launchd_label) {
+        println!("   launchd service detected: {}", launchd_label);
+        match restart_launchd_dcserver_and_verify(&launchd_label, READY_TIMEOUT) {
+            Ok(()) => {
+                let current_release = current_release_link_path()
+                    .as_deref()
+                    .and_then(read_release_link_target)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(unknown)".to_string());
+                println!(
+                    "✅ Discord bot restarted via launchd '{}' and passed ready check",
+                    launchd_label
+                );
+                write_restart_report(
+                    "ok",
+                    format!(
+                        "launchd restart 완료, ready check 통과\n- current release: `{}`",
+                        current_release
+                    ),
+                );
+                return;
+            }
+            Err(e) => {
+                eprintln!("⚠ launchd restart verification failed: {e}");
+                if let Some(prev) = previous_release.as_ref() {
+                    eprintln!("↩ rolling back current release to {}", prev.display());
+                    match rollback_to_previous_release(&launchd_label, READY_TIMEOUT) {
+                        Ok(restored) => {
+                            println!(
+                                "✅ Rolled back to {} and dcserver passed ready check",
+                                restored.display()
+                            );
+                            write_restart_report(
+                                "rolled_back",
+                                format!(
+                                    "launchd restart는 실패했지만 rollback 후 복구됨\n- restored release: `{}`\n- reason: `{}`",
+                                    restored.display(),
+                                    e
+                                ),
+                            );
+                        }
+                        Err(rollback_err) => {
+                            eprintln!("❌ Rollback failed: {rollback_err}");
+                            write_restart_report(
+                                "failed",
+                                format!(
+                                    "launchd restart 실패 후 rollback도 실패\n- restart error: `{}`\n- rollback error: `{}`",
+                                    e, rollback_err
+                                ),
+                            );
+                        }
+                    }
+                } else {
+                    eprintln!("⚠ no previous release link available for rollback");
+                    write_restart_report(
+                        "failed",
+                        format!(
+                            "launchd restart 실패, rollback target 없음\n- restart error: `{}`",
+                            e
+                        ),
+                    );
+                }
+                return;
+            }
         }
-        eprintln!("⚠ launchd kickstart failed, falling back to tmux restart");
     }
 
     // NOTE: We intentionally do NOT kill remoteCC-* Claude work sessions here.
@@ -411,14 +857,14 @@ fn handle_restart_dcserver() {
 
     // Launch new dcserver inside tmux session "remoteCC"
     // Write a launcher script to avoid token exposure in ps aux
-    let launcher_path = dirs::home_dir()
-        .map(|h| h.join(".remotecc").join("_launch_dcserver.sh"))
-        .expect("Cannot determine home directory");
+    let launcher_path = remotecc_runtime_root()
+        .map(|root| root.join("_launch_dcserver.sh"))
+        .expect("Cannot determine runtime root");
 
     // Use production binary at ~/.remotecc/bin/remotecc (trunk-based: separate from build output)
-    let prod_bin = dirs::home_dir()
-        .map(|h| h.join(".remotecc").join("bin").join("remotecc"))
-        .expect("Cannot determine home directory");
+    let prod_bin = remotecc_runtime_root()
+        .map(|root| root.join("bin").join("remotecc"))
+        .expect("Cannot determine runtime root");
     let exe = if prod_bin.exists() {
         prod_bin.display().to_string()
     } else {
@@ -437,7 +883,29 @@ fn handle_restart_dcserver() {
         }
     };
 
-    let script = format!("#!/bin/bash\nunset CLAUDECODE\nexec {} --dcserver\n", exe);
+    let root_env = current_dcserver_root_marker()
+        .map(|root| {
+            format!(
+                "export {REMOTECC_ROOT_DIR_ENV}='{}'\n",
+                root.replace('\'', "'\\''")
+            )
+        })
+        .unwrap_or_default();
+    let label_env = env::var(REMOTECC_DCSERVER_LABEL_ENV)
+        .ok()
+        .map(|label| label.trim().to_string())
+        .filter(|label| !label.is_empty())
+        .map(|label| {
+            format!(
+                "export {REMOTECC_DCSERVER_LABEL_ENV}='{}'\n",
+                label.replace('\'', "'\\''")
+            )
+        })
+        .unwrap_or_default();
+    let script = format!(
+        "#!/bin/bash\nunset CLAUDECODE\n{root_env}{label_env}exec {} --dcserver\n",
+        exe
+    );
     std::fs::write(&launcher_path, &script).expect("Failed to write launcher script");
     #[cfg(unix)]
     {
@@ -471,16 +939,51 @@ fn handle_restart_dcserver() {
                 .args(["has-session", "-t", tmux_session])
                 .status();
             if check.map(|s| s.success()).unwrap_or(false) {
-                println!("✅ Discord bot started in tmux session '{}'", tmux_session);
+                match verify_dcserver_ready_since(0, READY_TIMEOUT) {
+                    Ok(()) => {
+                        println!(
+                            "✅ Discord bot started in tmux session '{}' and passed ready check",
+                            tmux_session
+                        );
+                        write_restart_report(
+                            "ok",
+                            format!(
+                                "tmux fallback restart 완료, ready check 통과\n- session: `{}`",
+                                tmux_session
+                            ),
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "⚠ tmux session '{}' started but ready check failed: {}",
+                            tmux_session, e
+                        );
+                        write_restart_report(
+                            "failed",
+                            format!(
+                                "tmux fallback restart는 됐지만 ready check 실패\n- session: `{}`\n- error: `{}`",
+                                tmux_session, e
+                            ),
+                        );
+                    }
+                }
             } else {
                 eprintln!(
                     "❌ tmux session '{}' failed to start. Check with: tmux a -t {}",
                     tmux_session, tmux_session
                 );
+                write_restart_report(
+                    "failed",
+                    format!("tmux fallback restart 실패\n- session: `{}`", tmux_session),
+                );
             }
         }
         Err(e) => {
             eprintln!("❌ Failed to start tmux session: {}", e);
+            write_restart_report(
+                "failed",
+                format!("tmux fallback restart spawn 실패\n- error: `{}`", e),
+            );
         }
     }
 }
@@ -491,7 +994,9 @@ fn handle_dcserver(token: Option<String>) {
 
     // Write PID file for future instance detection
     if let Some(home) = dirs::home_dir() {
-        let pid_file = home.join(".remotecc").join("dcserver.pid");
+        let pid_file = remotecc_runtime_root()
+            .unwrap_or_else(|| home.join(".remotecc"))
+            .join("dcserver.pid");
         let _ = std::fs::write(&pid_file, std::process::id().to_string());
     }
 
@@ -499,6 +1004,7 @@ fn handle_dcserver(token: Option<String>) {
     std::env::remove_var("CLAUDECODE");
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+    let settings_path = instance_bot_settings_path();
 
     let title = format!("  RemoteCC v{}  |  Discord Bot Server  ", VERSION);
     let width = title.chars().count();
@@ -519,7 +1025,13 @@ fn handle_dcserver(token: Option<String>) {
             None => {
                 let configs = services::discord::load_discord_bot_launch_configs();
                 if configs.is_empty() {
-                    eprintln!("Error: no bot tokens found in ~/.remotecc/bot_settings.json");
+                    eprintln!(
+                        "Error: no bot tokens found in {}",
+                        settings_path
+                            .as_deref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "bot_settings.json".to_string())
+                    );
                     return;
                 }
 
@@ -803,7 +1315,10 @@ fn main() -> io::Result<()> {
                 return Ok(());
             }
             "--restart-dcserver" => {
-                handle_restart_dcserver();
+                match parse_restart_dcserver_report_context(&args, i + 1) {
+                    Ok(report_context) => handle_restart_dcserver(report_context),
+                    Err(err) => eprintln!("Error: {err}"),
+                }
                 return Ok(());
             }
             "--discord-sendfile" => {

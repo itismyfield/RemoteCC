@@ -1,5 +1,5 @@
-use super::*;
 use super::settings::{discord_token_hash, load_role_prompt, render_peer_agent_guidance};
+use super::*;
 
 pub(super) fn build_system_prompt(
     discord_context: &str,
@@ -9,6 +9,7 @@ pub(super) fn build_system_prompt(
     disabled_notice: &str,
     skills_notice: &str,
     role_binding: Option<&RoleBinding>,
+    queued_turn: bool,
 ) -> String {
     let mut system_prompt_owned = format!(
         "You are chatting with a user through Discord.\n\
@@ -71,6 +72,16 @@ pub(super) fn build_system_prompt(
             system_prompt_owned.push_str("\n\n");
             system_prompt_owned.push_str(&peer_guidance);
         }
+    }
+
+    if queued_turn {
+        system_prompt_owned.push_str(
+            "\n\n[Queued Turn Rules]\n\
+             This user message was queued while another turn was running.\n\
+             Treat ONLY the latest queued user message in this turn as actionable.\n\
+             Do NOT repeat, combine, or continue prior queued messages unless the latest user message explicitly asks for that.\n\
+             If the latest user message asks for an exact literal output, return exactly that literal output and nothing else.",
+        );
     }
 
     system_prompt_owned

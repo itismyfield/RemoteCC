@@ -1,12 +1,52 @@
 use poise::serenity_prelude as serenity;
-use serenity::{ChannelId, CreateMessage};
+use serenity::{ChannelId, CreateMessage, EditMessage, MessageId};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::time::Duration;
 
-use super::{rate_limit_wait, SharedData, DISCORD_MSG_LIMIT};
+use super::{rate_limit_wait, RecentDiscordSend, SharedData, DISCORD_MSG_LIMIT};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, super::Data, Error>;
+const DUPLICATE_SEND_TTL: Duration = Duration::from_secs(10 * 60);
+
+fn should_suppress_duplicate_send(
+    shared: &Arc<SharedData>,
+    channel_id: ChannelId,
+    text: &str,
+) -> bool {
+    let normalized = text.trim();
+    if normalized.is_empty() {
+        return false;
+    }
+
+    let mut hasher = DefaultHasher::new();
+    normalized.hash(&mut hasher);
+    let hash = hasher.finish();
+    let len = normalized.len();
+    let now = std::time::Instant::now();
+
+    if let Some(previous) = shared.recent_sends.get(&channel_id) {
+        if previous.hash == hash
+            && previous.len == len
+            && now.duration_since(previous.sent_at) <= DUPLICATE_SEND_TTL
+        {
+            return true;
+        }
+    }
+
+    shared.recent_sends.insert(
+        channel_id,
+        RecentDiscordSend {
+            hash,
+            len,
+            sent_at: now,
+        },
+    );
+    false
+}
 
 /// All available tools with (name, description, is_destructive)
 pub(super) const ALL_TOOLS: &[(&str, &str, bool)] = &[
@@ -603,6 +643,15 @@ pub(super) async fn send_long_message_raw(
     text: &str,
     shared: &Arc<SharedData>,
 ) -> Result<(), Error> {
+    if should_suppress_duplicate_send(shared, channel_id, text) {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        println!(
+            "  [{ts}] ⏭ Suppressed duplicate Discord send for channel {}",
+            channel_id.get()
+        );
+        return Ok(());
+    }
+
     if text.len() <= DISCORD_MSG_LIMIT {
         rate_limit_wait(shared, channel_id).await;
         channel_id
@@ -613,6 +662,45 @@ pub(super) async fn send_long_message_raw(
 
     let chunks = split_message(text);
     for chunk in &chunks {
+        rate_limit_wait(shared, channel_id).await;
+        channel_id
+            .send_message(http, CreateMessage::new().content(chunk))
+            .await?;
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    }
+
+    Ok(())
+}
+
+/// Replace an existing Discord message with the first chunk, then send the remaining chunks.
+pub(super) async fn replace_long_message_raw(
+    http: &serenity::Http,
+    channel_id: ChannelId,
+    message_id: MessageId,
+    text: &str,
+    shared: &Arc<SharedData>,
+) -> Result<(), Error> {
+    let chunks = split_message(text);
+    let Some(first_chunk) = chunks.first() else {
+        return Ok(());
+    };
+
+    rate_limit_wait(shared, channel_id).await;
+    let edit_result = channel_id
+        .edit_message(http, message_id, EditMessage::new().content(first_chunk))
+        .await;
+
+    if let Err(e) = edit_result {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        println!(
+            "  [{ts}] ⚠ replace_long_message_raw edit failed for channel {} msg {}: {e}",
+            channel_id.get(),
+            message_id.get()
+        );
+        return send_long_message_raw(http, channel_id, text, shared).await;
+    }
+
+    for chunk in chunks.iter().skip(1) {
         rate_limit_wait(shared, channel_id).await;
         channel_id
             .send_message(http, CreateMessage::new().content(chunk))
