@@ -541,6 +541,7 @@ pub(super) async fn handle_text_message(
         provider,
         Some(&pcd_session_info),
         None,
+        Some(&current_path),
     )
     .await;
 
@@ -685,6 +686,7 @@ pub(super) async fn handle_text_message(
             pcd_session_key,
             pcd_session_name,
             pcd_session_info: Some(pcd_session_info),
+            pcd_cwd: Some(current_path.clone()),
             current_msg_id: placeholder_msg_id,
             response_sent_offset: 0,
             full_response: String::new(),

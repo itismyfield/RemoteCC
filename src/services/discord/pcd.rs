@@ -77,6 +77,7 @@ pub(super) async fn post_pcd_session_status(
     provider: ProviderKind,
     session_info: Option<&str>,
     tokens: Option<u64>,
+    cwd: Option<&str>,
 ) {
     let Some(session_key) = session_key else {
         return;
@@ -98,12 +99,26 @@ pub(super) async fn post_pcd_session_status(
     if let Some(tokens) = tokens {
         body["tokens"] = serde_json::json!(tokens);
     }
+    if let Some(cwd) = cwd.and_then(clean_nonempty) {
+        body["cwd"] = serde_json::json!(cwd);
+    }
 
-    let _ = reqwest::Client::new()
+    match reqwest::Client::new()
         .post("http://127.0.0.1:8791/api/hook/session")
         .json(&body)
         .send()
-        .await;
+        .await
+    {
+        Ok(resp) if !resp.status().is_success() => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            eprintln!("  [{ts}] ⚠ PCD session POST failed: HTTP {}", resp.status());
+        }
+        Err(e) => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            eprintln!("  [{ts}] ⚠ PCD session POST error: {e}");
+        }
+        _ => {}
+    }
 }
 
 fn normalize_user_task_summary(input: &str) -> Option<String> {
