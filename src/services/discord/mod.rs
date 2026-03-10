@@ -561,6 +561,24 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
                     entry.value().cancel.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
 
+                // Create restart reports for channels with active inflight turns
+                // so that flush_restart_reports() on next startup sends "복원됨" messages
+                let inflight_states = inflight::load_inflight_states(provider);
+                for state in &inflight_states {
+                    let report = restart_report::RestartCompletionReport::new(
+                        provider,
+                        state.channel_id,
+                        "pending",
+                        "dcserver가 SIGTERM으로 종료되었습니다. 재시작 후 작업을 이어받습니다.",
+                    );
+                    if let Err(e) = restart_report::save_restart_report(&report) {
+                        eprintln!("  ⚠ failed to save restart report for channel {}: {e}", state.channel_id);
+                    }
+                }
+                if !inflight_states.is_empty() {
+                    println!("  [{ts}] 📝 saved {} restart report(s) for inflight channels", inflight_states.len());
+                }
+
                 // Grace period for watchers to see cancel flag and exit cleanly
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                 std::process::exit(0);
