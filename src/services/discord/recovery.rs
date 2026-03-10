@@ -293,6 +293,7 @@ pub(super) async fn restore_inflight_turns(
             provider,
             Some(&pcd_session_info),
             None,
+            last_path.as_deref(),
         )
         .await;
 
@@ -356,6 +357,7 @@ pub(super) async fn restore_inflight_turns(
                 pcd_session_key,
                 pcd_session_name,
                 pcd_session_info: Some(pcd_session_info),
+                pcd_cwd: last_path.clone(),
                 current_msg_id,
                 response_sent_offset: state.response_sent_offset,
                 full_response: state.full_response.clone(),

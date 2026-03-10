@@ -253,7 +253,7 @@ pub(super) async fn flush_restart_reports(
                 report.summary.clone(),
                 report.completed_at.clone(),
             ),
-            "pending" => (
+            "sigterm" => (
                 "♻️",
                 "recovered",
                 format!(
@@ -261,6 +261,12 @@ pub(super) async fn flush_restart_reports(
                     report.summary
                 ),
                 chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            ),
+            "pending" => (
+                "⏳",
+                "pending",
+                report.summary.clone(),
+                report.completed_at.clone(),
             ),
             _ => (
                 "❌",

@@ -561,26 +561,33 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
                     entry.value().cancel.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
 
-                // Create restart reports for channels with active inflight turns
-                // so that flush_restart_reports() on next startup sends "복원됨" messages
+                // Grace period for watchers to see cancel flag and exit cleanly.
+                // Active turns may also finish during this window.
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+                // Create restart reports AFTER grace period so that turns that
+                // completed (and cleared their inflight state) during the window
+                // are not given a spurious recovery follow-up.
                 let inflight_states = inflight::load_inflight_states(provider);
                 for state in &inflight_states {
-                    let report = restart_report::RestartCompletionReport::new(
-                        provider,
-                        state.channel_id,
-                        "pending",
-                        "dcserver가 SIGTERM으로 종료되었습니다. 재시작 후 작업을 이어받습니다.",
-                    );
-                    if let Err(e) = restart_report::save_restart_report(&report) {
-                        eprintln!("  ⚠ failed to save restart report for channel {}: {e}", state.channel_id);
+                    // Only create if no existing report from --restart-dcserver
+                    if restart_report::load_restart_report(provider, state.channel_id).is_none() {
+                        let report = restart_report::RestartCompletionReport::new(
+                            provider,
+                            state.channel_id,
+                            "sigterm",
+                            "dcserver가 SIGTERM으로 종료되었습니다. 재시작 후 작업을 이어받습니다.",
+                        );
+                        if let Err(e) = restart_report::save_restart_report(&report) {
+                            eprintln!("  ⚠ failed to save restart report for channel {}: {e}", state.channel_id);
+                        }
                     }
                 }
                 if !inflight_states.is_empty() {
-                    println!("  [{ts}] 📝 saved {} restart report(s) for inflight channels", inflight_states.len());
+                    let ts2 = chrono::Local::now().format("%H:%M:%S");
+                    println!("  [{ts2}] 📝 saved {} restart report(s) for inflight channels", inflight_states.len());
                 }
 
-                // Grace period for watchers to see cancel flag and exit cleanly
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                 std::process::exit(0);
             }
         }
