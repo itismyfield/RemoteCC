@@ -1,4 +1,26 @@
+use super::restart_report::{save_restart_report, RestartCompletionReport};
 use super::*;
+
+fn tail_with_ellipsis(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+
+    let keep = max_chars.saturating_sub(1);
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(keep)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("…{}", tail)
+}
 
 pub(super) fn cancel_active_token(token: &Arc<CancelToken>, cleanup_tmux: bool) {
     token.cancelled.store(true, Ordering::Relaxed);
@@ -43,6 +65,30 @@ pub(super) fn stale_inflight_message(saved_response: &str) -> String {
     }
 }
 
+fn is_dcserver_restart_command(input: &str) -> bool {
+    let lower = input.to_lowercase();
+
+    if lower.contains("--restart-dcserver") || lower.contains("restart_remotecc.sh") {
+        return true;
+    }
+
+    if lower.contains("remotecc-discord-smoke.sh") && lower.contains("--deploy-live") {
+        return true;
+    }
+
+    lower.contains("launchctl")
+        && lower.contains("com.itismyfield.remotecc.dcserver")
+        && (lower.contains("kickstart") || lower.contains("bootstrap") || lower.contains("bootout"))
+}
+
+fn should_resume_watcher_after_turn(
+    defer_watcher_resume: bool,
+    has_local_queued_turns: bool,
+    can_chain_locally: bool,
+) -> bool {
+    !defer_watcher_resume && !(has_local_queued_turns && can_chain_locally)
+}
+
 pub(super) struct TurnBridgeContext {
     pub(super) provider: ProviderKind,
     pub(super) channel_id: ChannelId,
@@ -54,12 +100,15 @@ pub(super) struct TurnBridgeContext {
     pub(super) token: Option<String>,
     pub(super) role_binding: Option<RoleBinding>,
     pub(super) pcd_session_key: Option<String>,
+    pub(super) pcd_session_name: Option<String>,
+    pub(super) pcd_session_info: Option<String>,
     pub(super) current_msg_id: MessageId,
-    pub(super) current_msg_len: usize,
     pub(super) response_sent_offset: usize,
     pub(super) full_response: String,
     pub(super) tmux_last_offset: Option<u64>,
     pub(super) new_session_id: Option<String>,
+    pub(super) defer_watcher_resume: bool,
+    pub(super) completion_tx: Option<tokio::sync::oneshot::Sender<()>>,
     pub(super) inflight_state: InflightTurnState,
 }
 
@@ -82,6 +131,8 @@ pub(super) fn spawn_turn_bridge(
         let token = bridge.token.clone();
         let role_binding = bridge.role_binding.clone();
         let pcd_session_key = bridge.pcd_session_key.clone();
+        let pcd_session_name = bridge.pcd_session_name.clone();
+        let pcd_session_info = bridge.pcd_session_info.clone();
 
         let mut full_response = bridge.full_response.clone();
         let mut last_edit_text = String::new();
@@ -91,11 +142,14 @@ pub(super) fn spawn_turn_bridge(
         let mut last_tool_name: Option<String> = None;
         let mut accumulated_tokens: u64 = 0;
         let mut spin_idx: usize = 0;
-        let mut current_msg_id = bridge.current_msg_id;
-        let mut current_msg_len = bridge.current_msg_len;
-        let mut response_sent_offset = bridge.response_sent_offset;
+        let mut restart_followup_pending = false;
+        let mut last_pcd_heartbeat = std::time::Instant::now();
+        let current_msg_id = bridge.current_msg_id;
+        let response_sent_offset = bridge.response_sent_offset;
         let mut tmux_last_offset = bridge.tmux_last_offset;
         let mut new_session_id = bridge.new_session_id.clone();
+        let defer_watcher_resume = bridge.defer_watcher_resume;
+        let completion_tx = bridge.completion_tx;
         let mut inflight_state = bridge.inflight_state.clone();
 
         let _ = save_inflight_state(&inflight_state);
@@ -135,6 +189,35 @@ pub(super) fn spawn_turn_bridge(
                             current_tool_line =
                                 Some(format!("⚙ {}: {}", name, truncate_str(&summary, 120)));
                             last_tool_name = Some(name.clone());
+                            if !restart_followup_pending && is_dcserver_restart_command(&input) {
+                                let mut report = RestartCompletionReport::new(
+                                    provider,
+                                    channel_id.get(),
+                                    "pending",
+                                    format!(
+                                        "dcserver restart requested by `{}`; 새 프로세스가 후속 보고를 이어받을 예정입니다.",
+                                        request_owner_name
+                                    ),
+                                );
+                                report.current_msg_id = Some(current_msg_id.get());
+                                if save_restart_report(&report).is_ok() {
+                                    restart_followup_pending = true;
+                                    let handoff_text =
+                                        "♻️ dcserver 재시작 중...\n\n새 dcserver가 이 메시지를 이어받는 중입니다.";
+                                    rate_limit_wait(&shared_owned, channel_id).await;
+                                    let _ = channel_id
+                                        .edit_message(
+                                            &http,
+                                            current_msg_id,
+                                            EditMessage::new().content(handoff_text),
+                                        )
+                                        .await;
+                                    last_edit_text = handoff_text.to_string();
+                                    inflight_state.current_msg_id = current_msg_id.get();
+                                    inflight_state.current_msg_len = handoff_text.len();
+                                    state_dirty = true;
+                                }
+                            }
                             if !full_response.is_empty() {
                                 let trimmed = full_response.trim_end();
                                 full_response.truncate(trimmed.len());
@@ -161,7 +244,7 @@ pub(super) fn spawn_turn_bridge(
                             result,
                             session_id: sid,
                         } => {
-                            if !result.is_empty() && full_response.is_empty() {
+                            if !result.is_empty() {
                                 full_response = result;
                                 inflight_state.full_response = full_response.clone();
                             }
@@ -218,6 +301,7 @@ pub(super) fn spawn_turn_bridge(
                                 let handle = TmuxWatcherHandle {
                                     paused: paused.clone(),
                                     resume_offset: resume_offset.clone(),
+                                    cancel: cancel.clone(),
                                 };
                                 shared_owned.tmux_watchers.insert(channel_id, handle);
                                 let http_bg = http.clone();
@@ -259,56 +343,28 @@ pub(super) fn spawn_turn_bridge(
             } else {
                 ""
             };
-            let display_text = if current_portion.is_empty() {
+            let footer = format!("\n\n{} {}", indicator, tool_status);
+            let body_budget = DISCORD_MSG_LIMIT.saturating_sub(footer.len() + 10);
+            let normalized = normalize_empty_lines(current_portion);
+            let stable_display_text = if current_portion.is_empty() {
                 format!("{} {}", indicator, tool_status)
             } else {
-                let normalized = normalize_empty_lines(current_portion);
-                let footer = format!("\n\n{} {}", indicator, tool_status);
-                let truncated = truncate_str(&normalized, DISCORD_MSG_LIMIT - footer.len() - 10);
-                format!("{}{}", truncated, footer)
+                let body = tail_with_ellipsis(&normalized, body_budget.max(1));
+                format!("{}{}", body, footer)
             };
 
-            if display_text != last_edit_text && !done {
-                if display_text.len() > DISCORD_MSG_LIMIT - 50 && current_msg_len > 100 {
-                    let normalized = normalize_empty_lines(current_portion);
-                    let finalize_text = truncate_str(&normalized, DISCORD_MSG_LIMIT - 10);
-                    current_msg_len = finalize_text.len();
-                    response_sent_offset = full_response.len();
-
-                    rate_limit_wait(&shared_owned, channel_id).await;
-                    let _ = channel_id
-                        .edit_message(
-                            &http,
-                            current_msg_id,
-                            EditMessage::new().content(&finalize_text),
-                        )
-                        .await;
-
-                    rate_limit_wait(&shared_owned, channel_id).await;
-                    if let Ok(new_msg) = channel_id
-                        .send_message(
-                            &http,
-                            CreateMessage::new().content(format!("{} Processing...", indicator)),
-                        )
-                        .await
-                    {
-                        current_msg_id = new_msg.id;
-                        current_msg_len = 0;
-                    }
-                } else {
-                    rate_limit_wait(&shared_owned, channel_id).await;
-                    let _ = channel_id
-                        .edit_message(
-                            &http,
-                            current_msg_id,
-                            EditMessage::new().content(&display_text),
-                        )
-                        .await;
-                    current_msg_len = display_text.len();
-                }
-                last_edit_text = display_text;
+            if stable_display_text != last_edit_text && !done {
+                rate_limit_wait(&shared_owned, channel_id).await;
+                let _ = channel_id
+                    .edit_message(
+                        &http,
+                        current_msg_id,
+                        EditMessage::new().content(&stable_display_text),
+                    )
+                    .await;
+                last_edit_text = stable_display_text;
                 inflight_state.current_msg_id = current_msg_id.get();
-                inflight_state.current_msg_len = current_msg_len;
+                inflight_state.current_msg_len = last_edit_text.len();
                 inflight_state.response_sent_offset = response_sent_offset;
                 inflight_state.full_response = full_response.clone();
                 state_dirty = true;
@@ -317,39 +373,51 @@ pub(super) fn spawn_turn_bridge(
             if state_dirty {
                 let _ = save_inflight_state(&inflight_state);
             }
-        }
 
-        if let Some(offset) = tmux_last_offset {
-            if let Some(watcher) = shared_owned.tmux_watchers.get(&channel_id) {
-                if let Ok(mut guard) = watcher.resume_offset.lock() {
-                    *guard = Some(offset);
-                }
-                watcher.paused.store(false, Ordering::Relaxed);
+            if last_pcd_heartbeat.elapsed() >= std::time::Duration::from_secs(30) {
+                post_pcd_session_status(
+                    pcd_session_key.as_deref(),
+                    pcd_session_name.as_deref(),
+                    Some(provider.as_str()),
+                    "working",
+                    provider,
+                    pcd_session_info.as_deref(),
+                    None,
+                )
+                .await;
+                last_pcd_heartbeat = std::time::Instant::now();
             }
         }
 
         post_pcd_session_status(
             pcd_session_key.as_deref(),
+            pcd_session_name.as_deref(),
+            Some(provider.as_str()),
             "idle",
             provider,
+            None,
             (accumulated_tokens > 0).then_some(accumulated_tokens),
         )
         .await;
 
-        let queued_commands: Vec<String> = {
+        let can_chain_locally =
+            serenity_ctx.is_some() && request_owner.is_some() && token.is_some();
+        let has_queued_turns = {
             let mut data = shared_owned.core.lock().await;
             data.cancel_tokens.remove(&channel_id);
             data.active_request_owner.remove(&channel_id);
-
-            let queued = data
-                .intervention_queue
-                .remove(&channel_id)
-                .unwrap_or_default();
-            queued
-                .into_iter()
-                .filter(|i| i.mode == InterventionMode::Soft)
-                .map(|i| i.text)
-                .collect()
+            let mut remove_queue = false;
+            let has_pending = if let Some(queue) = data.intervention_queue.get_mut(&channel_id) {
+                let has_pending = super::has_soft_intervention(queue);
+                remove_queue = queue.is_empty();
+                has_pending
+            } else {
+                false
+            };
+            if remove_queue {
+                data.intervention_queue.remove(&channel_id);
+            }
+            has_pending
         };
 
         remove_reaction_raw(&http, channel_id, user_msg_id, '⏳').await;
@@ -369,13 +437,14 @@ pub(super) fn spawn_turn_bridge(
             };
 
             rate_limit_wait(&shared_owned, channel_id).await;
-            let _ = channel_id
-                .edit_message(
-                    &http,
-                    current_msg_id,
-                    EditMessage::new().content(truncate_str(&full_response, DISCORD_MSG_LIMIT)),
-                )
-                .await;
+            let _ = super::formatting::replace_long_message_raw(
+                &http,
+                channel_id,
+                current_msg_id,
+                &full_response,
+                &shared_owned,
+            )
+            .await;
 
             add_reaction_raw(&http, channel_id, user_msg_id, '🛑').await;
 
@@ -387,28 +456,34 @@ pub(super) fn spawn_turn_bridge(
             }
 
             full_response = format_for_discord(&full_response);
-
-            rate_limit_wait(&shared_owned, channel_id).await;
-            let _ = channel_id.delete_message(&http, current_msg_id).await;
-
-            if let Err(e) =
-                send_long_message_raw(&http, channel_id, &full_response, &shared_owned).await
-            {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                println!("  [{ts}]   ⚠ send_long_message failed: {e}");
-                rate_limit_wait(&shared_owned, channel_id).await;
-                let _ = channel_id
-                    .send_message(
-                        &http,
-                        CreateMessage::new().content(truncate_str(&full_response, DISCORD_MSG_LIMIT)),
-                    )
-                    .await;
-            }
+            let _ = super::formatting::replace_long_message_raw(
+                &http,
+                channel_id,
+                current_msg_id,
+                &full_response,
+                &shared_owned,
+            )
+            .await;
 
             add_reaction_raw(&http, channel_id, user_msg_id, '✅').await;
 
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!("  [{ts}] ▶ Response sent");
+        }
+
+        if should_resume_watcher_after_turn(
+            defer_watcher_resume,
+            has_queued_turns,
+            can_chain_locally,
+        ) {
+            if let Some(offset) = tmux_last_offset {
+                if let Some(watcher) = shared_owned.tmux_watchers.get(&channel_id) {
+                    if let Ok(mut guard) = watcher.resume_offset.lock() {
+                        *guard = Some(offset);
+                    }
+                    watcher.paused.store(false, Ordering::Relaxed);
+                }
+            }
         }
 
         {
@@ -453,31 +528,88 @@ pub(super) fn spawn_turn_bridge(
         clear_inflight_state(provider, channel_id.get());
         shared_owned.recovering_channels.remove(&channel_id);
 
-        if !queued_commands.is_empty() {
+        if has_queued_turns {
             if let (Some(ctx), Some(owner), Some(tok)) =
                 (serenity_ctx.as_ref(), request_owner, token.as_deref())
             {
-                let cmd_count = queued_commands.len();
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                println!("  [{ts}] 📋 Processing {cmd_count} queued command(s)");
-                for cmd in queued_commands {
+                let (next_intervention, has_more_queued_turns) = {
+                    let mut data = shared_owned.core.lock().await;
+                    let mut remove_queue = false;
+                    let next = if let Some(queue) = data.intervention_queue.get_mut(&channel_id) {
+                        let next = super::dequeue_next_soft_intervention(queue);
+                        let has_more = super::has_soft_intervention(queue);
+                        remove_queue = queue.is_empty();
+                        (next, has_more)
+                    } else {
+                        (None, false)
+                    };
+                    if remove_queue {
+                        data.intervention_queue.remove(&channel_id);
+                    }
+                    next
+                };
+
+                if let Some(intervention) = next_intervention {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    println!("  [{ts}] 📋 Processing next queued command");
                     if let Err(e) = handle_text_message(
                         ctx,
                         channel_id,
-                        user_msg_id,
+                        intervention.message_id,
                         owner,
                         &request_owner_name,
-                        &cmd,
+                        &intervention.text,
                         &shared_owned,
                         tok,
+                        true,
+                        has_more_queued_turns,
+                        true,
                     )
                     .await
                     {
                         let ts = chrono::Local::now().format("%H:%M:%S");
                         println!("  [{ts}]   ⚠ queued command failed: {e}");
+                        let mut data = shared_owned.core.lock().await;
+                        let queue = data.intervention_queue.entry(channel_id).or_default();
+                        super::requeue_intervention_front(queue, intervention);
+                    }
+                }
+            } else {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!("  [{ts}] 📦 preserving queued command(s): missing live Discord context");
+                if let Some(offset) = tmux_last_offset {
+                    if let Some(watcher) = shared_owned.tmux_watchers.get(&channel_id) {
+                        if let Ok(mut guard) = watcher.resume_offset.lock() {
+                            *guard = Some(offset);
+                        }
+                        watcher.paused.store(false, Ordering::Relaxed);
                     }
                 }
             }
         }
+
+        if let Some(tx) = completion_tx {
+            let _ = tx.send(());
+        }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_resume_watcher_after_turn;
+
+    #[test]
+    fn chained_batch_mid_turn_keeps_watcher_paused() {
+        assert!(!should_resume_watcher_after_turn(true, false, false));
+    }
+
+    #[test]
+    fn locally_chainable_queue_keeps_watcher_paused() {
+        assert!(!should_resume_watcher_after_turn(false, true, true));
+    }
+
+    #[test]
+    fn final_turn_without_remaining_queue_resumes_watcher() {
+        assert!(should_resume_watcher_after_turn(false, false, true));
+    }
 }

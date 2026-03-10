@@ -1002,6 +1002,8 @@ Keep responses concise and terminal-friendly.",
                 None,
                 remote_profile.as_ref(),
                 None, // no tmux for TUI (user is already at terminal)
+                None,
+                None,
             );
 
             let elapsed = start_time.elapsed();

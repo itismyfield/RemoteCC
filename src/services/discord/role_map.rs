@@ -2,7 +2,7 @@ use std::fs;
 
 use poise::serenity_prelude::ChannelId;
 
-use super::meeting::{MeetingAgentConfig, MeetingConfig};
+use super::meeting::{MeetingAgentConfig, MeetingConfig, SummaryAgentConfig, SummaryAgentRule};
 use super::runtime_store::role_map_path;
 use super::settings::{PeerAgentInfo, RoleBinding};
 use crate::services::provider::ProviderKind;
@@ -133,6 +133,39 @@ pub(super) fn load_peer_agents() -> Vec<PeerAgentInfo> {
     result
 }
 
+fn parse_summary_agent_config(value: &serde_json::Value) -> Option<SummaryAgentConfig> {
+    // Backward-compatible: accept plain string
+    if let Some(s) = value.as_str() {
+        return Some(SummaryAgentConfig::Static(s.to_string()));
+    }
+
+    // Rule-based: { "rules": [...], "default": "..." }
+    let obj = value.as_object()?;
+    let default_agent = obj.get("default")?.as_str()?.to_string();
+    let rules_arr = obj.get("rules").and_then(|v| v.as_array());
+    let mut rules = Vec::new();
+    if let Some(arr) = rules_arr {
+        for rule in arr {
+            let agent = rule.get("agent").and_then(|v| v.as_str());
+            let keywords = rule.get("keywords").and_then(|v| v.as_array()).map(|kws| {
+                kws.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect::<Vec<_>>()
+            });
+            if let (Some(agent), Some(keywords)) = (agent, keywords) {
+                rules.push(SummaryAgentRule {
+                    keywords,
+                    agent: agent.to_string(),
+                });
+            }
+        }
+    }
+    Some(SummaryAgentConfig::Dynamic {
+        rules,
+        default: default_agent,
+    })
+}
+
 pub(super) fn load_meeting_config() -> Option<MeetingConfig> {
     let json = load_role_map_json()?;
     let meeting = json.get("meeting")?;
@@ -142,7 +175,7 @@ pub(super) fn load_meeting_config() -> Option<MeetingConfig> {
         .get("max_rounds")
         .and_then(|v| v.as_u64())
         .unwrap_or(3) as u32;
-    let summary_agent = meeting.get("summary_agent")?.as_str()?.to_string();
+    let summary_agent = parse_summary_agent_config(meeting.get("summary_agent")?)?;
 
     let agents_arr = meeting.get("available_agents")?.as_array()?;
     let mut available_agents = Vec::new();

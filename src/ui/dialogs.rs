@@ -4469,8 +4469,6 @@ fn draw_remote_connect_dialog(frame: &mut Frame, app: &App, area: Rect, theme: &
 
 /// Handle input for the remote connect dialog
 fn handle_remote_connect_input(app: &mut App, code: KeyCode) -> bool {
-    
-
     if app.remote_connect_state.is_none() {
         app.dialog = None;
         return false;

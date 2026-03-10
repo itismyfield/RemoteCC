@@ -97,6 +97,28 @@ Minimum release bar for changes in `src/services/tmux_wrapper.rs`, `src/services
 - If wrapper code changed, include `--reset-wrappers` so old tmux sessions do not keep the stale binary.
 - After deploy, send one short Korean prompt in `#mac-mini` and confirm an actual Discord reply.
 
+## Preview Recovery Stress Test
+
+Use this before trusting restart and inflight auto-recovery changes:
+
+```bash
+cd /Users/itismyfield/remotecc
+REMOTECC_TEST_SENDER_TOKEN='***' scripts/preview-recovery-stress.sh --iterations 10
+```
+
+To make it a stable deploy gate inside the live smoke flow:
+
+```bash
+cd /Users/itismyfield/remotecc
+REMOTECC_TEST_SENDER_TOKEN='***' scripts/remotecc-discord-smoke.sh --deploy-live --preview-recovery-stress --preview-iterations 10
+```
+
+See `scripts/preview-recovery-checklist.md` for:
+
+- preconditions
+- pass/fail criteria
+- where to inspect preview inflight/log/output artifacts
+
 ## Supported Platforms
 
 - macOS (Apple Silicon & Intel)

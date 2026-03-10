@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use poise::serenity_prelude::ChannelId;
 use serde::{Deserialize, Serialize};
 
-use crate::services::provider::ProviderKind;
 use super::runtime_store::{atomic_write, shared_agent_memory_root};
+use crate::services::provider::ProviderKind;
 
 const SHARED_MEMORY_VERSION: u32 = 1;
 const MAX_STORED_TURNS: usize = 40;

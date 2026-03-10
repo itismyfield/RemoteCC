@@ -7,8 +7,13 @@ use std::sync::mpsc::Sender;
 use std::sync::OnceLock;
 
 use crate::services::claude::{
-    self, read_output_file_until_result, shell_escape, CancelToken, ReadOutputResult, StreamMessage,
+    self, process_stream_line, read_output_file_until_result, shell_escape, CancelToken,
+    ReadOutputResult, StreamLineState, StreamMessage,
 };
+use crate::services::discord::restart_report::{
+    RESTART_REPORT_CHANNEL_ENV, RESTART_REPORT_PROVIDER_ENV,
+};
+use crate::services::provider::ProviderKind;
 use crate::services::remote::RemoteProfile;
 
 static CODEX_PATH: OnceLock<Option<String>> = OnceLock::new();
@@ -38,6 +43,25 @@ fn resolve_codex_path() -> Option<String> {
 
 fn get_codex_path() -> Option<&'static str> {
     CODEX_PATH.get_or_init(resolve_codex_path).as_deref()
+}
+
+fn current_tmux_owner_marker() -> String {
+    std::env::var("REMOTECC_ROOT_DIR")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| dirs::home_dir().map(|home| home.join(".remotecc").display().to_string()))
+        .unwrap_or_else(|| ".remotecc".to_string())
+}
+
+fn tmux_owner_path(tmux_session_name: &str) -> String {
+    format!("/tmp/remotecc-{}.owner", tmux_session_name)
+}
+
+fn write_tmux_owner_marker(tmux_session_name: &str) -> Result<(), String> {
+    let owner_path = tmux_owner_path(tmux_session_name);
+    std::fs::write(&owner_path, current_tmux_owner_marker())
+        .map_err(|e| format!("Failed to write tmux owner marker: {}", e))
 }
 
 pub fn execute_command_simple(prompt: &str) -> Result<String, String> {
@@ -112,12 +136,41 @@ pub fn execute_command_streaming(
     cancel_token: Option<std::sync::Arc<CancelToken>>,
     remote_profile: Option<&RemoteProfile>,
     tmux_session_name: Option<&str>,
+    report_channel_id: Option<u64>,
+    report_provider: Option<ProviderKind>,
 ) -> Result<(), String> {
-    if remote_profile.is_some() {
-        return Err("Codex remote profiles are not implemented yet.".to_string());
-    }
-
     let prompt = compose_codex_prompt(prompt, system_prompt, allowed_tools);
+
+    if let Some(profile) = remote_profile {
+        let use_remote_tmux = tmux_session_name.is_some()
+            && std::env::var("REMOTECC_CODEX_REMOTE_TMUX")
+                .map(|value| {
+                    let normalized = value.trim().to_ascii_lowercase();
+                    normalized == "1" || normalized == "true" || normalized == "yes"
+                })
+                .unwrap_or(false);
+        if use_remote_tmux {
+            let tmux_name = tmux_session_name.expect("checked is_some above");
+            return execute_streaming_remote_tmux(
+                profile,
+                &prompt,
+                working_dir,
+                sender,
+                cancel_token,
+                tmux_name,
+                report_channel_id,
+                report_provider,
+            );
+        }
+        return execute_streaming_remote_direct(
+            profile,
+            session_id,
+            &prompt,
+            working_dir,
+            sender,
+            cancel_token,
+        );
+    }
 
     if let Some(tmux_name) = tmux_session_name {
         if claude::is_tmux_available() {
@@ -127,11 +180,21 @@ pub fn execute_command_streaming(
                 sender,
                 cancel_token,
                 tmux_name,
+                report_channel_id,
+                report_provider,
             );
         }
     }
 
-    execute_streaming_direct(&prompt, session_id, working_dir, sender, cancel_token)
+    execute_streaming_direct(
+        &prompt,
+        session_id,
+        working_dir,
+        sender,
+        cancel_token,
+        report_channel_id,
+        report_provider,
+    )
 }
 
 fn compose_codex_prompt(
@@ -173,26 +236,34 @@ fn execute_streaming_direct(
     working_dir: &str,
     sender: Sender<StreamMessage>,
     cancel_token: Option<std::sync::Arc<CancelToken>>,
+    report_channel_id: Option<u64>,
+    report_provider: Option<ProviderKind>,
 ) -> Result<(), String> {
     let codex_bin = get_codex_path().ok_or_else(|| "Codex CLI not found".to_string())?;
     let args = base_exec_args(session_id, prompt);
 
-    let mut child = Command::new(codex_bin)
+    let mut command = Command::new(codex_bin);
+    command
         .args(&args)
         .current_dir(working_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(channel_id) = report_channel_id {
+        command.env(RESTART_REPORT_CHANNEL_ENV, channel_id.to_string());
+    }
+    if let Some(provider) = report_provider {
+        command.env(RESTART_REPORT_PROVIDER_ENV, provider.as_str());
+    }
+
+    let mut child = command
         .spawn()
         .map_err(|e| format!("Failed to start Codex: {}", e))?;
 
     if let Some(ref token) = cancel_token {
         *token.child_pid.lock().unwrap() = Some(child.id());
         // Race condition fix: if /stop arrived before PID was stored, kill now
-        if token
-            .cancelled
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if token.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
             claude::kill_child_tree(&mut child);
             let _ = child.wait();
             return Ok(());
@@ -264,16 +335,579 @@ fn execute_streaming_direct(
     Ok(())
 }
 
+fn execute_streaming_remote_direct(
+    profile: &RemoteProfile,
+    session_id: Option<&str>,
+    prompt: &str,
+    working_dir: &str,
+    sender: Sender<StreamMessage>,
+    cancel_token: Option<std::sync::Arc<CancelToken>>,
+) -> Result<(), String> {
+    use crate::services::remote::{RemoteAuth, SshHandler};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|e| format!("Failed to create tokio runtime: {}", e))?;
+
+    let profile = profile.clone();
+    let args = base_exec_args(session_id, prompt);
+    let working_dir = working_dir.to_string();
+
+    let ssh_cancel_flag = Arc::new(AtomicBool::new(false));
+    if let Some(ref token) = cancel_token {
+        *token.ssh_cancel.lock().unwrap() = Some(ssh_cancel_flag.clone());
+    }
+
+    let ssh_cancel = ssh_cancel_flag.clone();
+    let cancel_token_inner = cancel_token.clone();
+
+    runtime.block_on(async move {
+        let config = russh::client::Config {
+            inactivity_timeout: Some(std::time::Duration::from_secs(3600)),
+            keepalive_interval: Some(std::time::Duration::from_secs(30)),
+            keepalive_max: 10,
+            ..Default::default()
+        };
+
+        let mut ssh = russh::client::connect(
+            Arc::new(config),
+            (profile.host.as_str(), profile.port),
+            SshHandler,
+        )
+        .await
+        .map_err(|e| format!("SSH connection failed: {}", e))?;
+
+        let auth_result = match &profile.auth {
+            RemoteAuth::Password { password } => {
+                ssh.authenticate_password(&profile.user, password)
+                    .await
+                    .map_err(|e| format!("Password auth failed: {}", e))?
+            }
+            RemoteAuth::KeyFile { path, passphrase } => {
+                let key_path = if path.starts_with('~') {
+                    if let Some(home) = dirs::home_dir() {
+                        home.join(path.trim_start_matches('~').trim_start_matches('/'))
+                    } else {
+                        std::path::PathBuf::from(path)
+                    }
+                } else {
+                    std::path::PathBuf::from(path)
+                };
+
+                let key_pair = if let Some(pass) = passphrase {
+                    russh_keys::load_secret_key(&key_path, Some(pass))
+                        .map_err(|e| format!("Failed to load key: {}", e))?
+                } else {
+                    russh_keys::load_secret_key(&key_path, None)
+                        .map_err(|e| format!("Failed to load key: {}", e))?
+                };
+
+                ssh.authenticate_publickey(&profile.user, Arc::new(key_pair))
+                    .await
+                    .map_err(|e| format!("Key auth failed: {}", e))?
+            }
+        };
+
+        if !auth_result {
+            return Err("Authentication rejected by server".to_string());
+        }
+
+        eprintln!("  [remote-codex] SSH authenticated");
+
+        let mut channel = ssh
+            .channel_open_session()
+            .await
+            .map_err(|e| format!("Failed to open channel: {}", e))?;
+
+        let escaped_args: Vec<String> = args.iter().map(|arg| shell_escape(arg)).collect();
+        let cd_part = if working_dir == "~" {
+            String::new()
+        } else if working_dir.starts_with("~/") {
+            format!("cd {} && ", working_dir)
+        } else {
+            format!("cd {} && ", shell_escape(&working_dir))
+        };
+        let cmd = format!(
+            "{{ [ -f ~/.zshrc ] && source ~/.zshrc; [ -f ~/.bashrc ] && source ~/.bashrc; }} 2>/dev/null; {}codex {}",
+            cd_part,
+            escaped_args.join(" ")
+        );
+
+        eprintln!("  [remote-codex] exec direct codex over SSH ...");
+        channel
+            .exec(true, cmd)
+            .await
+            .map_err(|e| format!("Failed to exec remote Codex: {}", e))?;
+        let _ = channel.eof().await;
+
+        let mut line_buf = Vec::new();
+        let mut stderr_buf = Vec::new();
+        let mut exit_status: Option<u32> = None;
+        let mut current_thread_id = session_id.map(str::to_string);
+        let mut final_text = String::new();
+        let mut saw_done = false;
+        let started_at = std::time::Instant::now();
+
+        while let Some(msg) = channel.wait().await {
+            if let Some(ref token) = cancel_token_inner {
+                if token.cancelled.load(Ordering::Relaxed) {
+                    ssh_cancel.store(true, Ordering::Relaxed);
+                    let _ = channel.close().await;
+                    return Ok(());
+                }
+            }
+
+            match msg {
+                russh::ChannelMsg::Data { ref data } => {
+                    line_buf.extend_from_slice(data);
+                    while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
+                        let line_bytes: Vec<u8> = line_buf.drain(..=pos).collect();
+                        if let Ok(line) = String::from_utf8(line_bytes) {
+                            let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+                            if let Some(done) = handle_codex_json_line(
+                                trimmed,
+                                &sender,
+                                &mut current_thread_id,
+                                &mut final_text,
+                                started_at,
+                            )? {
+                                saw_done = saw_done || done;
+                            }
+                        }
+                    }
+                }
+                russh::ChannelMsg::ExtendedData { data, ext } => {
+                    if ext == 1 {
+                        stderr_buf.extend_from_slice(&data);
+                    }
+                }
+                russh::ChannelMsg::ExitStatus { exit_status: s } => {
+                    exit_status = Some(s);
+                }
+                _ => {}
+            }
+        }
+
+        if !line_buf.is_empty() {
+            if let Ok(line) = String::from_utf8(line_buf) {
+                let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+                if let Some(done) = handle_codex_json_line(
+                    trimmed,
+                    &sender,
+                    &mut current_thread_id,
+                    &mut final_text,
+                    started_at,
+                )? {
+                    saw_done = saw_done || done;
+                }
+            }
+        }
+
+        let stderr = String::from_utf8_lossy(&stderr_buf).trim().to_string();
+        let success = exit_status.map_or(true, |status| status == 0);
+        if !success && !saw_done {
+            let message = if stderr.is_empty() {
+                format!("Remote Codex exited with code {:?}", exit_status)
+            } else {
+                stderr.clone()
+            };
+            let _ = sender.send(StreamMessage::Error {
+                message,
+                stdout: String::new(),
+                stderr,
+                exit_code: exit_status.map(|status| status as i32),
+            });
+            return Ok(());
+        }
+
+        if !saw_done {
+            let _ = sender.send(StreamMessage::Done {
+                result: final_text,
+                session_id: current_thread_id,
+            });
+        }
+
+        Ok(())
+    })
+}
+
+fn execute_streaming_remote_tmux(
+    profile: &RemoteProfile,
+    prompt: &str,
+    working_dir: &str,
+    sender: Sender<StreamMessage>,
+    cancel_token: Option<std::sync::Arc<CancelToken>>,
+    tmux_session_name: &str,
+    report_channel_id: Option<u64>,
+    report_provider: Option<ProviderKind>,
+) -> Result<(), String> {
+    use crate::services::remote::{RemoteAuth, SshHandler};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|e| format!("Failed to create tokio runtime: {}", e))?;
+
+    let profile = profile.clone();
+    let prompt = prompt.to_string();
+    let working_dir = working_dir.to_string();
+    let tmux_name = tmux_session_name.to_string();
+
+    let ssh_cancel_flag = Arc::new(AtomicBool::new(false));
+    if let Some(ref token) = cancel_token {
+        *token.ssh_cancel.lock().unwrap() = Some(ssh_cancel_flag.clone());
+        *token.tmux_session.lock().unwrap() = Some(tmux_name.clone());
+    }
+
+    let ssh_cancel = ssh_cancel_flag.clone();
+    let cancel_token_inner = cancel_token.clone();
+
+    runtime.block_on(async move {
+        let config = russh::client::Config {
+            inactivity_timeout: Some(std::time::Duration::from_secs(3600)),
+            keepalive_interval: Some(std::time::Duration::from_secs(30)),
+            keepalive_max: 10,
+            ..Default::default()
+        };
+
+        let mut ssh = russh::client::connect(
+            Arc::new(config),
+            (profile.host.as_str(), profile.port),
+            SshHandler,
+        )
+        .await
+        .map_err(|e| format!("SSH connection failed: {}", e))?;
+
+        let auth_result = match &profile.auth {
+            RemoteAuth::Password { password } => {
+                ssh.authenticate_password(&profile.user, password)
+                    .await
+                    .map_err(|e| format!("Password auth failed: {}", e))?
+            }
+            RemoteAuth::KeyFile { path, passphrase } => {
+                let key_path = if path.starts_with('~') {
+                    if let Some(home) = dirs::home_dir() {
+                        home.join(path.trim_start_matches('~').trim_start_matches('/'))
+                    } else {
+                        std::path::PathBuf::from(path)
+                    }
+                } else {
+                    std::path::PathBuf::from(path)
+                };
+
+                let key_pair = if let Some(pass) = passphrase {
+                    russh_keys::load_secret_key(&key_path, Some(pass))
+                        .map_err(|e| format!("Failed to load key: {}", e))?
+                } else {
+                    russh_keys::load_secret_key(&key_path, None)
+                        .map_err(|e| format!("Failed to load key: {}", e))?
+                };
+
+                ssh.authenticate_publickey(&profile.user, Arc::new(key_pair))
+                    .await
+                    .map_err(|e| format!("Key auth failed: {}", e))?
+            }
+        };
+
+        if !auth_result {
+            return Err("Authentication rejected by server".to_string());
+        }
+
+        eprintln!("  [remote-codex-tmux] SSH authenticated");
+
+        let codex_bin = "codex";
+        let cd_part = if working_dir == "~" {
+            String::new()
+        } else if working_dir.starts_with("~/") {
+            format!("cd {} && ", working_dir)
+        } else {
+            format!("cd {} && ", shell_escape(&working_dir))
+        };
+
+        let output_path = format!("/tmp/remotecc-{}.jsonl", tmux_name);
+        let input_fifo_path = format!("/tmp/remotecc-{}.input", tmux_name);
+        let prompt_path = format!("/tmp/remotecc-{}.prompt", tmux_name);
+        let script_path = format!("/tmp/remotecc-{}.sh", tmux_name);
+
+        let mut wrapper_env_prefix = vec![
+            "env".to_string(),
+            "-u".to_string(),
+            "CLAUDECODE".to_string(),
+        ];
+        if let Some(channel_id) = report_channel_id {
+            wrapper_env_prefix.push(format!(
+                "{}={}",
+                RESTART_REPORT_CHANNEL_ENV,
+                shell_escape(&channel_id.to_string())
+            ));
+        }
+        if let Some(provider) = report_provider {
+            wrapper_env_prefix.push(format!(
+                "{}={}",
+                RESTART_REPORT_PROVIDER_ENV,
+                shell_escape(provider.as_str())
+            ));
+        }
+
+        let script_content = format!(
+            "#!/bin/bash\n\
+            {{ [ -f ~/.zshrc ] && source ~/.zshrc; [ -f ~/.bashrc ] && source ~/.bashrc; }} 2>/dev/null\n\
+            exec {} remotecc --codex-tmux-wrapper \\\n  \
+            --output-file {output} \\\n  \
+            --input-fifo {input_fifo} \\\n  \
+            --prompt-file {prompt} \\\n  \
+            --cwd {wd} \\\n  \
+            --codex-bin {codex_bin}\n",
+            wrapper_env_prefix.join(" "),
+            output = shell_escape(&output_path),
+            input_fifo = shell_escape(&input_fifo_path),
+            prompt = shell_escape(&prompt_path),
+            wd = shell_escape(&working_dir),
+            codex_bin = shell_escape(codex_bin),
+        );
+
+        let prompt_b64 = BASE64_STANDARD.encode(prompt.as_bytes());
+        let script_b64 = BASE64_STANDARD.encode(script_content.as_bytes());
+
+        let mut force_recreate = false;
+        let mut retried_after_missing_output = false;
+
+        loop {
+            let is_followup;
+            {
+                let mut setup_channel = ssh
+                    .channel_open_session()
+                    .await
+                    .map_err(|e| format!("Failed to open setup channel: {}", e))?;
+
+                let force_cleanup = if force_recreate {
+                    format!(
+                        r#"if tmux has-session -t {name} 2>/dev/null; then \
+                            tmux kill-session -t {name} 2>/dev/null; \
+                        fi; \
+                        pkill -f 'tail -f {output}' 2>/dev/null; \
+                        pkill -f 'tail -F {output}' 2>/dev/null; \
+                        rm -f {output} {input_fifo} {prompt} {script} 2>/dev/null; \
+                        "#,
+                        name = shell_escape(&tmux_name),
+                        output = shell_escape(&output_path),
+                        input_fifo = shell_escape(&input_fifo_path),
+                        prompt = shell_escape(&prompt_path),
+                        script = shell_escape(&script_path),
+                    )
+                } else {
+                    String::new()
+                };
+
+                let setup_cmd = format!(
+                    r#"{{ [ -f ~/.zshrc ] && source ~/.zshrc; [ -f ~/.bashrc ] && source ~/.bashrc; }} 2>/dev/null; \
+                    {cd}{force_cleanup}if tmux has-session -t {name} 2>/dev/null; then \
+                        _PANE_DEAD=$(tmux list-panes -t {name} -F '#{{pane_dead}}' 2>/dev/null | head -1); \
+                        _HAS_OUTPUT=0; [ -f {output} ] && _HAS_OUTPUT=1; \
+                        _HAS_FIFO=0; [ -p {input_fifo} ] && _HAS_FIFO=1; \
+                        if [ "$_PANE_DEAD" = "1" ] || [ "$_HAS_OUTPUT" != "1" ] || [ "$_HAS_FIFO" != "1" ]; then \
+                            tmux kill-session -t {name} 2>/dev/null; \
+                            pkill -f 'tail -f {output}' 2>/dev/null; \
+                            pkill -f 'tail -F {output}' 2>/dev/null; \
+                            rm -f {output} {input_fifo} {prompt} {script} 2>/dev/null; \
+                        fi; \
+                    fi; \
+                    if tmux has-session -t {name} 2>/dev/null; then \
+                        echo 'FOLLOWUP'; \
+                        OFFSET=$(wc -c < {output} 2>/dev/null || echo 0); \
+                        echo "$OFFSET"; \
+                        echo '{prompt_b64}' | base64 -d > {input_fifo}; \
+                    else \
+                        echo '{prompt_b64}' | base64 -d > {prompt} && \
+                        rm -f {output} {input_fifo} && touch {output} && mkfifo {input_fifo} && \
+                        echo '{script_b64}' | base64 -d > {script} && chmod +x {script} && \
+                        tmux new-session -d -s {name} {script} && \
+                        echo 'NEW' || echo 'FAILED'; \
+                    fi"#,
+                    cd = cd_part,
+                    force_cleanup = force_cleanup,
+                    name = shell_escape(&tmux_name),
+                    output = shell_escape(&output_path),
+                    input_fifo = shell_escape(&input_fifo_path),
+                    prompt = shell_escape(&prompt_path),
+                    prompt_b64 = prompt_b64,
+                    script_b64 = script_b64,
+                    script = shell_escape(&script_path),
+                );
+
+                eprintln!(
+                    "  [remote-codex-tmux] Phase 1: setup ({} bytes)...",
+                    setup_cmd.len()
+                );
+                setup_channel
+                    .exec(true, setup_cmd)
+                    .await
+                    .map_err(|e| format!("Failed to exec setup: {}", e))?;
+                let _ = setup_channel.eof().await;
+
+                let mut setup_output = Vec::new();
+                while let Some(msg) = setup_channel.wait().await {
+                    if let russh::ChannelMsg::Data { ref data } = msg {
+                        setup_output.extend_from_slice(data);
+                    }
+                }
+                let setup_str = String::from_utf8_lossy(&setup_output).to_string();
+                let setup_lines: Vec<&str> = setup_str.trim().lines().collect();
+                eprintln!("  [remote-codex-tmux] Setup result: {:?}", setup_lines);
+
+                is_followup = setup_lines.first().map_or(false, |l| *l == "FOLLOWUP");
+                if setup_lines.first().map_or(true, |l| *l == "FAILED") && !is_followup {
+                    return Err("Failed to create tmux session on remote".to_string());
+                }
+            }
+            let mut stream_channel = ssh
+                .channel_open_session()
+                .await
+                .map_err(|e| format!("Failed to open stream channel: {}", e))?;
+
+            let stream_cmd = format!(
+                r#"{{ [ -f ~/.zshrc ] && source ~/.zshrc; [ -f ~/.bashrc ] && source ~/.bashrc; }} 2>/dev/null; \
+                _WAIT_OK=0; \
+                for _ in $(seq 1 100); do \
+                    if [ -f {output} ]; then \
+                        _WAIT_OK=1; \
+                        break; \
+                    fi; \
+                    sleep 0.1; \
+                done; \
+                if [ "$_WAIT_OK" != "1" ]; then \
+                    echo "tail: {output}: No such file or directory" >&2; \
+                    exit 1; \
+                fi; \
+                exec tail -f {output}"#,
+                output = shell_escape(&output_path),
+            );
+
+            eprintln!("  [remote-codex-tmux] Phase 2: waiting for output then tail -f ...");
+            stream_channel
+                .exec(true, stream_cmd)
+                .await
+                .map_err(|e| format!("Failed to exec stream: {}", e))?;
+            let _ = stream_channel.eof().await;
+
+            let mut line_buf = Vec::new();
+            let mut stderr_buf = Vec::new();
+            let mut exit_status: Option<u32> = None;
+            let mut line_state = StreamLineState::new();
+
+            while let Some(msg) = stream_channel.wait().await {
+                if let Some(ref token) = cancel_token_inner {
+                    if token.cancelled.load(Ordering::Relaxed) {
+                        ssh_cancel.store(true, Ordering::Relaxed);
+                        let _ = stream_channel.close().await;
+                        return Ok(());
+                    }
+                }
+
+                match msg {
+                    russh::ChannelMsg::Data { ref data } => {
+                        line_buf.extend_from_slice(data);
+                        while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
+                            let line_bytes: Vec<u8> = line_buf.drain(..=pos).collect();
+                            if let Ok(line) = String::from_utf8(line_bytes) {
+                                let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+                                if !process_stream_line(trimmed, &sender, &mut line_state) {
+                                    let _ = stream_channel.close().await;
+                                    return Ok(());
+                                }
+                                if line_state.final_result.is_some() {
+                                    let _ = stream_channel.close().await;
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                    russh::ChannelMsg::ExtendedData { data, ext } => {
+                        if ext == 1 {
+                            stderr_buf.extend_from_slice(&data);
+                        }
+                    }
+                    russh::ChannelMsg::ExitStatus { exit_status: s } => {
+                        exit_status = Some(s);
+                    }
+                    _ => {}
+                }
+            }
+
+            if !line_buf.is_empty() {
+                if let Ok(line) = String::from_utf8(line_buf) {
+                    let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+                    let _ = process_stream_line(trimmed, &sender, &mut line_state);
+                }
+            }
+
+            let stderr_msg = String::from_utf8_lossy(&stderr_buf).to_string();
+            eprintln!(
+                "  [remote-codex-tmux] Stream ended. exit_status={:?}, stderr_len={}, has_result={}",
+                exit_status,
+                stderr_msg.len(),
+                line_state.final_result.is_some()
+            );
+            if !stderr_msg.is_empty() {
+                eprintln!("  [remote-codex-tmux] stderr: {}", stderr_msg);
+            }
+
+            let missing_output_after_followup = is_followup
+                && !retried_after_missing_output
+                && line_state.final_result.is_none()
+                && line_state.stdout_error.is_none()
+                && stderr_msg.contains("No such file or directory");
+            if missing_output_after_followup {
+                eprintln!(
+                    "  [remote-codex-tmux] FOLLOWUP lost output file; forcing NEW retry..."
+                );
+                force_recreate = true;
+                retried_after_missing_output = true;
+                continue;
+            }
+
+            let success = exit_status.map_or(true, |s| s == 0);
+            if line_state.stdout_error.is_some() || (!success && line_state.final_result.is_none()) {
+                let (message, stdout_raw) = if let Some((msg, raw)) = line_state.stdout_error {
+                    (msg, raw)
+                } else {
+                    (format!("Remote tmux process exited with code {:?}", exit_status), String::new())
+                };
+                let _ = sender.send(StreamMessage::Error {
+                    message,
+                    stdout: stdout_raw,
+                    stderr: stderr_msg,
+                    exit_code: exit_status.map(|s| s as i32),
+                });
+                return Ok(());
+            }
+
+            if line_state.final_result.is_none() {
+                let _ = sender.send(StreamMessage::Done {
+                    result: String::new(),
+                    session_id: line_state.last_session_id,
+                });
+            }
+
+            return Ok(());
+        }
+    })
+}
+
 fn execute_streaming_local_tmux(
     prompt: &str,
     working_dir: &str,
     sender: Sender<StreamMessage>,
     cancel_token: Option<std::sync::Arc<CancelToken>>,
     tmux_session_name: &str,
+    report_channel_id: Option<u64>,
+    report_provider: Option<ProviderKind>,
 ) -> Result<(), String> {
     let output_path = format!("/tmp/remotecc-{}.jsonl", tmux_session_name);
     let input_fifo_path = format!("/tmp/remotecc-{}.input", tmux_session_name);
     let prompt_path = format!("/tmp/remotecc-{}.prompt", tmux_session_name);
+    let owner_path = tmux_owner_path(tmux_session_name);
 
     let session_exists = Command::new("tmux")
         .args(["has-session", "-t", tmux_session_name])
@@ -295,6 +929,7 @@ fn execute_streaming_local_tmux(
     let _ = std::fs::remove_file(&output_path);
     let _ = std::fs::remove_file(&input_fifo_path);
     let _ = std::fs::remove_file(&prompt_path);
+    let _ = std::fs::remove_file(&owner_path);
 
     std::fs::write(&output_path, "").map_err(|e| format!("Failed to create output file: {}", e))?;
 
@@ -312,6 +947,7 @@ fn execute_streaming_local_tmux(
 
     std::fs::write(&prompt_path, prompt)
         .map_err(|e| format!("Failed to write prompt file: {}", e))?;
+    write_tmux_owner_marker(tmux_session_name)?;
 
     let exe =
         std::env::current_exe().map_err(|e| format!("Failed to get executable path: {}", e))?;
@@ -326,7 +962,26 @@ fn execute_streaming_local_tmux(
         shell_escape(working_dir),
         shell_escape(codex_bin),
     );
-    let wrapper_cmd_with_env = format!("env -u CLAUDECODE {}", wrapper_cmd);
+    let mut wrapper_env_prefix = vec![
+        "env".to_string(),
+        "-u".to_string(),
+        "CLAUDECODE".to_string(),
+    ];
+    if let Some(channel_id) = report_channel_id {
+        wrapper_env_prefix.push(format!(
+            "{}={}",
+            RESTART_REPORT_CHANNEL_ENV,
+            shell_escape(&channel_id.to_string())
+        ));
+    }
+    if let Some(provider) = report_provider {
+        wrapper_env_prefix.push(format!(
+            "{}={}",
+            RESTART_REPORT_PROVIDER_ENV,
+            shell_escape(provider.as_str())
+        ));
+    }
+    let wrapper_cmd_with_env = format!("{} {}", wrapper_env_prefix.join(" "), wrapper_cmd);
 
     let tmux_result = Command::new("tmux")
         .args([
@@ -347,6 +1002,7 @@ fn execute_streaming_local_tmux(
         let _ = std::fs::remove_file(&output_path);
         let _ = std::fs::remove_file(&input_fifo_path);
         let _ = std::fs::remove_file(&prompt_path);
+        let _ = std::fs::remove_file(&owner_path);
         return Err(format!("tmux error: {}", stderr));
     }
 

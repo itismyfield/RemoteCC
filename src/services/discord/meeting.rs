@@ -55,12 +55,51 @@ pub(super) struct Meeting {
     pub started_at: String,
 }
 
+/// Rule for dynamic summary agent selection based on agenda keywords.
+#[derive(Clone, Debug)]
+pub(super) struct SummaryAgentRule {
+    pub keywords: Vec<String>,
+    pub agent: String,
+}
+
+/// Summary agent config: either a static agent or rule-based dynamic selection.
+#[derive(Clone, Debug)]
+pub(super) enum SummaryAgentConfig {
+    Static(String),
+    Dynamic {
+        rules: Vec<SummaryAgentRule>,
+        default: String,
+    },
+}
+
+impl SummaryAgentConfig {
+    /// Resolve which agent should write the summary based on the agenda.
+    pub fn resolve(&self, agenda: &str) -> String {
+        match self {
+            Self::Static(agent) => agent.clone(),
+            Self::Dynamic { rules, default } => {
+                let agenda_lower = agenda.to_lowercase();
+                for rule in rules {
+                    if rule
+                        .keywords
+                        .iter()
+                        .any(|kw| agenda_lower.contains(&kw.to_lowercase()))
+                    {
+                        return rule.agent.clone();
+                    }
+                }
+                default.clone()
+            }
+        }
+    }
+}
+
 /// Meeting configuration from role_map.json "meeting" section
 #[derive(Clone, Debug)]
 pub(super) struct MeetingConfig {
     pub channel_name: String,
     pub max_rounds: u32,
-    pub summary_agent: String,
+    pub summary_agent: SummaryAgentConfig,
     pub available_agents: Vec<MeetingAgentConfig>,
 }
 
@@ -946,17 +985,20 @@ async fn conclude_meeting(
         )
     };
 
+    // Resolve summary agent dynamically based on agenda
+    let resolved_summary_agent = config.summary_agent.resolve(&agenda);
+
     // Find summary agent's prompt file
     let summary_prompt_file = config
         .available_agents
         .iter()
-        .find(|a| a.role_id == config.summary_agent)
+        .find(|a| a.role_id == resolved_summary_agent)
         .map(|a| a.prompt_file.clone())
         .unwrap_or_default();
 
     let summary_role_context = if !summary_prompt_file.is_empty() {
         load_role_prompt(&RoleBinding {
-            role_id: config.summary_agent.clone(),
+            role_id: resolved_summary_agent.clone(),
             prompt_file: summary_prompt_file,
             provider: None,
         })
@@ -996,7 +1038,7 @@ async fn conclude_meeting(
 
 #### Action Items
 - [ ] [담당자] — [할 일]"#,
-        agent = config.summary_agent,
+        agent = resolved_summary_agent,
         role_context = if summary_role_context.is_empty() {
             String::new()
         } else {
@@ -1069,7 +1111,7 @@ async fn conclude_meeting(
 - 형식은 기존 회의록 형식을 유지하라
 - 미합의 사항이 남아 있으면 결론에 분리해 적어라
 - 도구나 명령 실행 없이 최종 회의록만 작성하라"#,
-                agent = config.summary_agent,
+                agent = resolved_summary_agent,
                 role_context = if summary_role_context.is_empty() {
                     String::new()
                 } else {

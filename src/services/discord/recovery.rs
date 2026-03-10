@@ -1,5 +1,77 @@
-use super::*;
 use super::turn_bridge::stale_inflight_message;
+use super::*;
+
+fn output_has_result_after_offset(output_path: &str, start_offset: u64) -> bool {
+    let Ok(bytes) = std::fs::read(output_path) else {
+        return false;
+    };
+    let start = usize::try_from(start_offset)
+        .ok()
+        .map(|offset| offset.min(bytes.len()))
+        .unwrap_or(bytes.len());
+
+    String::from_utf8_lossy(&bytes[start..])
+        .lines()
+        .any(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return false;
+            }
+            serde_json::from_str::<serde_json::Value>(trimmed)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("type")
+                        .and_then(|kind| kind.as_str())
+                        .map(str::to_string)
+                })
+                .as_deref()
+                == Some("result")
+        })
+}
+
+/// Extract accumulated assistant text from output JSONL after the given offset.
+fn extract_response_from_output(output_path: &str, start_offset: u64) -> String {
+    let Ok(bytes) = std::fs::read(output_path) else {
+        return String::new();
+    };
+    let start = usize::try_from(start_offset)
+        .ok()
+        .map(|offset| offset.min(bytes.len()))
+        .unwrap_or(bytes.len());
+
+    let mut response = String::new();
+    for line in String::from_utf8_lossy(&bytes[start..]).lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        let msg_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if msg_type == "assistant" {
+            if let Some(content) = value.get("message").and_then(|m| m.get("content")) {
+                if let Some(arr) = content.as_array() {
+                    for block in arr {
+                        if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                            if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                response.push_str(text);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    response
+}
+
+fn output_has_bytes_after_offset(output_path: &str, start_offset: u64) -> bool {
+    std::fs::metadata(output_path)
+        .map(|meta| meta.len() > start_offset)
+        .unwrap_or(false)
+}
 
 pub(super) async fn restore_inflight_turns(
     http: &Arc<serenity::Http>,
@@ -37,6 +109,73 @@ pub(super) async fn restore_inflight_turns(
             .clone()
             .filter(|s| !s.is_empty())
             .or_else(|| (!fallback_input.is_empty()).then_some(fallback_input.clone()));
+        let output_already_completed = output_path
+            .as_deref()
+            .map(|path| output_has_result_after_offset(path, state.last_offset))
+            .unwrap_or(false);
+        let output_has_new_bytes = output_path
+            .as_deref()
+            .map(|path| output_has_bytes_after_offset(path, state.last_offset))
+            .unwrap_or(false);
+
+        if output_already_completed {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ✓ recovering completed turn for channel {}: output contains result after offset {}",
+                state.channel_id, state.last_offset
+            );
+            // Deliver the result to Discord before clearing the inflight state
+            let extracted = output_path
+                .as_deref()
+                .map(|p| extract_response_from_output(p, state.last_offset))
+                .unwrap_or_default();
+            let final_text = if extracted.trim().is_empty() {
+                if state.full_response.trim().is_empty() {
+                    "(복구됨 — 응답 텍스트 없음)".to_string()
+                } else {
+                    super::formatting::format_for_discord(&state.full_response)
+                }
+            } else {
+                super::formatting::format_for_discord(&extracted)
+            };
+            let _ = super::formatting::replace_long_message_raw(
+                http,
+                channel_id,
+                current_msg_id,
+                &final_text,
+                shared,
+            )
+            .await;
+            clear_inflight_state(provider, state.channel_id);
+            continue;
+        }
+
+        let tmux_ready_without_new_output = tmux_session_name.as_deref().map_or(false, |name| {
+            !output_has_new_bytes && claude::tmux_session_ready_for_input(name)
+        });
+
+        if tmux_ready_without_new_output {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ✓ clearing inflight turn for channel {}: tmux is ready for input and output is idle after offset {}",
+                state.channel_id, state.last_offset
+            );
+            let final_text = if state.full_response.trim().is_empty() {
+                stale_inflight_message("")
+            } else {
+                super::formatting::format_for_discord(&state.full_response)
+            };
+            let _ = super::formatting::replace_long_message_raw(
+                http,
+                channel_id,
+                current_msg_id,
+                &final_text,
+                shared,
+            )
+            .await;
+            clear_inflight_state(provider, state.channel_id);
+            continue;
+        }
 
         let can_recover = tmux_session_name.as_deref().map_or(false, |name| {
             std::process::Command::new("tmux")
@@ -47,30 +186,48 @@ pub(super) async fn restore_inflight_turns(
         });
 
         if !can_recover {
-            rate_limit_wait(shared, channel_id).await;
-            let _ = channel_id
-                .edit_message(
-                    http,
-                    current_msg_id,
-                    EditMessage::new().content(truncate_str(
-                        &stale_inflight_message(&state.full_response),
-                        DISCORD_MSG_LIMIT,
-                    )),
-                )
-                .await;
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ⚠ cannot recover inflight turn for channel {}: tmux session missing",
+                state.channel_id
+            );
+            let stale_text = stale_inflight_message(&state.full_response);
+            let _ = super::formatting::replace_long_message_raw(
+                http,
+                channel_id,
+                current_msg_id,
+                &stale_text,
+                shared,
+            )
+            .await;
             clear_inflight_state(provider, state.channel_id);
             continue;
         }
 
         let Some(tmux_session_name) = tmux_session_name else {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ⚠ clearing inflight turn for channel {}: tmux session name missing",
+                state.channel_id
+            );
             clear_inflight_state(provider, state.channel_id);
             continue;
         };
         let Some(output_path) = output_path else {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ⚠ clearing inflight turn for channel {}: output path missing",
+                state.channel_id
+            );
             clear_inflight_state(provider, state.channel_id);
             continue;
         };
         let Some(input_fifo_path) = input_fifo_path else {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ⚠ clearing inflight turn for channel {}: input fifo path missing",
+                state.channel_id
+            );
             clear_inflight_state(provider, state.channel_id);
             continue;
         };
@@ -107,7 +264,7 @@ pub(super) async fn restore_inflight_turns(
             session.channel_id = Some(channel_id.get());
             session.last_active = tokio::time::Instant::now();
             if session.current_path.is_none() {
-                session.current_path = last_path;
+                session.current_path = last_path.clone();
             }
             if session.channel_name.is_none() {
                 session.channel_name = channel_name.clone();
@@ -122,7 +279,22 @@ pub(super) async fn restore_inflight_turns(
 
         let role_binding = resolve_role_binding(channel_id, channel_name.as_deref());
         let pcd_session_key = build_pcd_session_key(shared, channel_id, provider).await;
-        post_pcd_session_status(pcd_session_key.as_deref(), "working", provider, None).await;
+        let pcd_session_name = channel_name.clone();
+        let pcd_session_info = derive_pcd_session_info(
+            Some(&state.user_text),
+            channel_name.as_deref(),
+            last_path.as_deref(),
+        );
+        post_pcd_session_status(
+            pcd_session_key.as_deref(),
+            pcd_session_name.as_deref(),
+            Some(provider.as_str()),
+            "working",
+            provider,
+            Some(&pcd_session_info),
+            None,
+        )
+        .await;
 
         let (tx, rx) = mpsc::channel();
         let cancel_for_reader = cancel_token.clone();
@@ -182,14 +354,90 @@ pub(super) async fn restore_inflight_turns(
                 token: None,
                 role_binding,
                 pcd_session_key,
+                pcd_session_name,
+                pcd_session_info: Some(pcd_session_info),
                 current_msg_id,
-                current_msg_len: state.current_msg_len,
                 response_sent_offset: state.response_sent_offset,
                 full_response: state.full_response.clone(),
                 tmux_last_offset: Some(state.last_offset),
                 new_session_id: state.session_id.clone(),
+                defer_watcher_resume: false,
+                completion_tx: None,
                 inflight_state: state,
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{output_has_bytes_after_offset, output_has_result_after_offset};
+    use std::io::Write;
+
+    #[test]
+    fn detects_result_after_offset_only_in_remaining_slice() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"before\"}}]}}}}"
+        )
+        .unwrap();
+        let offset = file.as_file().metadata().unwrap().len();
+        writeln!(
+            file,
+            "{{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"done\"}}"
+        )
+        .unwrap();
+
+        assert!(output_has_result_after_offset(
+            file.path().to_str().unwrap(),
+            offset
+        ));
+    }
+
+    #[test]
+    fn ignores_result_before_offset() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "{{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"done\"}}"
+        )
+        .unwrap();
+        let offset = file.as_file().metadata().unwrap().len();
+        writeln!(
+            file,
+            "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"after\"}}]}}}}"
+        )
+        .unwrap();
+
+        assert!(!output_has_result_after_offset(
+            file.path().to_str().unwrap(),
+            offset
+        ));
+    }
+
+    #[test]
+    fn detects_new_bytes_after_offset() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "before").unwrap();
+        let offset = file.as_file().metadata().unwrap().len();
+        writeln!(file, "after").unwrap();
+
+        assert!(output_has_bytes_after_offset(
+            file.path().to_str().unwrap(),
+            offset
+        ));
+    }
+
+    #[test]
+    fn ignores_missing_new_bytes_after_offset() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "before").unwrap();
+        let offset = file.as_file().metadata().unwrap().len();
+
+        assert!(!output_has_bytes_after_offset(
+            file.path().to_str().unwrap(),
+            offset
+        ));
     }
 }

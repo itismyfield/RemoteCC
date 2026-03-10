@@ -1,9 +1,12 @@
 mod formatting;
 mod inflight;
 mod meeting;
+mod pcd;
 mod prompt_builder;
 mod recovery;
+pub(crate) mod restart_report;
 mod role_map;
+mod router;
 mod runtime_store;
 mod settings;
 mod shared_memory;
@@ -39,8 +42,11 @@ use formatting::{
 use inflight::{
     clear_inflight_state, load_inflight_states, save_inflight_state, InflightTurnState,
 };
+use pcd::{build_pcd_session_key, derive_pcd_session_info, post_pcd_session_status};
 use prompt_builder::build_system_prompt;
 use recovery::restore_inflight_turns;
+use restart_report::flush_restart_reports;
+use router::{handle_event, handle_text_message};
 use runtime_store::{workspace_root, worktrees_root};
 use settings::{
     channel_supports_provider, channel_upload_dir, cleanup_channel_uploads, cleanup_old_uploads,
@@ -62,7 +68,8 @@ const INTERVENTION_DEDUP_WINDOW: Duration = Duration::from_secs(10);
 const UPLOAD_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const UPLOAD_MAX_AGE: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 const SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60); // 1 hour
-const SESSION_MAX_IDLE: Duration = Duration::from_secs(7 * 24 * 60 * 60); // 7 days
+const SESSION_MAX_IDLE: Duration = Duration::from_secs(24 * 60 * 60); // 1 day
+const RESTART_REPORT_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Per-channel session state
 pub(super) struct DiscordSession {
@@ -100,8 +107,9 @@ enum InterventionMode {
 }
 
 #[derive(Clone, Debug)]
-struct Intervention {
+pub(super) struct Intervention {
     author_id: UserId,
+    message_id: MessageId,
     text: String,
     mode: InterventionMode,
     created_at: Instant,
@@ -148,6 +156,8 @@ pub(super) struct TmuxWatcherHandle {
     pub(super) paused: Arc<std::sync::atomic::AtomicBool>,
     /// After Discord handler finishes its turn, set this offset so watcher resumes from here
     pub(super) resume_offset: Arc<std::sync::Mutex<Option<u64>>>,
+    /// Signal to cancel the watcher (quiet exit, no "session ended" message)
+    pub(super) cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Core state that requires atomic multi-field access (always locked together)
@@ -178,6 +188,8 @@ pub(super) struct SharedData {
     pub(super) tmux_watchers: dashmap::DashMap<ChannelId, TmuxWatcherHandle>,
     /// Per-channel in-flight turn recovery marker (restart resume in progress)
     pub(super) recovering_channels: dashmap::DashMap<ChannelId, ()>,
+    /// Global shutdown flag — when set, watchers exit quietly via cancel path
+    pub(super) shutting_down: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Poise user data type
@@ -223,6 +235,32 @@ fn enqueue_intervention(queue: &mut Vec<Intervention>, intervention: Interventio
         queue.drain(0..overflow);
     }
     true
+}
+
+pub(super) fn has_soft_intervention(queue: &mut Vec<Intervention>) -> bool {
+    prune_interventions(queue);
+    queue.iter().any(|item| item.mode == InterventionMode::Soft)
+}
+
+pub(super) fn dequeue_next_soft_intervention(
+    queue: &mut Vec<Intervention>,
+) -> Option<Intervention> {
+    prune_interventions(queue);
+    let index = queue
+        .iter()
+        .position(|item| item.mode == InterventionMode::Soft)?;
+    Some(queue.remove(index))
+}
+
+pub(super) fn requeue_intervention_front(
+    queue: &mut Vec<Intervention>,
+    intervention: Intervention,
+) {
+    prune_interventions(queue);
+    queue.insert(0, intervention);
+    if queue.len() > MAX_INTERVENTIONS_PER_CHANNEL {
+        queue.truncate(MAX_INTERVENTIONS_PER_CHANNEL);
+    }
 }
 
 /// Scan for provider-specific skills available to this bot.
@@ -387,6 +425,7 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
         skills_cache: tokio::sync::RwLock::new(initial_skills),
         tmux_watchers: dashmap::DashMap::new(),
         recovering_channels: dashmap::DashMap::new(),
+        shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
 
     let token_owned = token.to_string();
@@ -397,15 +436,17 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
             commands: vec![
                 cmd_start(),
                 cmd_pwd(),
+                cmd_status(),
+                cmd_inflight(),
                 cmd_clear(),
                 cmd_stop(),
                 cmd_down(),
                 cmd_shell(),
                 cmd_cc(),
+                cmd_health(),
                 cmd_allowedtools(),
                 cmd_allowed(),
                 cmd_debug(),
-
                 cmd_adduser(),
                 cmd_removeuser(),
                 cmd_help(),
@@ -440,6 +481,27 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
                 let shared_for_tmux = shared_for_migrate.clone();
                 tokio::spawn(async move {
                     migrate_session_categories(&ctx_clone, &shared_for_migrate).await;
+                });
+
+                // Background: flush delayed restart follow-up reports until they are delivered
+                let http_for_restart_reports = ctx.http.clone();
+                let shared_for_restart_reports = shared_for_tmux.clone();
+                flush_restart_reports(
+                    &http_for_restart_reports,
+                    &shared_for_restart_reports,
+                    provider,
+                )
+                .await;
+                tokio::spawn(async move {
+                    loop {
+                        flush_restart_reports(
+                            &http_for_restart_reports,
+                            &shared_for_restart_reports,
+                            provider,
+                        )
+                        .await;
+                        tokio::time::sleep(RESTART_REPORT_FLUSH_INTERVAL).await;
+                    }
                 });
 
                 // Background: restore tmux watchers for surviving tmux sessions, then clean orphans
@@ -477,6 +539,34 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
         .framework(framework)
         .await
         .expect("Failed to create Discord client");
+
+    // Graceful shutdown: on SIGTERM, cancel all tmux watchers before dying
+    let shared_for_signal = shared.clone();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
+                sigterm.recv().await;
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!("  [{ts}] 🛑 SIGTERM received — graceful shutdown");
+
+                // Set global shutdown flag
+                shared_for_signal
+                    .shutting_down
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+
+                // Cancel all active tmux watchers (quiet exit, no "session ended" messages)
+                for entry in shared_for_signal.tmux_watchers.iter() {
+                    entry.value().cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+
+                // Grace period for watchers to see cancel flag and exit cleanly
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                std::process::exit(0);
+            }
+        }
+    });
 
     if let Err(e) = client.start().await {
         eprintln!("  ✗ {} bot error: {e}", provider.display_name());
@@ -729,57 +819,6 @@ async fn add_reaction(
         .await;
 }
 
-async fn build_pcd_session_key(
-    shared: &Arc<SharedData>,
-    channel_id: ChannelId,
-    provider: ProviderKind,
-) -> Option<String> {
-    let tmux_name = {
-        let data = shared.core.lock().await;
-        data.sessions
-            .get(&channel_id)
-            .and_then(|s| s.channel_name.as_ref())
-            .map(|name| provider.build_tmux_session_name(name))
-    }?;
-
-    let hostname = std::process::Command::new("hostname")
-        .arg("-s")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string());
-
-    Some(format!("{}:{}", hostname, tmux_name))
-}
-
-async fn post_pcd_session_status(
-    session_key: Option<&str>,
-    status: &str,
-    provider: ProviderKind,
-    tokens: Option<u64>,
-) {
-    let Some(session_key) = session_key else {
-        return;
-    };
-
-    let mut body = serde_json::json!({
-        "session_key": session_key,
-        "status": status,
-        "provider": provider.as_str(),
-    });
-    if let Some(tokens) = tokens {
-        body["tokens"] = serde_json::json!(tokens);
-    }
-
-    let _ = reqwest::Client::new()
-        .post("http://127.0.0.1:8791/api/hook/session")
-        .json(&body)
-        .send()
-        .await;
-}
-
 // ─── Event handler ───────────────────────────────────────────────────────────
 
 /// Periodically clean up idle sessions and their associated data.
@@ -830,219 +869,6 @@ async fn maybe_cleanup_sessions(shared: &Arc<SharedData>) {
 }
 
 /// Handle raw Discord events (non-slash-command messages, file uploads)
-async fn handle_event(
-    ctx: &serenity::Context,
-    event: &serenity::FullEvent,
-    data: &Data,
-) -> Result<(), Error> {
-    maybe_cleanup_sessions(&data.shared).await;
-    match event {
-        serenity::FullEvent::Message { new_message } => {
-            // Ignore bot messages, unless the bot is in the allowed_bot_ids list
-            if new_message.author.bot {
-                let allowed = {
-                    let settings = data.shared.settings.read().await;
-                    settings
-                        .allowed_bot_ids
-                        .contains(&new_message.author.id.get())
-                };
-                if !allowed {
-                    return Ok(());
-                }
-            }
-
-            // Ignore messages that look like slash commands (but allow from trusted bots)
-            if new_message.content.starts_with('/') && !new_message.author.bot {
-                return Ok(());
-            }
-
-            // Ignore messages that mention other users (not directed at the bot)
-            if !new_message.mentions.is_empty() {
-                let bot_id = ctx.cache.current_user().id;
-                let mentions_others = new_message.mentions.iter().any(|u| u.id != bot_id);
-                if mentions_others {
-                    return Ok(());
-                }
-            }
-
-            let user_id = new_message.author.id;
-            let user_name = &new_message.author.name;
-            let channel_id = new_message.channel_id;
-            let is_dm = new_message.guild_id.is_none();
-            let (channel_name, _) = resolve_channel_category(ctx, channel_id).await;
-            let role_binding = resolve_role_binding(channel_id, channel_name.as_deref());
-            if !channel_supports_provider(
-                data.provider,
-                channel_name.as_deref(),
-                is_dm,
-                role_binding.as_ref(),
-            ) {
-                return Ok(());
-            }
-
-            let text = new_message.content.trim();
-            if !text.is_empty()
-                && try_handle_family_profile_probe_reply(
-                    ctx,
-                    new_message,
-                    &data.shared,
-                    data.provider,
-                )
-                .await?
-            {
-                return Ok(());
-            }
-
-            // Auth check (allowed bots bypass auth)
-            let is_allowed_bot = new_message.author.bot && {
-                let settings = data.shared.settings.read().await;
-                settings.allowed_bot_ids.contains(&user_id.get())
-            };
-            if !is_allowed_bot && !check_auth(user_id, user_name, &data.shared, &data.token).await {
-                return Ok(());
-            }
-
-            // Handle file attachments first, then continue to text (if any)
-            if !new_message.attachments.is_empty() {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                println!(
-                    "  [{ts}] ◀ [{user_name}] Upload: {} file(s)",
-                    new_message.attachments.len()
-                );
-                handle_file_upload(ctx, new_message, &data.shared).await?;
-            }
-
-            if text.is_empty() {
-                return Ok(());
-            }
-
-            // Auto-restore session
-            auto_restore_session(&data.shared, channel_id, ctx).await;
-
-            // Steering while AI is in progress for this channel
-            {
-                let mut d = data.shared.core.lock().await;
-                if d.cancel_tokens.contains_key(&channel_id) {
-                    let request_owner = d.active_request_owner.get(&channel_id).copied();
-                    if let Some(owner_id) = request_owner {
-                        if owner_id != user_id {
-                            drop(d);
-                            rate_limit_wait(&data.shared, channel_id).await;
-                            let _ = channel_id
-                                .say(
-                                    &ctx.http,
-                                    format!(
-                                        "AI request in progress. Only <@{}> can steer this turn.",
-                                        owner_id.get()
-                                    ),
-                                )
-                                .await;
-                            return Ok(());
-                        }
-                    }
-
-                    let mode = if is_hard_intervention(text) {
-                        InterventionMode::Hard
-                    } else {
-                        InterventionMode::Soft
-                    };
-
-                    let (inserted, queued_count, hard_token) = {
-                        let queue = d.intervention_queue.entry(channel_id).or_default();
-                        let inserted = enqueue_intervention(
-                            queue,
-                            Intervention {
-                                author_id: user_id,
-                                text: text.to_string(),
-                                mode,
-                                created_at: Instant::now(),
-                            },
-                        );
-                        let queued_count = queue.len();
-                        let hard_token = if mode == InterventionMode::Hard {
-                            d.cancel_tokens.get(&channel_id).cloned()
-                        } else {
-                            None
-                        };
-                        (inserted, queued_count, hard_token)
-                    };
-
-                    if let Some(token) = hard_token {
-                        cancel_active_token(&token, true);
-                    }
-
-                    drop(d);
-
-                    if !inserted {
-                        rate_limit_wait(&data.shared, channel_id).await;
-                        let _ = channel_id
-                            .say(&ctx.http, "↪ 같은 메시지가 방금 이미 큐잉되어서 무시했어.")
-                            .await;
-                        return Ok(());
-                    }
-
-                    rate_limit_wait(&data.shared, channel_id).await;
-                    let feedback = match mode {
-                        InterventionMode::Hard => "🛑 현재 작업을 중단할게.",
-                        InterventionMode::Soft => {
-                            "📋 큐잉됨. 현재 턴 종료 후 자동 처리돼. 즉시 반영하려면 /stop"
-                        }
-                    };
-                    let _ = channel_id
-                        .say(&ctx.http, format!("{} (queue: {})", feedback, queued_count))
-                        .await;
-                    return Ok(());
-                }
-            }
-
-            // Meeting command from text (e.g. announce bot sending "/meeting start ...")
-            if text.starts_with("/meeting ") {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                println!("  [{ts}] ◀ [{user_name}] Meeting cmd: {text}");
-                let http = ctx.http.clone();
-                if meeting::handle_meeting_command(
-                    http,
-                    channel_id,
-                    text,
-                    data.provider,
-                    &data.shared,
-                )
-                .await?
-                {
-                    return Ok(());
-                }
-            }
-
-            // Shell command shortcut
-            if text.starts_with('!') {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                let preview = truncate_str(text, 60);
-                println!("  [{ts}] ◀ [{user_name}] Shell: {preview}");
-                handle_shell_command_raw(ctx, channel_id, text, &data.shared).await?;
-                return Ok(());
-            }
-
-            // Regular text → Claude AI
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            let preview = truncate_str(text, 60);
-            println!("  [{ts}] ◀ [{user_name}] {preview}");
-            handle_text_message(
-                ctx,
-                channel_id,
-                new_message.id,
-                user_id,
-                user_name,
-                text,
-                &data.shared,
-                &data.token,
-            )
-            .await?;
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
 // ─── Slash commands ──────────────────────────────────────────────────────────
 
 /// Autocomplete handler for remote profile names in /start
@@ -1199,8 +1025,7 @@ async fn cmd_start(
     // Check for worktree conflict (another channel using same git repo path)
     let worktree_info = {
         let data = ctx.data().shared.core.lock().await;
-        let conflict =
-            detect_worktree_conflict(&data.sessions, &canonical_path, ctx.channel_id());
+        let conflict = detect_worktree_conflict(&data.sessions, &canonical_path, ctx.channel_id());
         drop(data);
         if let Some(conflicting_channel) = conflict {
             let provider_str = {
@@ -1444,6 +1269,411 @@ async fn cmd_pwd(ctx: Context<'_>) -> Result<(), Error> {
                 .await?
         }
     };
+    Ok(())
+}
+
+async fn build_health_report(
+    shared: &Arc<SharedData>,
+    provider: ProviderKind,
+    channel_id: ChannelId,
+) -> String {
+    let (
+        session_path,
+        session_id,
+        session_channel_name,
+        pending_uploads,
+        active_request,
+        queued_count,
+        session_count,
+        active_request_count,
+        queued_channel_count,
+        queued_total,
+    ) = {
+        let data = shared.core.lock().await;
+        let session = data.sessions.get(&channel_id);
+        let queued_count = data
+            .intervention_queue
+            .get(&channel_id)
+            .map(|q| q.len())
+            .unwrap_or(0);
+        let queued_channel_count = data
+            .intervention_queue
+            .values()
+            .filter(|q| !q.is_empty())
+            .count();
+        let queued_total: usize = data.intervention_queue.values().map(|q| q.len()).sum();
+        (
+            session.and_then(|s| s.current_path.clone()),
+            session.and_then(|s| s.session_id.clone()),
+            session.and_then(|s| s.channel_name.clone()),
+            session.map(|s| s.pending_uploads.len()).unwrap_or(0),
+            data.cancel_tokens.contains_key(&channel_id),
+            queued_count,
+            data.sessions.len(),
+            data.cancel_tokens.len(),
+            queued_channel_count,
+            queued_total,
+        )
+    };
+
+    let current_release = dirs::home_dir()
+        .map(|h| h.join(".remotecc").join("releases").join("current"))
+        .and_then(|p| fs::read_link(p).ok())
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(unknown)".to_string());
+    let previous_release = dirs::home_dir()
+        .map(|h| h.join(".remotecc").join("releases").join("previous"))
+        .and_then(|p| fs::read_link(p).ok())
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(none)".to_string());
+    let release_label = |value: &str| value.rsplit('/').next().unwrap_or(value).to_string();
+    let home_prefix = dirs::home_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "/Users/itismyfield".to_string());
+    let compact_path = |value: String| {
+        if value.starts_with(&home_prefix) {
+            value.replacen(&home_prefix, "~", 1)
+        } else {
+            value
+        }
+    };
+    let inflight_states = load_inflight_states(provider);
+    let inflight_count = inflight_states.len();
+    let channel_inflight = inflight_states
+        .iter()
+        .find(|s| s.channel_id == channel_id.get());
+    let recovering_count = shared.recovering_channels.len();
+    let watchers = shared.tmux_watchers.len();
+    let channel_watcher = shared.tmux_watchers.contains_key(&channel_id);
+    let channel_recovering = shared.recovering_channels.contains_key(&channel_id);
+    let current_path_text =
+        compact_path(session_path.unwrap_or_else(|| "(no session)".to_string()));
+    let session_id_text = session_id.unwrap_or_else(|| "(none)".to_string());
+    let session_id_short = if session_id_text.len() > 24 {
+        format!("{}...", &session_id_text[..24])
+    } else {
+        session_id_text.clone()
+    };
+    let tmux_session_name =
+        session_channel_name.map(|name| provider.build_tmux_session_name(&name));
+    let tmux_alive = if let Some(ref session_name) = tmux_session_name {
+        match std::process::Command::new("tmux")
+            .args(["has-session", "-t", session_name])
+            .status()
+        {
+            Ok(status) if status.success() => "alive",
+            _ => "missing",
+        }
+    } else {
+        "unknown"
+    };
+    let channel_state = if channel_recovering {
+        "recovering"
+    } else if active_request {
+        "working"
+    } else if channel_watcher {
+        "watching"
+    } else {
+        "idle"
+    };
+    let inflight_text = channel_inflight
+        .map(|state| format!("yes (offset {})", state.last_offset))
+        .unwrap_or_else(|| "no".to_string());
+
+    format!(
+        "\
+**RemoteCC Health**
+- provider: `{}`
+- dcserver pid: `{}`
+- release: current `{}`, previous `{}`
+- runtime: sessions `{}`, active `{}`, queued `{}/{}`
+- bridge: watchers `{}`, recovering `{}`, inflight saved `{}`
+
+**This Channel**
+- state: `{}`
+- path: `{}`
+- session_id: `{}`
+- tmux: `{}`
+- bridge: active `{}`, watcher `{}`, inflight `{}`
+- queue: interventions `{}`, uploads `{}`
+",
+        provider.as_str(),
+        std::process::id(),
+        release_label(&current_release),
+        release_label(&previous_release),
+        session_count,
+        active_request_count,
+        queued_channel_count,
+        queued_total,
+        watchers,
+        recovering_count,
+        inflight_count,
+        channel_state,
+        current_path_text,
+        session_id_short,
+        tmux_alive,
+        if active_request { "yes" } else { "no" },
+        if channel_watcher { "yes" } else { "no" },
+        inflight_text,
+        queued_count,
+        pending_uploads
+    )
+}
+
+async fn build_status_report(
+    shared: &Arc<SharedData>,
+    provider: ProviderKind,
+    channel_id: ChannelId,
+) -> String {
+    let (
+        session_path,
+        session_id,
+        remote_name,
+        pending_uploads,
+        history_len,
+        cleared,
+        active_request,
+        active_owner,
+        queued_count,
+        session_channel_name,
+    ) = {
+        let data = shared.core.lock().await;
+        let session = data.sessions.get(&channel_id);
+        (
+            session.and_then(|s| s.current_path.clone()),
+            session.and_then(|s| s.session_id.clone()),
+            session.and_then(|s| s.remote_profile_name.clone()),
+            session.map(|s| s.pending_uploads.len()).unwrap_or(0),
+            session.map(|s| s.history.len()).unwrap_or(0),
+            session.map(|s| s.cleared).unwrap_or(false),
+            data.cancel_tokens.contains_key(&channel_id),
+            data.active_request_owner.get(&channel_id).copied(),
+            data.intervention_queue
+                .get(&channel_id)
+                .map(|q| q.len())
+                .unwrap_or(0),
+            session.and_then(|s| s.channel_name.clone()),
+        )
+    };
+
+    let home_prefix = dirs::home_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "/Users/itismyfield".to_string());
+    let compact_path = |value: String| {
+        if value.starts_with(&home_prefix) {
+            value.replacen(&home_prefix, "~", 1)
+        } else {
+            value
+        }
+    };
+    let session_id_text = session_id.unwrap_or_else(|| "(none)".to_string());
+    let session_id_short = if session_id_text.len() > 24 {
+        format!("{}...", &session_id_text[..24])
+    } else {
+        session_id_text
+    };
+    let tmux_session_name =
+        session_channel_name.map(|name| provider.build_tmux_session_name(&name));
+    let tmux_alive = if let Some(ref session_name) = tmux_session_name {
+        match std::process::Command::new("tmux")
+            .args(["has-session", "-t", session_name])
+            .status()
+        {
+            Ok(status) if status.success() => "alive",
+            _ => "missing",
+        }
+    } else {
+        "unknown"
+    };
+    let channel_watcher = shared.tmux_watchers.contains_key(&channel_id);
+    let channel_recovering = shared.recovering_channels.contains_key(&channel_id);
+    let channel_state = if channel_recovering {
+        "recovering"
+    } else if active_request {
+        "working"
+    } else if channel_watcher {
+        "watching"
+    } else {
+        "idle"
+    };
+    let owner_text = active_owner
+        .map(|id| format!("<@{}>", id.get()))
+        .unwrap_or_else(|| "(none)".to_string());
+    let path_text = compact_path(session_path.unwrap_or_else(|| "(no session)".to_string()));
+    let remote_text = remote_name.unwrap_or_else(|| "local".to_string());
+
+    format!(
+        "\
+**Channel Status**
+- provider: `{}`
+- state: `{}`
+- path: `{}`
+- session_id: `{}`
+- remote: `{}`
+- tmux: `{}`
+- owner: {}
+- queue: interventions `{}`, uploads `{}`
+- history: items `{}`, cleared `{}`
+",
+        provider.as_str(),
+        channel_state,
+        path_text,
+        session_id_short,
+        remote_text,
+        tmux_alive,
+        owner_text,
+        queued_count,
+        pending_uploads,
+        history_len,
+        if cleared { "yes" } else { "no" }
+    )
+}
+
+async fn build_inflight_report(
+    shared: &Arc<SharedData>,
+    provider: ProviderKind,
+    channel_id: ChannelId,
+) -> String {
+    let mut inflight_states = load_inflight_states(provider);
+    inflight_states.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+
+    let recovering_count = shared.recovering_channels.len();
+    let channel_inflight = inflight_states
+        .iter()
+        .find(|state| state.channel_id == channel_id.get());
+
+    let channel_status = channel_inflight.map(|_| "saved").unwrap_or("none");
+
+    let current_section = if let Some(state) = channel_inflight {
+        let session_id = state
+            .session_id
+            .clone()
+            .unwrap_or_else(|| "(none)".to_string());
+        let session_id_short = if session_id.len() > 24 {
+            format!("{}...", &session_id[..24])
+        } else {
+            session_id
+        };
+        let tmux_name = state
+            .tmux_session_name
+            .clone()
+            .unwrap_or_else(|| "(none)".to_string());
+        format!(
+            "\
+**This Channel**
+- started: `{}`
+- updated: `{}`
+- offset: `{}`
+- session_id: `{}`
+- tmux: `{}`
+- placeholder_msg: `{}`
+- user_text: `{}`
+",
+            state.started_at,
+            state.updated_at,
+            state.last_offset,
+            session_id_short,
+            tmux_name,
+            state.current_msg_id,
+            truncate_str(&state.user_text, 80)
+        )
+    } else {
+        "\
+**This Channel**
+- status: `none`
+"
+        .to_string()
+    };
+
+    let saved_channels = if inflight_states.is_empty() {
+        "- (none)".to_string()
+    } else {
+        inflight_states
+            .iter()
+            .take(6)
+            .map(|state| {
+                format!(
+                    "- `{}` (`{}`) offset `{}` updated `{}`",
+                    state.channel_name.as_deref().unwrap_or("unknown"),
+                    state.channel_id,
+                    state.last_offset,
+                    state.updated_at
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    format!(
+        "\
+**Inflight**
+- provider: `{}`
+- saved turns: `{}`
+- recovering channels: `{}`
+- this channel: `{}`
+
+{}
+**Saved Channels**
+{}
+",
+        provider.as_str(),
+        inflight_states.len(),
+        recovering_count,
+        channel_status,
+        current_section,
+        saved_channels
+    )
+}
+
+/// /health — Show runtime health summary
+#[poise::command(slash_command, rename = "health")]
+async fn cmd_health(ctx: Context<'_>) -> Result<(), Error> {
+    let user_id = ctx.author().id;
+    let user_name = &ctx.author().name;
+    if !check_auth(user_id, user_name, &ctx.data().shared, &ctx.data().token).await {
+        return Ok(());
+    }
+
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    println!("  [{ts}] ◀ [{user_name}] /health");
+
+    let text = build_health_report(&ctx.data().shared, ctx.data().provider, ctx.channel_id()).await;
+    send_long_message_ctx(ctx, &text).await?;
+    Ok(())
+}
+
+/// /status — Show concise per-channel runtime state
+#[poise::command(slash_command, rename = "status")]
+async fn cmd_status(ctx: Context<'_>) -> Result<(), Error> {
+    let user_id = ctx.author().id;
+    let user_name = &ctx.author().name;
+    if !check_auth(user_id, user_name, &ctx.data().shared, &ctx.data().token).await {
+        return Ok(());
+    }
+
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    println!("  [{ts}] ◀ [{user_name}] /status");
+
+    let text = build_status_report(&ctx.data().shared, ctx.data().provider, ctx.channel_id()).await;
+    send_long_message_ctx(ctx, &text).await?;
+    Ok(())
+}
+
+/// /inflight — Show saved inflight turn state
+#[poise::command(slash_command, rename = "inflight")]
+async fn cmd_inflight(ctx: Context<'_>) -> Result<(), Error> {
+    let user_id = ctx.author().id;
+    let user_name = &ctx.author().name;
+    if !check_auth(user_id, user_name, &ctx.data().shared, &ctx.data().token).await {
+        return Ok(());
+    }
+
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    println!("  [{ts}] ◀ [{user_name}] /inflight");
+
+    let text =
+        build_inflight_report(&ctx.data().shared, ctx.data().provider, ctx.channel_id()).await;
+    send_long_message_ctx(ctx, &text).await?;
     Ok(())
 }
 
@@ -1889,7 +2119,6 @@ async fn cmd_debug(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-
 /// /help — Show help information
 #[poise::command(slash_command, rename = "help")]
 async fn cmd_help(ctx: Context<'_>) -> Result<(), Error> {
@@ -1904,6 +2133,9 @@ Each channel gets its own independent {} session.
 `/start <path> [remote]` — Start session at directory
 `/start` — Start with auto-generated workspace
 `/pwd` — Show current working directory
+`/health` — Show runtime health summary
+`/status` — Show this channel session status
+`/inflight` — Show saved inflight turn state
 `/clear` — Clear AI conversation history
 `/stop` — Stop current AI request
 
@@ -1947,17 +2179,37 @@ async fn autocomplete_skill<'a>(
     ctx: Context<'a>,
     partial: &'a str,
 ) -> Vec<serenity::AutocompleteChoice> {
+    let builtins = [
+        ("health", "Show runtime health summary"),
+        ("status", "Show this channel session status"),
+        ("inflight", "Show saved inflight turn state"),
+        ("pwd", "Show current working directory"),
+        ("clear", "Clear session state"),
+        ("stop", "Stop current AI request"),
+        ("help", "Show command help"),
+    ];
     let skills = ctx.data().shared.skills_cache.read().await;
     let partial_lower = partial.to_lowercase();
-    skills
-        .iter()
-        .filter(|(name, _)| partial.is_empty() || name.to_lowercase().contains(&partial_lower))
-        .take(25) // Discord autocomplete limit
-        .map(|(name, desc)| {
+    let mut choices = Vec::new();
+
+    for (name, desc) in builtins {
+        if partial.is_empty() || name.contains(&partial_lower) {
             let label = format!("{} — {}", name, truncate_str(desc, 60));
-            serenity::AutocompleteChoice::new(label, name.clone())
-        })
-        .collect()
+            choices.push(serenity::AutocompleteChoice::new(label, name.to_string()));
+        }
+    }
+
+    for (name, desc) in skills.iter() {
+        if choices.len() >= 25 {
+            break;
+        }
+        if partial.is_empty() || name.to_lowercase().contains(&partial_lower) {
+            let label = format!("{} — {}", name, truncate_str(desc, 60));
+            choices.push(serenity::AutocompleteChoice::new(label, name.clone()));
+        }
+    }
+
+    choices
 }
 
 /// /cc <skill> [args] — Run a provider skill
@@ -2053,6 +2305,27 @@ async fn cmd_cc(
                         .await?
                 }
             };
+            return Ok(());
+        }
+        "health" => {
+            let text =
+                build_health_report(&ctx.data().shared, ctx.data().provider, ctx.channel_id())
+                    .await;
+            send_long_message_ctx(ctx, &text).await?;
+            return Ok(());
+        }
+        "status" => {
+            let text =
+                build_status_report(&ctx.data().shared, ctx.data().provider, ctx.channel_id())
+                    .await;
+            send_long_message_ctx(ctx, &text).await?;
+            return Ok(());
+        }
+        "inflight" => {
+            let text =
+                build_inflight_report(&ctx.data().shared, ctx.data().provider, ctx.channel_id())
+                    .await;
+            send_long_message_ctx(ctx, &text).await?;
             return Ok(());
         }
         "help" => {
@@ -2157,6 +2430,9 @@ async fn cmd_cc(
         &skill_prompt,
         &ctx.data().shared,
         &ctx.data().token,
+        false,
+        false,
+        false,
     )
     .await?;
 
@@ -2259,460 +2535,6 @@ async fn cmd_meeting(
 // ─── Text message → Claude AI ───────────────────────────────────────────────
 
 /// Handle regular text messages — send to the active provider.
-async fn handle_text_message(
-    ctx: &serenity::Context,
-    channel_id: ChannelId,
-    user_msg_id: MessageId,
-    request_owner: UserId,
-    request_owner_name: &str,
-    user_text: &str,
-    shared: &Arc<SharedData>,
-    token: &str,
-) -> Result<(), Error> {
-    // Get session info, allowed tools, and pending uploads
-    let (session_info, provider, allowed_tools, pending_uploads) = {
-        let mut data = shared.core.lock().await;
-        let info = data.sessions.get(&channel_id).and_then(|session| {
-            session.current_path.as_ref().map(|_| {
-                (
-                    session.session_id.clone(),
-                    session.current_path.clone().unwrap_or_default(),
-                )
-            })
-        });
-        let uploads = data
-            .sessions
-            .get_mut(&channel_id)
-            .map(|s| {
-                s.cleared = false;
-                std::mem::take(&mut s.pending_uploads)
-            })
-            .unwrap_or_default();
-        drop(data);
-        let settings = shared.settings.read().await;
-        (
-            info,
-            settings.provider,
-            settings.allowed_tools.clone(),
-            uploads,
-        )
-    };
-
-    let (session_id, current_path) = match session_info {
-        Some(info) => info,
-        None => {
-            // Try auto-start from role_map workspace
-            let ch_name = {
-                let data = shared.core.lock().await;
-                data.sessions
-                    .get(&channel_id)
-                    .and_then(|s| s.channel_name.clone())
-            };
-            let workspace = settings::resolve_workspace(channel_id, ch_name.as_deref());
-            if let Some(ws_path) = workspace {
-                let ws = std::path::Path::new(&ws_path);
-                if ws.is_dir() {
-                    let canonical = ws
-                        .canonicalize()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|_| ws_path.clone());
-                    // Check worktree conflict
-                    let wt_info = {
-                        let data = shared.core.lock().await;
-                        let conflict = detect_worktree_conflict(
-                            &data.sessions,
-                            &canonical,
-                            channel_id,
-                        );
-                        drop(data);
-                        if let Some(conflicting) = conflict {
-                            let ch = ch_name.as_deref().unwrap_or("unknown");
-                            match create_git_worktree(&canonical, ch, provider.as_str()) {
-                                Ok((wt_path, branch)) => {
-                                    let ts = chrono::Local::now().format("%H:%M:%S");
-                                    println!(
-                                        "  [{ts}] 🌿 Auto-start worktree: {} uses {}",
-                                        conflicting, canonical
-                                    );
-                                    Some(WorktreeInfo {
-                                        original_path: canonical.clone(),
-                                        worktree_path: wt_path,
-                                        branch_name: branch,
-                                    })
-                                }
-                                Err(_) => None,
-                            }
-                        } else {
-                            None
-                        }
-                    };
-                    let eff_path = wt_info
-                        .as_ref()
-                        .map(|wt| wt.worktree_path.clone())
-                        .unwrap_or_else(|| canonical.clone());
-                    let (ch_name_resolved, cat_name) =
-                        resolve_channel_category(ctx, channel_id).await;
-                    let existing = load_existing_session(&eff_path, Some(channel_id.get()));
-                    {
-                        let mut data = shared.core.lock().await;
-                        let session =
-                            data.sessions
-                                .entry(channel_id)
-                                .or_insert_with(|| DiscordSession {
-                                    session_id: None,
-                                    current_path: None,
-                                    history: Vec::new(),
-                                    pending_uploads: Vec::new(),
-                                    cleared: false,
-                                    channel_name: None,
-                                    category_name: None,
-                                    remote_profile_name: None,
-                                    channel_id: Some(channel_id.get()),
-                    
-                                    last_active: tokio::time::Instant::now(),
-                                    worktree: None,
-                                });
-                        session.current_path = Some(eff_path.clone());
-                        session.channel_name = ch_name_resolved;
-                        session.category_name = cat_name;
-                        session.channel_id = Some(channel_id.get());
-                        session.last_active = tokio::time::Instant::now();
-                        session.worktree = wt_info;
-                        if let Some((session_data, _)) = &existing {
-                            session.history = session_data.history.clone();
-                            session.session_id = Some(session_data.session_id.clone());
-                        }
-                    }
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    println!("  [{ts}] ▶ Auto-started session from workspace: {eff_path}");
-                    let sid = {
-                        let data = shared.core.lock().await;
-                        data.sessions
-                            .get(&channel_id)
-                            .and_then(|s| s.session_id.clone())
-                    };
-                    (sid, eff_path)
-                } else {
-                    rate_limit_wait(shared, channel_id).await;
-                    let _ = channel_id
-                        .say(&ctx.http, "No active session. Use `/start <path>` first.")
-                        .await;
-                    return Ok(());
-                }
-            } else {
-                rate_limit_wait(shared, channel_id).await;
-                let _ = channel_id
-                    .say(&ctx.http, "No active session. Use `/start <path>` first.")
-                    .await;
-                return Ok(());
-            }
-        }
-    };
-
-    // Add hourglass reaction to user's message
-    add_reaction(ctx, channel_id, user_msg_id, '⏳').await;
-
-    // Send placeholder message
-    rate_limit_wait(shared, channel_id).await;
-    let placeholder = channel_id
-        .send_message(&ctx.http, CreateMessage::new().content("..."))
-        .await?;
-    let placeholder_msg_id = placeholder.id;
-
-    // Sanitize input
-    let sanitized_input = ai_screen::sanitize_user_input(user_text);
-
-    let role_binding = {
-        let data = shared.core.lock().await;
-        let ch_name = data
-            .sessions
-            .get(&channel_id)
-            .and_then(|s| s.channel_name.as_deref());
-        resolve_role_binding(channel_id, ch_name)
-    };
-
-    // Prepend pending file uploads
-    let mut context_chunks = Vec::new();
-    if !pending_uploads.is_empty() {
-        context_chunks.push(pending_uploads.join("\n"));
-    }
-    if let Some(shared_memory) = role_binding.as_ref().and_then(|binding| {
-        build_shared_memory_context(&binding.role_id, provider, channel_id, session_id.is_some())
-    }) {
-        context_chunks.push(shared_memory);
-    }
-    context_chunks.push(sanitized_input);
-    let context_prompt = context_chunks.join("\n\n");
-
-    // Build disabled tools notice
-    let default_tools: std::collections::HashSet<&str> =
-        DEFAULT_ALLOWED_TOOLS.iter().copied().collect();
-    let allowed_set: std::collections::HashSet<&str> =
-        allowed_tools.iter().map(|s| s.as_str()).collect();
-    let disabled: Vec<&&str> = default_tools
-        .iter()
-        .filter(|t| !allowed_set.contains(**t))
-        .collect();
-    let disabled_notice = if disabled.is_empty() {
-        String::new()
-    } else {
-        let names: Vec<&str> = disabled.iter().map(|t| **t).collect();
-        format!(
-            "\n\nDISABLED TOOLS: The following tools have been disabled by the user: {}.\n\
-             You MUST NOT attempt to use these tools. \
-             If a user's request requires a disabled tool, do NOT proceed with the task. \
-             Instead, clearly inform the user which tool is needed and that it is currently disabled. \
-             Suggest they re-enable it with: /allowed +ToolName",
-            names.join(", ")
-        )
-    };
-
-    // Build skills notice for system prompt
-    let skills_notice = {
-        let skills = shared.skills_cache.read().await;
-        if skills.is_empty() {
-            String::new()
-        } else {
-            let list: Vec<String> = skills
-                .iter()
-                .map(|(name, desc)| format!("  - /{}: {}", name, desc))
-                .collect();
-            match provider {
-                ProviderKind::Claude => format!(
-                    "\n\nAvailable skills (invoke via the Skill tool):\n{}",
-                    list.join("\n")
-                ),
-                ProviderKind::Codex => format!(
-                    "\n\nAvailable local Codex skills (use them by name when relevant):\n{}",
-                    list.join("\n")
-                ),
-            }
-        }
-    };
-
-    // Build Discord context info
-    let discord_context = {
-        let data = shared.core.lock().await;
-        let session = data.sessions.get(&channel_id);
-        let ch_name = session.and_then(|s| s.channel_name.as_deref());
-        let cat_name = session.and_then(|s| s.category_name.as_deref());
-        match ch_name {
-            Some(name) => {
-                let cat_part = cat_name
-                    .map(|c| format!(" (category: {})", c))
-                    .unwrap_or_default();
-                format!(
-                    "Discord context: channel #{} (ID: {}){}, user: {} (ID: {})",
-                    name,
-                    channel_id.get(),
-                    cat_part,
-                    request_owner_name,
-                    request_owner.get()
-                )
-            }
-            None => format!(
-                "Discord context: DM, user: {} (ID: {})",
-                request_owner_name,
-                request_owner.get()
-            ),
-        }
-    };
-
-    let system_prompt_owned = build_system_prompt(
-        &discord_context,
-        &current_path,
-        channel_id,
-        token,
-        &disabled_notice,
-        &skills_notice,
-        role_binding.as_ref(),
-    );
-
-    // Create cancel token
-    let cancel_token = Arc::new(CancelToken::new());
-    {
-        let mut data = shared.core.lock().await;
-        data.cancel_tokens.insert(channel_id, cancel_token.clone());
-        data.active_request_owner.insert(channel_id, request_owner);
-    }
-
-    // Resolve remote profile for this channel
-    let remote_profile = {
-        let data = shared.core.lock().await;
-        data.sessions
-            .get(&channel_id)
-            .and_then(|s| s.remote_profile_name.as_ref())
-            .and_then(|name| {
-                let settings = crate::config::Settings::load();
-                settings
-                    .remote_profiles
-                    .iter()
-                    .find(|p| p.name == *name)
-                    .cloned()
-            })
-    };
-
-    // Resolve channel/tmux session name from current session state
-    let (channel_name, tmux_session_name) = {
-        let data = shared.core.lock().await;
-        let channel_name = data
-            .sessions
-            .get(&channel_id)
-            .and_then(|s| s.channel_name.clone());
-        let tmux_session_name = channel_name
-            .as_ref()
-            .map(|name| provider.build_tmux_session_name(name));
-        (channel_name, tmux_session_name)
-    };
-    let pcd_session_key = build_pcd_session_key(shared, channel_id, provider).await;
-    post_pcd_session_status(pcd_session_key.as_deref(), "working", provider, None).await;
-
-    let (inflight_tmux_name, inflight_output_path, inflight_input_fifo, inflight_offset) =
-        if remote_profile.is_none() && claude::is_tmux_available() {
-            if let Some(ref tmux_name) = tmux_session_name {
-                let (output_path, input_fifo_path) = tmux_runtime_paths(tmux_name);
-                let session_exists = std::process::Command::new("tmux")
-                    .args(["has-session", "-t", tmux_name])
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false);
-                let last_offset = if session_exists {
-                    std::fs::metadata(&output_path)
-                        .map(|m| m.len())
-                        .unwrap_or(0)
-                } else {
-                    0
-                };
-                (
-                    Some(tmux_name.clone()),
-                    Some(output_path),
-                    Some(input_fifo_path),
-                    last_offset,
-                )
-            } else {
-                (None, None, None, 0)
-            }
-        } else {
-            (None, None, None, 0)
-        };
-
-    let inflight_state = InflightTurnState::new(
-        provider,
-        channel_id.get(),
-        channel_name.clone(),
-        request_owner.get(),
-        user_msg_id.get(),
-        placeholder_msg_id.get(),
-        user_text.to_string(),
-        session_id.clone(),
-        inflight_tmux_name,
-        inflight_output_path,
-        inflight_input_fifo.clone(),
-        inflight_offset,
-    );
-    if let Err(e) = save_inflight_state(&inflight_state) {
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        println!("  [{ts}]   ⚠ inflight state save failed: {e}");
-    }
-
-    // Create channel for streaming
-    let (tx, rx) = mpsc::channel();
-
-    let session_id_clone = session_id.clone();
-    let current_path_clone = current_path.clone();
-    let cancel_token_clone = cancel_token.clone();
-
-    // Pause tmux watcher if one exists (so it doesn't read our turn's output)
-    if let Some(watcher) = shared.tmux_watchers.get(&channel_id) {
-        watcher.paused.store(true, Ordering::Relaxed);
-    }
-
-    // Run the provider in a blocking thread
-    tokio::task::spawn_blocking(move || {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match provider {
-            ProviderKind::Claude => claude::execute_command_streaming(
-                &context_prompt,
-                session_id_clone.as_deref(),
-                &current_path_clone,
-                tx.clone(),
-                Some(&system_prompt_owned),
-                Some(&allowed_tools),
-                Some(cancel_token_clone),
-                remote_profile.as_ref(),
-                tmux_session_name.as_deref(),
-            ),
-            ProviderKind::Codex => codex::execute_command_streaming(
-                &context_prompt,
-                session_id_clone.as_deref(),
-                &current_path_clone,
-                tx.clone(),
-                Some(&system_prompt_owned),
-                Some(&allowed_tools),
-                Some(cancel_token_clone),
-                remote_profile.as_ref(),
-                tmux_session_name.as_deref(),
-            ),
-        }));
-
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                eprintln!("  [streaming] Error: {}", e);
-                let _ = tx.send(StreamMessage::Error {
-                    message: e,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    exit_code: None,
-                });
-            }
-            Err(panic_info) => {
-                let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
-                    s.clone()
-                } else if let Some(s) = panic_info.downcast_ref::<&str>() {
-                    s.to_string()
-                } else {
-                    "unknown panic".to_string()
-                };
-                eprintln!("  [streaming] PANIC: {}", msg);
-                let _ = tx.send(StreamMessage::Error {
-                    message: format!("Internal error (panic): {}", msg),
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    exit_code: None,
-                });
-            }
-        }
-    });
-
-    spawn_turn_bridge(
-        ctx.http.clone(),
-        shared.clone(),
-        cancel_token.clone(),
-        rx,
-        TurnBridgeContext {
-            provider,
-            channel_id,
-            user_msg_id,
-            user_text_owned: user_text.to_string(),
-            request_owner_name: request_owner_name.to_string(),
-            request_owner: Some(request_owner),
-            serenity_ctx: Some(ctx.clone()),
-            token: Some(token.to_string()),
-            role_binding: role_binding.clone(),
-            pcd_session_key,
-            current_msg_id: placeholder_msg_id,
-            current_msg_len: 0,
-            response_sent_offset: 0,
-            full_response: String::new(),
-            tmux_last_offset: Some(inflight_offset),
-            new_session_id: session_id.clone(),
-            inflight_state,
-        },
-    );
-
-    Ok(())
-}
-
 /// Check if a path is a git repo and if another channel already uses it.
 /// Returns the conflicting channel's name if found.
 fn detect_worktree_conflict(
@@ -2859,192 +2681,6 @@ fn cleanup_git_worktree(wt_info: &WorktreeInfo) {
 
 // ─── File upload handling ────────────────────────────────────────────────────
 
-/// Handle file uploads from Discord messages
-async fn handle_file_upload(
-    ctx: &serenity::Context,
-    msg: &serenity::Message,
-    shared: &Arc<SharedData>,
-) -> Result<(), Error> {
-    let channel_id = msg.channel_id;
-
-    let has_session = {
-        let data = shared.core.lock().await;
-        data.sessions.get(&channel_id).is_some()
-    };
-
-    if !has_session {
-        rate_limit_wait(shared, channel_id).await;
-        let _ = channel_id
-            .say(&ctx.http, "No active session. Use `/start <path>` first.")
-            .await;
-        return Ok(());
-    }
-
-    let Some(save_dir) = channel_upload_dir(channel_id) else {
-        rate_limit_wait(shared, channel_id).await;
-        let _ = channel_id
-            .say(&ctx.http, "Cannot resolve upload directory.")
-            .await;
-        return Ok(());
-    };
-
-    if let Err(e) = fs::create_dir_all(&save_dir) {
-        rate_limit_wait(shared, channel_id).await;
-        let _ = channel_id
-            .say(
-                &ctx.http,
-                format!("Failed to prepare upload directory: {}", e),
-            )
-            .await;
-        return Ok(());
-    }
-
-    for attachment in &msg.attachments {
-        let file_name = &attachment.filename;
-
-        // Download file from Discord CDN
-        let buf = match reqwest::get(&attachment.url).await {
-            Ok(resp) => match resp.bytes().await {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    rate_limit_wait(shared, channel_id).await;
-                    let _ = channel_id
-                        .say(&ctx.http, format!("Download failed: {}", e))
-                        .await;
-                    continue;
-                }
-            },
-            Err(e) => {
-                rate_limit_wait(shared, channel_id).await;
-                let _ = channel_id
-                    .say(&ctx.http, format!("Download failed: {}", e))
-                    .await;
-                continue;
-            }
-        };
-
-        // Save to session path (sanitize filename)
-        let safe_name = Path::new(file_name)
-            .file_name()
-            .unwrap_or_else(|| std::ffi::OsStr::new("uploaded_file"));
-        let ts = chrono::Utc::now().timestamp_millis();
-        let stamped_name = format!("{}_{}", ts, safe_name.to_string_lossy());
-        let dest = save_dir.join(stamped_name);
-        let file_size = buf.len();
-
-        match fs::write(&dest, &buf) {
-            Ok(_) => {
-                let msg_text = format!("Saved: {}\n({} bytes)", dest.display(), file_size);
-                rate_limit_wait(shared, channel_id).await;
-                let _ = channel_id.say(&ctx.http, &msg_text).await;
-            }
-            Err(e) => {
-                rate_limit_wait(shared, channel_id).await;
-                let _ = channel_id
-                    .say(&ctx.http, format!("Failed to save file: {}", e))
-                    .await;
-                continue;
-            }
-        }
-
-        // Record upload in session
-        let upload_record = format!(
-            "[File uploaded] {} → {} ({} bytes)",
-            file_name,
-            dest.display(),
-            file_size
-        );
-        {
-            let mut data = shared.core.lock().await;
-            if let Some(session) = data.sessions.get_mut(&channel_id) {
-                session.history.push(HistoryItem {
-                    item_type: HistoryType::User,
-                    content: upload_record.clone(),
-                });
-                session.pending_uploads.push(upload_record);
-                if let Some(ref path) = session.current_path {
-                    save_session_to_file(session, path);
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Handle shell commands from raw text messages (! prefix)
-async fn handle_shell_command_raw(
-    ctx: &serenity::Context,
-    channel_id: ChannelId,
-    text: &str,
-    shared: &Arc<SharedData>,
-) -> Result<(), Error> {
-    let cmd_str = text.strip_prefix('!').unwrap_or("").trim();
-    if cmd_str.is_empty() {
-        rate_limit_wait(shared, channel_id).await;
-        let _ = channel_id
-            .say(&ctx.http, "Usage: `!<command>`\nExample: `!ls -la`")
-            .await;
-        return Ok(());
-    }
-
-    let working_dir = {
-        let data = shared.core.lock().await;
-        data.sessions
-            .get(&channel_id)
-            .and_then(|s| s.current_path.clone())
-            .unwrap_or_else(|| {
-                dirs::home_dir()
-                    .map(|h| h.display().to_string())
-                    .unwrap_or_else(|| "/".to_string())
-            })
-    };
-
-    let cmd_owned = cmd_str.to_string();
-    let working_dir_clone = working_dir.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        let child = std::process::Command::new("bash")
-            .args(["-c", &cmd_owned])
-            .current_dir(&working_dir_clone)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn();
-        match child {
-            Ok(child) => child.wait_with_output(),
-            Err(e) => Err(e),
-        }
-    })
-    .await;
-
-    let response = match result {
-        Ok(Ok(output)) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let exit_code = output.status.code().unwrap_or(-1);
-            let mut parts = Vec::new();
-            if !stdout.is_empty() {
-                parts.push(format!("```\n{}\n```", stdout.trim_end()));
-            }
-            if !stderr.is_empty() {
-                parts.push(format!("stderr:\n```\n{}\n```", stderr.trim_end()));
-            }
-            if parts.is_empty() {
-                parts.push(format!("(exit code: {})", exit_code));
-            } else if exit_code != 0 {
-                parts.push(format!("(exit code: {})", exit_code));
-            }
-            parts.join("\n")
-        }
-        Ok(Err(e)) => format!("Failed to execute: {}", e),
-        Err(e) => format!("Task error: {}", e),
-    };
-
-    send_long_message_raw(&ctx.http, channel_id, &response, shared).await?;
-    Ok(())
-}
-
 // ─── Sendfile (CLI) ──────────────────────────────────────────────────────────
 
 /// Send a file to a Discord channel (called from CLI --discord-sendfile)
@@ -3160,7 +2796,7 @@ async fn auto_restore_session(
                     channel_name: ch_name,
                     category_name: cat_name,
                     remote_profile_name: saved_remote.clone(),
-    
+
                     last_active: tokio::time::Instant::now(),
                     worktree: None,
                 });

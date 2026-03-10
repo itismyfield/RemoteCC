@@ -1,6 +1,6 @@
 [package]
 name = "remotecc"
-version = "0.4.47"
+version = "0.4.48"
 edition = "2021"
 authors = ["cokac <monogatree@gmail.com>"]
 description = "Multi-panel terminal file manager with AI-powered natural language commands"
@@ -13,7 +13,7 @@ categories = ["command-line-utilities", "filesystem"]
 [dependencies]
 ratatui = { version = "0.28", features = ["unstable-rendered-line-info"] }
 crossterm = "0.28"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "process", "io-util", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "process", "io-util", "macros", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }

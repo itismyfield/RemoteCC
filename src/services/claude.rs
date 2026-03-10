@@ -6,6 +6,10 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
 use std::sync::OnceLock;
 
+use crate::services::discord::restart_report::{
+    RESTART_REPORT_CHANNEL_ENV, RESTART_REPORT_PROVIDER_ENV,
+};
+use crate::services::provider::ProviderKind;
 use crate::services::remote::RemoteProfile;
 use crate::utils::format::safe_prefix;
 
@@ -59,6 +63,25 @@ fn resolve_claude_path() -> Option<String> {
 /// Get the cached claude binary path, resolving it on first call.
 fn get_claude_path() -> Option<&'static str> {
     CLAUDE_PATH.get_or_init(|| resolve_claude_path()).as_deref()
+}
+
+fn current_tmux_owner_marker() -> String {
+    std::env::var("REMOTECC_ROOT_DIR")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| dirs::home_dir().map(|home| home.join(".remotecc").display().to_string()))
+        .unwrap_or_else(|| ".remotecc".to_string())
+}
+
+fn tmux_owner_path(tmux_session_name: &str) -> String {
+    format!("/tmp/remotecc-{}.owner", tmux_session_name)
+}
+
+fn write_tmux_owner_marker(tmux_session_name: &str) -> Result<(), String> {
+    let owner_path = tmux_owner_path(tmux_session_name);
+    std::fs::write(&owner_path, current_tmux_owner_marker())
+        .map_err(|e| format!("Failed to write tmux owner marker: {}", e))
 }
 
 /// Global runtime debug flag — togglable via `/debug` command or COKACDIR_DEBUG=1 env var.
@@ -208,6 +231,31 @@ pub enum ReadOutputResult {
     SessionDied { offset: u64 },
     /// User cancelled the operation
     Cancelled { offset: u64 },
+}
+
+fn tmux_session_alive(tmux_session_name: &str) -> bool {
+    Command::new("tmux")
+        .args(["has-session", "-t", tmux_session_name])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn tmux_capture_indicates_ready_for_input(capture: &str) -> bool {
+    capture.contains("Ready for input (type message + Enter)")
+}
+
+pub(crate) fn tmux_session_ready_for_input(tmux_session_name: &str) -> bool {
+    Command::new("tmux")
+        .args(["capture-pane", "-p", "-t", tmux_session_name, "-S", "-80"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            tmux_capture_indicates_ready_for_input(&stdout)
+        })
+        .unwrap_or(false)
 }
 
 /// Token for cooperative cancellation of streaming requests.
@@ -521,6 +569,8 @@ pub fn execute_command_streaming(
     cancel_token: Option<std::sync::Arc<CancelToken>>,
     remote_profile: Option<&RemoteProfile>,
     tmux_session_name: Option<&str>,
+    report_channel_id: Option<u64>,
+    report_provider: Option<ProviderKind>,
 ) -> Result<(), String> {
     debug_log("========================================");
     debug_log("=== execute_command_streaming START ===");
@@ -620,6 +670,8 @@ IMPORTANT: Format your responses using Markdown for better readability:
                     sender,
                     cancel_token,
                     tmux_name,
+                    report_channel_id,
+                    report_provider,
                 );
             }
         } else {
@@ -658,7 +710,8 @@ IMPORTANT: Format your responses using Markdown for better readability:
     debug_log("Env: BASH_MAX_TIMEOUT_MS=86400000");
 
     let spawn_start = std::time::Instant::now();
-    let mut child = Command::new(claude_bin)
+    let mut command = Command::new(claude_bin);
+    command
         .args(&args)
         .current_dir(working_dir)
         .env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "64000")
@@ -667,16 +720,22 @@ IMPORTANT: Format your responses using Markdown for better readability:
         .env_remove("CLAUDECODE") // Allow running from within Claude Code sessions
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            debug_log(&format!(
-                "ERROR: Failed to spawn after {:?}: {}",
-                spawn_start.elapsed(),
-                e
-            ));
-            format!("Failed to start Claude: {}. Is Claude CLI installed?", e)
-        })?;
+        .stderr(Stdio::piped());
+    if let Some(channel_id) = report_channel_id {
+        command.env(RESTART_REPORT_CHANNEL_ENV, channel_id.to_string());
+    }
+    if let Some(provider) = report_provider {
+        command.env(RESTART_REPORT_PROVIDER_ENV, provider.as_str());
+    }
+
+    let mut child = command.spawn().map_err(|e| {
+        debug_log(&format!(
+            "ERROR: Failed to spawn after {:?}: {}",
+            spawn_start.elapsed(),
+            e
+        ));
+        format!("Failed to start Claude: {}. Is Claude CLI installed?", e)
+    })?;
     debug_log(&format!(
         "Claude process spawned successfully in {:?}, pid={:?}",
         spawn_start.elapsed(),
@@ -1529,6 +1588,8 @@ fn execute_streaming_local_tmux(
     sender: Sender<StreamMessage>,
     cancel_token: Option<std::sync::Arc<CancelToken>>,
     tmux_session_name: &str,
+    report_channel_id: Option<u64>,
+    report_provider: Option<ProviderKind>,
 ) -> Result<(), String> {
     debug_log(&format!(
         "=== execute_streaming_local_tmux START: {} ===",
@@ -1538,6 +1599,7 @@ fn execute_streaming_local_tmux(
     let output_path = format!("/tmp/remotecc-{}.jsonl", tmux_session_name);
     let input_fifo_path = format!("/tmp/remotecc-{}.input", tmux_session_name);
     let prompt_path = format!("/tmp/remotecc-{}.prompt", tmux_session_name);
+    let owner_path = tmux_owner_path(tmux_session_name);
 
     // Check if tmux session already exists (follow-up to running session)
     let session_exists = Command::new("tmux")
@@ -1565,6 +1627,7 @@ fn execute_streaming_local_tmux(
     let _ = std::fs::remove_file(&output_path);
     let _ = std::fs::remove_file(&input_fifo_path);
     let _ = std::fs::remove_file(&prompt_path);
+    let _ = std::fs::remove_file(&owner_path);
 
     // Create output file (empty)
     std::fs::write(&output_path, "").map_err(|e| format!("Failed to create output file: {}", e))?;
@@ -1585,6 +1648,7 @@ fn execute_streaming_local_tmux(
     // Write prompt to temp file
     std::fs::write(&prompt_path, prompt)
         .map_err(|e| format!("Failed to write prompt file: {}", e))?;
+    write_tmux_owner_marker(tmux_session_name)?;
 
     // Get paths
     let exe =
@@ -1614,7 +1678,26 @@ fn execute_streaming_local_tmux(
     debug_log(&format!("Wrapper cmd: {}", safe_prefix(&wrapper_cmd, 300)));
 
     // Launch tmux session (remove CLAUDECODE so nested claude invocations work)
-    let wrapper_cmd_with_env = format!("env -u CLAUDECODE {}", wrapper_cmd);
+    let mut wrapper_env_prefix = vec![
+        "env".to_string(),
+        "-u".to_string(),
+        "CLAUDECODE".to_string(),
+    ];
+    if let Some(channel_id) = report_channel_id {
+        wrapper_env_prefix.push(format!(
+            "{}={}",
+            RESTART_REPORT_CHANNEL_ENV,
+            shell_escape(&channel_id.to_string())
+        ));
+    }
+    if let Some(provider) = report_provider {
+        wrapper_env_prefix.push(format!(
+            "{}={}",
+            RESTART_REPORT_PROVIDER_ENV,
+            shell_escape(provider.as_str())
+        ));
+    }
+    let wrapper_cmd_with_env = format!("{} {}", wrapper_env_prefix.join(" "), wrapper_cmd);
     let tmux_result = Command::new("tmux")
         .args([
             "new-session",
@@ -1634,6 +1717,7 @@ fn execute_streaming_local_tmux(
         let _ = std::fs::remove_file(&output_path);
         let _ = std::fs::remove_file(&input_fifo_path);
         let _ = std::fs::remove_file(&prompt_path);
+        let _ = std::fs::remove_file(&owner_path);
         return Err(format!("tmux error: {}", stderr));
     }
 
@@ -1870,6 +1954,7 @@ pub(crate) fn read_output_file_until_result(
     let mut state = StreamLineState::new();
     let mut buf = [0u8; 8192];
     let mut no_data_count: u32 = 0;
+    let mut consecutive_ready_count: u32 = 0;
 
     loop {
         // Check cancellation
@@ -1888,20 +1973,47 @@ pub(crate) fn read_output_file_until_result(
                 no_data_count += 1;
                 if no_data_count % 50 == 0 {
                     // Every ~5 seconds
-                    let alive = Command::new("tmux")
-                        .args(["has-session", "-t", tmux_session_name])
-                        .status()
-                        .map(|s| s.success())
-                        .unwrap_or(false);
+                    let alive = tmux_session_alive(tmux_session_name);
                     if !alive {
                         debug_log("tmux session ended while reading output");
                         break;
+                    }
+
+                    let file_len = std::fs::metadata(output_path)
+                        .map(|meta| meta.len())
+                        .unwrap_or(current_offset);
+                    let has_new_bytes = file_len > current_offset;
+                    if !has_new_bytes && tmux_session_ready_for_input(tmux_session_name) {
+                        consecutive_ready_count += 1;
+                        // Require 3 consecutive ready checks (~15s) to avoid false
+                        // positives during Claude Code auto-continue transitions.
+                        if consecutive_ready_count >= 3 {
+                            debug_log(
+                                "tmux session returned to ready prompt without result event; synthesizing completion",
+                            );
+                            let synthetic = StreamMessage::Done {
+                                result: String::new(),
+                                session_id: state.last_session_id.clone(),
+                            };
+                            if sender.send(synthetic).is_err() {
+                                return Ok(ReadOutputResult::Cancelled {
+                                    offset: current_offset,
+                                });
+                            }
+                            state.final_result = Some(String::new());
+                            return Ok(ReadOutputResult::Completed {
+                                offset: current_offset,
+                            });
+                        }
+                    } else {
+                        consecutive_ready_count = 0;
                     }
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
             Ok(n) => {
                 no_data_count = 0;
+                consecutive_ready_count = 0;
                 current_offset += n as u64;
                 let _ = sender.send(StreamMessage::OutputOffset {
                     offset: current_offset,
@@ -2093,180 +2205,229 @@ fn execute_streaming_remote_tmux(
         let prompt_b64 = base64::engine::general_purpose::STANDARD.encode(prompt.as_bytes());
         let script_b64 = base64::engine::general_purpose::STANDARD.encode(script_content.as_bytes());
 
-        // === PHASE 1: Setup channel — create/resume tmux session ===
-        let is_followup;
-        {
-            let mut setup_channel = ssh.channel_open_session()
-                .await
-                .map_err(|e| format!("Failed to open setup channel: {}", e))?;
+        let mut force_recreate = false;
+        let mut retried_after_missing_output = false;
 
-            // Setup command: check tmux, create session if needed, report status.
-            // The wrapper command is written as a script file to avoid nested shell-escaping.
-            // First block: detect and clean up stale sessions (dead pane or auth failure).
-            // Second block: proceed with FOLLOWUP or NEW as before.
-            let setup_cmd = format!(
-                r#"{{ [ -f ~/.zshrc ] && source ~/.zshrc; [ -f ~/.bashrc ] && source ~/.bashrc; }} 2>/dev/null; \
-                {cd}if tmux has-session -t {name} 2>/dev/null; then \
-                    _PANE_DEAD=$(tmux list-panes -t {name} -F '#{{pane_dead}}' 2>/dev/null | head -1); \
-                    if [ "$_PANE_DEAD" = "1" ] || grep -q '"error":"authentication_failed"' {output} 2>/dev/null; then \
-                        tmux kill-session -t {name} 2>/dev/null; \
+        loop {
+            // === PHASE 1: Setup channel — create/resume tmux session ===
+            let is_followup;
+            {
+                let mut setup_channel = ssh.channel_open_session()
+                    .await
+                    .map_err(|e| format!("Failed to open setup channel: {}", e))?;
+
+                let force_cleanup = if force_recreate {
+                    format!(
+                        r#"if tmux has-session -t {name} 2>/dev/null; then \
+                            tmux kill-session -t {name} 2>/dev/null; \
+                        fi; \
                         pkill -f 'tail -f {output}' 2>/dev/null; \
-                        rm -f {output} {input_fifo} {script} 2>/dev/null; \
+                        pkill -f 'tail -F {output}' 2>/dev/null; \
+                        rm -f {output} {input_fifo} {prompt} {script} 2>/dev/null; \
+                        "#,
+                        name = shell_escape(&tmux_name),
+                        output = shell_escape(&output_path),
+                        input_fifo = shell_escape(&input_fifo_path),
+                        prompt = shell_escape(&prompt_path),
+                        script = shell_escape(&script_path),
+                    )
+                } else {
+                    String::new()
+                };
+
+                // Setup command: check tmux, create session if needed, report status.
+                // The wrapper command is written as a script file to avoid nested shell-escaping.
+                // First block: detect and clean up stale sessions (dead pane or auth failure).
+                // Second block: proceed with FOLLOWUP or NEW as before.
+                let setup_cmd = format!(
+                    r#"{{ [ -f ~/.zshrc ] && source ~/.zshrc; [ -f ~/.bashrc ] && source ~/.bashrc; }} 2>/dev/null; \
+                    {cd}{force_cleanup}if tmux has-session -t {name} 2>/dev/null; then \
+                        _PANE_DEAD=$(tmux list-panes -t {name} -F '#{{pane_dead}}' 2>/dev/null | head -1); \
+                        _HAS_OUTPUT=0; [ -f {output} ] && _HAS_OUTPUT=1; \
+                        _HAS_FIFO=0; [ -p {input_fifo} ] && _HAS_FIFO=1; \
+                        if [ "$_PANE_DEAD" = "1" ] || [ "$_HAS_OUTPUT" != "1" ] || [ "$_HAS_FIFO" != "1" ] || grep -q '"error":"authentication_failed"' {output} 2>/dev/null; then \
+                            tmux kill-session -t {name} 2>/dev/null; \
+                            pkill -f 'tail -f {output}' 2>/dev/null; \
+                            pkill -f 'tail -F {output}' 2>/dev/null; \
+                            rm -f {output} {input_fifo} {prompt} {script} 2>/dev/null; \
+                        fi; \
                     fi; \
+                    if tmux has-session -t {name} 2>/dev/null; then \
+                        echo 'FOLLOWUP'; \
+                        OFFSET=$(wc -c < {output} 2>/dev/null || echo 0); \
+                        echo "$OFFSET"; \
+                        echo '{prompt_b64}' | base64 -d > {input_fifo}; \
+                    else \
+                        echo '{prompt_b64}' | base64 -d > {prompt} && \
+                        rm -f {output} {input_fifo} && touch {output} && mkfifo {input_fifo} && \
+                        echo '{script_b64}' | base64 -d > {script} && chmod +x {script} && \
+                        tmux new-session -d -s {name} {script} && \
+                        echo 'NEW' || echo 'FAILED'; \
+                    fi"#,
+                    cd = cd_part,
+                    force_cleanup = force_cleanup,
+                    name = shell_escape(&tmux_name),
+                    output = shell_escape(&output_path),
+                    input_fifo = shell_escape(&input_fifo_path),
+                    prompt = shell_escape(&prompt_path),
+                    prompt_b64 = prompt_b64,
+                    script_b64 = script_b64,
+                    script = shell_escape(&script_path),
+                );
+
+                eprintln!("  [remote-tmux] Phase 1: setup ({} bytes)...", setup_cmd.len());
+                setup_channel.exec(true, setup_cmd)
+                    .await
+                    .map_err(|e| format!("Failed to exec setup: {}", e))?;
+                let _ = setup_channel.eof().await;
+
+                let mut setup_output = Vec::new();
+                while let Some(msg) = setup_channel.wait().await {
+                    if let russh::ChannelMsg::Data { ref data } = msg {
+                        setup_output.extend_from_slice(data);
+                    }
+                }
+                let setup_str = String::from_utf8_lossy(&setup_output).to_string();
+                let setup_lines: Vec<&str> = setup_str.trim().lines().collect();
+                eprintln!("  [remote-tmux] Setup result: {:?}", setup_lines);
+
+                is_followup = setup_lines.first().map_or(false, |l| *l == "FOLLOWUP");
+                if setup_lines.first().map_or(true, |l| *l == "FAILED") && !is_followup {
+                    return Err("Failed to create tmux session on remote".to_string());
+                }
+            }
+            // === PHASE 2: Streaming channel — read output via Claude directly ===
+            // Use the same proven pattern as execute_streaming_remote:
+            // run a single long-lived process whose stdout IS the data stream.
+            let mut stream_channel = ssh.channel_open_session()
+                .await
+                .map_err(|e| format!("Failed to open stream channel: {}", e))?;
+
+            // Use a simple script: source profile for PATH, then exec tail -f
+            // The 'exec' replaces the shell with tail, so tail's stdout goes directly to SSH channel.
+            let stream_cmd = format!(
+                r#"{{ [ -f ~/.zshrc ] && source ~/.zshrc; [ -f ~/.bashrc ] && source ~/.bashrc; }} 2>/dev/null; \
+                _WAIT_OK=0; \
+                for _ in $(seq 1 100); do \
+                    if [ -f {output} ]; then \
+                        _WAIT_OK=1; \
+                        break; \
+                    fi; \
+                    sleep 0.1; \
+                done; \
+                if [ "$_WAIT_OK" != "1" ]; then \
+                    echo "tail: {output}: No such file or directory" >&2; \
+                    exit 1; \
                 fi; \
-                if tmux has-session -t {name} 2>/dev/null; then \
-                    echo 'FOLLOWUP'; \
-                    OFFSET=$(wc -c < {output} 2>/dev/null || echo 0); \
-                    echo "$OFFSET"; \
-                    echo '{prompt_b64}' | base64 -d > {input_fifo}; \
-                else \
-                    echo '{prompt_b64}' | base64 -d > {prompt} && \
-                    rm -f {output} {input_fifo} && touch {output} && mkfifo {input_fifo} && \
-                    echo '{script_b64}' | base64 -d > {script} && chmod +x {script} && \
-                    tmux new-session -d -s {name} {script} && \
-                    echo 'NEW' || echo 'FAILED'; \
-                fi"#,
-                cd = cd_part,
-                name = shell_escape(&tmux_name),
+                exec tail -f {output}"#,
                 output = shell_escape(&output_path),
-                input_fifo = shell_escape(&input_fifo_path),
-                prompt = shell_escape(&prompt_path),
-                prompt_b64 = prompt_b64,
-                script_b64 = script_b64,
-                script = shell_escape(&script_path),
             );
 
-            eprintln!("  [remote-tmux] Phase 1: setup ({} bytes)...", setup_cmd.len());
-            setup_channel.exec(true, setup_cmd)
+            eprintln!("  [remote-tmux] Phase 2: waiting for output then tail -f ...");
+            stream_channel.exec(true, stream_cmd)
                 .await
-                .map_err(|e| format!("Failed to exec setup: {}", e))?;
-            // Close stdin immediately (not needed)
-            let _ = setup_channel.eof().await;
+                .map_err(|e| format!("Failed to exec stream: {}", e))?;
+            let _ = stream_channel.eof().await;
 
-            // Read setup response
-            let mut setup_output = Vec::new();
-            while let Some(msg) = setup_channel.wait().await {
-                if let russh::ChannelMsg::Data { ref data } = msg {
-                    setup_output.extend_from_slice(data);
+            // Read output (same pattern as execute_streaming_remote)
+            let mut line_buf = Vec::new();
+            let mut stderr_buf = Vec::new();
+            let mut exit_status: Option<u32> = None;
+            let mut line_state = StreamLineState::new();
+
+            while let Some(msg) = stream_channel.wait().await {
+                if let Some(ref token) = cancel_token_inner {
+                    if token.cancelled.load(Ordering::Relaxed) {
+                        debug_log("Cancel detected — closing SSH channel");
+                        ssh_cancel.store(true, Ordering::Relaxed);
+                        let _ = stream_channel.close().await;
+                        return Ok(());
+                    }
                 }
-            }
-            let setup_str = String::from_utf8_lossy(&setup_output).to_string();
-            let setup_lines: Vec<&str> = setup_str.trim().lines().collect();
-            eprintln!("  [remote-tmux] Setup result: {:?}", setup_lines);
 
-            is_followup = setup_lines.first().map_or(false, |l| *l == "FOLLOWUP");
-            if setup_lines.first().map_or(true, |l| *l == "FAILED") && !is_followup {
-                return Err("Failed to create tmux session on remote".to_string());
-            }
-        }
-
-        // === PHASE 2: Streaming channel — read output via Claude directly ===
-        // Use the same proven pattern as execute_streaming_remote:
-        // run a single long-lived process whose stdout IS the data stream.
-        let mut stream_channel = ssh.channel_open_session()
-            .await
-            .map_err(|e| format!("Failed to open stream channel: {}", e))?;
-
-        // Use a simple script: source profile for PATH, then exec tail -f
-        // The 'exec' replaces the shell with tail, so tail's stdout goes directly to SSH channel.
-        let stream_cmd = format!(
-            r#"{{ [ -f ~/.zshrc ] && source ~/.zshrc; [ -f ~/.bashrc ] && source ~/.bashrc; }} 2>/dev/null; exec tail -f {output}"#,
-            output = shell_escape(&output_path),
-        );
-
-        eprintln!("  [remote-tmux] Phase 2: streaming tail -f ...");
-        stream_channel.exec(true, stream_cmd)
-            .await
-            .map_err(|e| format!("Failed to exec stream: {}", e))?;
-        let _ = stream_channel.eof().await;
-
-        // Read output (same pattern as execute_streaming_remote)
-        let mut line_buf = Vec::new();
-        let mut stderr_buf = Vec::new();
-        let mut exit_status: Option<u32> = None;
-        let mut line_state = StreamLineState::new();
-
-        while let Some(msg) = stream_channel.wait().await {
-            if let Some(ref token) = cancel_token_inner {
-                if token.cancelled.load(Ordering::Relaxed) {
-                    debug_log("Cancel detected — closing SSH channel");
-                    ssh_cancel.store(true, Ordering::Relaxed);
-                    let _ = stream_channel.close().await;
-                    return Ok(());
-                }
-            }
-
-            match msg {
-                russh::ChannelMsg::Data { ref data } => {
-                    line_buf.extend_from_slice(data);
-                    while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
-                        let line_bytes: Vec<u8> = line_buf.drain(..=pos).collect();
-                        if let Ok(line) = String::from_utf8(line_bytes) {
-                            let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
-                            if !process_stream_line(trimmed, &sender, &mut line_state) {
-                                let _ = stream_channel.close().await;
-                                return Ok(());
-                            }
-                            if line_state.final_result.is_some() {
-                                let _ = stream_channel.close().await;
-                                return Ok(());
+                match msg {
+                    russh::ChannelMsg::Data { ref data } => {
+                        line_buf.extend_from_slice(data);
+                        while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
+                            let line_bytes: Vec<u8> = line_buf.drain(..=pos).collect();
+                            if let Ok(line) = String::from_utf8(line_bytes) {
+                                let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+                                if !process_stream_line(trimmed, &sender, &mut line_state) {
+                                    let _ = stream_channel.close().await;
+                                    return Ok(());
+                                }
+                                if line_state.final_result.is_some() {
+                                    let _ = stream_channel.close().await;
+                                    return Ok(());
+                                }
                             }
                         }
                     }
-                }
-                russh::ChannelMsg::ExtendedData { data, ext } => {
-                    if ext == 1 {
-                        stderr_buf.extend_from_slice(&data);
+                    russh::ChannelMsg::ExtendedData { data, ext } => {
+                        if ext == 1 {
+                            stderr_buf.extend_from_slice(&data);
+                        }
                     }
+                    russh::ChannelMsg::ExitStatus { exit_status: s } => {
+                        exit_status = Some(s);
+                    }
+                    _ => {}
                 }
-                russh::ChannelMsg::ExitStatus { exit_status: s } => {
-                    exit_status = Some(s);
+            }
+
+            if !line_buf.is_empty() {
+                if let Ok(line) = String::from_utf8(line_buf) {
+                    let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+                    let _ = process_stream_line(trimmed, &sender, &mut line_state);
                 }
-                _ => {}
             }
-        }
 
-        // Process remaining buffer
-        if !line_buf.is_empty() {
-            if let Ok(line) = String::from_utf8(line_buf) {
-                let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
-                let _ = process_stream_line(trimmed, &sender, &mut line_state);
+            let stderr_msg = String::from_utf8_lossy(&stderr_buf).to_string();
+            eprintln!("  [remote-tmux] Stream ended. exit_status={:?}, stderr_len={}, tokens_in={}, has_result={}",
+                exit_status, stderr_msg.len(), line_state.accum_input_tokens, line_state.final_result.is_some());
+            if !stderr_msg.is_empty() {
+                eprintln!("  [remote-tmux] stderr: {}", safe_prefix(&stderr_msg, 500));
             }
-        }
 
-        // Handle errors
-        let stderr_msg = String::from_utf8_lossy(&stderr_buf).to_string();
-        eprintln!("  [remote-tmux] Stream ended. exit_status={:?}, stderr_len={}, tokens_in={}, has_result={}",
-            exit_status, stderr_msg.len(), line_state.accum_input_tokens, line_state.final_result.is_some());
-        if !stderr_msg.is_empty() {
-            eprintln!("  [remote-tmux] stderr: {}", safe_prefix(&stderr_msg, 500));
-        }
-        let success = exit_status.map_or(true, |s| s == 0);
-        if line_state.stdout_error.is_some() || (!success && line_state.final_result.is_none()) {
-            let (message, stdout_raw) = if let Some((msg, raw)) = line_state.stdout_error {
-                (msg, raw)
-            } else {
-                (format!("Remote tmux process exited with code {:?}", exit_status), String::new())
-            };
-            let _ = sender.send(StreamMessage::Error {
-                message,
-                stdout: stdout_raw,
-                stderr: stderr_msg,
-                exit_code: exit_status.map(|s| s as i32),
-            });
+            let missing_output_after_followup = is_followup
+                && !retried_after_missing_output
+                && line_state.final_result.is_none()
+                && line_state.stdout_error.is_none()
+                && stderr_msg.contains("No such file or directory");
+            if missing_output_after_followup {
+                eprintln!("  [remote-tmux] FOLLOWUP lost output file; forcing NEW retry...");
+                force_recreate = true;
+                retried_after_missing_output = true;
+                continue;
+            }
+
+            let success = exit_status.map_or(true, |s| s == 0);
+            if line_state.stdout_error.is_some() || (!success && line_state.final_result.is_none()) {
+                let (message, stdout_raw) = if let Some((msg, raw)) = line_state.stdout_error {
+                    (msg, raw)
+                } else {
+                    (format!("Remote tmux process exited with code {:?}", exit_status), String::new())
+                };
+                let _ = sender.send(StreamMessage::Error {
+                    message,
+                    stdout: stdout_raw,
+                    stderr: stderr_msg,
+                    exit_code: exit_status.map(|s| s as i32),
+                });
+                return Ok(());
+            }
+
+            if line_state.final_result.is_none() {
+                eprintln!("  [remote-tmux] No result received, sending empty Done");
+                let _ = sender.send(StreamMessage::Done {
+                    result: String::new(),
+                    session_id: line_state.last_session_id,
+                });
+            }
+
+            debug_log("=== execute_streaming_remote_tmux END (success) ===");
             return Ok(());
         }
-
-        if line_state.final_result.is_none() {
-            eprintln!("  [remote-tmux] No result received, sending empty Done");
-            let _ = sender.send(StreamMessage::Done {
-                result: String::new(),
-                session_id: line_state.last_session_id,
-            });
-        }
-
-        debug_log("=== execute_streaming_remote_tmux END (success) ===");
-        Ok(())
     })
 }
 
@@ -2528,5 +2689,17 @@ mod tests {
 
         let msg = parse_stream_message(&json);
         assert!(msg.is_none());
+    }
+
+    #[test]
+    fn test_tmux_capture_detects_ready_prompt() {
+        let capture = "...\n▶ Ready for input (type message + Enter)\n";
+        assert!(tmux_capture_indicates_ready_for_input(capture));
+    }
+
+    #[test]
+    fn test_tmux_capture_ignores_non_ready_prompt() {
+        let capture = "Claude is still working...\n";
+        assert!(!tmux_capture_indicates_ready_for_input(capture));
     }
 }

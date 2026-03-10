@@ -1,5 +1,5 @@
 use poise::serenity_prelude as serenity;
-use serenity::{ChannelId, CreateMessage};
+use serenity::{ChannelId, CreateMessage, EditMessage, MessageId};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -613,6 +613,45 @@ pub(super) async fn send_long_message_raw(
 
     let chunks = split_message(text);
     for chunk in &chunks {
+        rate_limit_wait(shared, channel_id).await;
+        channel_id
+            .send_message(http, CreateMessage::new().content(chunk))
+            .await?;
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    }
+
+    Ok(())
+}
+
+/// Replace an existing Discord message with the first chunk, then send the remaining chunks.
+pub(super) async fn replace_long_message_raw(
+    http: &serenity::Http,
+    channel_id: ChannelId,
+    message_id: MessageId,
+    text: &str,
+    shared: &Arc<SharedData>,
+) -> Result<(), Error> {
+    let chunks = split_message(text);
+    let Some(first_chunk) = chunks.first() else {
+        return Ok(());
+    };
+
+    rate_limit_wait(shared, channel_id).await;
+    let edit_result = channel_id
+        .edit_message(http, message_id, EditMessage::new().content(first_chunk))
+        .await;
+
+    if let Err(e) = edit_result {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        println!(
+            "  [{ts}] ⚠ replace_long_message_raw edit failed for channel {} msg {}: {e}",
+            channel_id.get(),
+            message_id.get()
+        );
+        return send_long_message_raw(http, channel_id, text, shared).await;
+    }
+
+    for chunk in chunks.iter().skip(1) {
         rate_limit_wait(shared, channel_id).await;
         channel_id
             .send_message(http, CreateMessage::new().content(chunk))

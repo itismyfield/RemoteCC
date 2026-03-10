@@ -11,6 +11,28 @@ use super::formatting::{format_for_discord, send_long_message_raw};
 use super::settings::{channel_supports_provider, resolve_role_binding};
 use super::{SharedData, TmuxWatcherHandle};
 
+fn current_tmux_owner_marker() -> String {
+    std::env::var("REMOTECC_ROOT_DIR")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| dirs::home_dir().map(|home| home.join(".remotecc").display().to_string()))
+        .unwrap_or_else(|| ".remotecc".to_string())
+}
+
+fn tmux_owner_path(session_name: &str) -> String {
+    format!("/tmp/remotecc-{}.owner", session_name)
+}
+
+fn session_belongs_to_current_runtime(session_name: &str, current_owner_marker: &str) -> bool {
+    std::fs::read_to_string(tmux_owner_path(session_name))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(|value| value == current_owner_marker)
+        .unwrap_or(false)
+}
+
 /// Background watcher that continuously tails a tmux output file.
 /// When Claude produces output from terminal input (not Discord), relay it to Discord.
 pub(super) async fn tmux_output_watcher(
@@ -33,8 +55,8 @@ pub(super) async fn tmux_output_watcher(
     let mut current_offset = initial_offset;
 
     loop {
-        // Check cancel
-        if cancel.load(Ordering::Relaxed) {
+        // Check cancel or global shutdown (both exit quietly, no "session ended" message)
+        if cancel.load(Ordering::Relaxed) || shared.shutting_down.load(Ordering::Relaxed) {
             break;
         }
 
@@ -421,6 +443,7 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
             TmuxWatcherHandle {
                 paused: paused.clone(),
                 resume_offset: resume_offset.clone(),
+                cancel: cancel.clone(),
             },
         );
 
@@ -442,6 +465,7 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
 /// Called after restore_tmux_watchers to clean up sessions from renamed/deleted channels.
 pub(super) async fn cleanup_orphan_tmux_sessions(shared: &Arc<SharedData>) {
     let provider = shared.settings.read().await.provider;
+    let current_owner_marker = current_tmux_owner_marker();
 
     let output = match tokio::task::spawn_blocking(|| {
         std::process::Command::new("tmux")
@@ -466,6 +490,9 @@ pub(super) async fn cleanup_orphan_tmux_sessions(shared: &Arc<SharedData>) {
                 continue;
             };
             if session_provider != provider {
+                continue;
+            }
+            if !session_belongs_to_current_runtime(session_name, &current_owner_marker) {
                 continue;
             }
 
@@ -514,6 +541,7 @@ pub(super) async fn cleanup_orphan_tmux_sessions(shared: &Arc<SharedData>) {
             let _ = std::fs::remove_file(format!("/tmp/remotecc-{}.jsonl", name));
             let _ = std::fs::remove_file(format!("/tmp/remotecc-{}.input", name));
             let _ = std::fs::remove_file(format!("/tmp/remotecc-{}.prompt", name));
+            let _ = std::fs::remove_file(tmux_owner_path(name));
         }
     }
 }
