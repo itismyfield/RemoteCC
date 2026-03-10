@@ -254,11 +254,10 @@ pub(super) async fn flush_restart_reports(
                 report.completed_at.clone(),
             ),
             "pending" => (
-                "✅",
-                "ok",
-                "원래 답변은 재시작 때문에 중간에서 끊겼습니다.\n새 dcserver가 여기서 마무리를 이어받았고, ready check도 통과했습니다."
-                    .to_string(),
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                "⏳",
+                "pending",
+                report.summary.clone(),
+                report.completed_at.clone(),
             ),
             _ => (
                 "❌",

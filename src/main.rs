@@ -939,7 +939,12 @@ fn handle_restart_dcserver(
                 .args(["has-session", "-t", tmux_session])
                 .status();
             if check.map(|s| s.success()).unwrap_or(false) {
-                match verify_dcserver_ready_since(0, READY_TIMEOUT) {
+                // Use current log size as offset to avoid matching stale "Bot connected" lines
+                let log_offset = dcserver_stdout_log_path()
+                    .and_then(|p| fs::metadata(&p).ok())
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                match verify_dcserver_ready_since(log_offset, READY_TIMEOUT) {
                     Ok(()) => {
                         println!(
                             "✅ Discord bot started in tmux session '{}' and passed ready check",

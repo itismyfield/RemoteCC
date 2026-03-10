@@ -30,6 +30,43 @@ fn output_has_result_after_offset(output_path: &str, start_offset: u64) -> bool 
         })
 }
 
+/// Extract accumulated assistant text from output JSONL after the given offset.
+fn extract_response_from_output(output_path: &str, start_offset: u64) -> String {
+    let Ok(bytes) = std::fs::read(output_path) else {
+        return String::new();
+    };
+    let start = usize::try_from(start_offset)
+        .ok()
+        .map(|offset| offset.min(bytes.len()))
+        .unwrap_or(bytes.len());
+
+    let mut response = String::new();
+    for line in String::from_utf8_lossy(&bytes[start..]).lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        let msg_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if msg_type == "assistant" {
+            if let Some(content) = value.get("message").and_then(|m| m.get("content")) {
+                if let Some(arr) = content.as_array() {
+                    for block in arr {
+                        if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                            if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                response.push_str(text);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    response
+}
+
 fn output_has_bytes_after_offset(output_path: &str, start_offset: u64) -> bool {
     std::fs::metadata(output_path)
         .map(|meta| meta.len() > start_offset)
@@ -84,9 +121,31 @@ pub(super) async fn restore_inflight_turns(
         if output_already_completed {
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!(
-                "  [{ts}] ✓ clearing inflight turn for channel {}: output already contains result after offset {}",
+                "  [{ts}] ✓ recovering completed turn for channel {}: output contains result after offset {}",
                 state.channel_id, state.last_offset
             );
+            // Deliver the result to Discord before clearing the inflight state
+            let extracted = output_path
+                .as_deref()
+                .map(|p| extract_response_from_output(p, state.last_offset))
+                .unwrap_or_default();
+            let final_text = if extracted.trim().is_empty() {
+                if state.full_response.trim().is_empty() {
+                    "(복구됨 — 응답 텍스트 없음)".to_string()
+                } else {
+                    super::formatting::format_for_discord(&state.full_response)
+                }
+            } else {
+                super::formatting::format_for_discord(&extracted)
+            };
+            let _ = super::formatting::replace_long_message_raw(
+                http,
+                channel_id,
+                current_msg_id,
+                &final_text,
+                shared,
+            )
+            .await;
             clear_inflight_state(provider, state.channel_id);
             continue;
         }

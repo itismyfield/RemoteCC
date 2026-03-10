@@ -160,12 +160,6 @@ pub(super) struct TmuxWatcherHandle {
     pub(super) cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
-pub(super) struct RecentDiscordSend {
-    pub(super) hash: u64,
-    pub(super) len: usize,
-    pub(super) sent_at: Instant,
-}
-
 /// Core state that requires atomic multi-field access (always locked together)
 pub(super) struct CoreState {
     /// Per-channel sessions (each Discord channel can have its own Claude Code session)
@@ -194,8 +188,6 @@ pub(super) struct SharedData {
     pub(super) tmux_watchers: dashmap::DashMap<ChannelId, TmuxWatcherHandle>,
     /// Per-channel in-flight turn recovery marker (restart resume in progress)
     pub(super) recovering_channels: dashmap::DashMap<ChannelId, ()>,
-    /// Per-channel last outbound response fingerprint for duplicate suppression
-    pub(super) recent_sends: dashmap::DashMap<ChannelId, RecentDiscordSend>,
     /// Global shutdown flag — when set, watchers exit quietly via cancel path
     pub(super) shutting_down: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -433,7 +425,6 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
         skills_cache: tokio::sync::RwLock::new(initial_skills),
         tmux_watchers: dashmap::DashMap::new(),
         recovering_channels: dashmap::DashMap::new(),
-        recent_sends: dashmap::DashMap::new(),
         shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
 
