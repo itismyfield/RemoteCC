@@ -253,6 +253,15 @@ pub(super) async fn flush_restart_reports(
                 report.summary.clone(),
                 report.completed_at.clone(),
             ),
+            "sigterm" => (
+                "♻️",
+                "recovered",
+                format!(
+                    "{}\n새 dcserver가 정상 시작되어 작업을 이어받았습니다.",
+                    report.summary
+                ),
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            ),
             "pending" => (
                 "⏳",
                 "pending",
