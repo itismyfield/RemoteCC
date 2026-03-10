@@ -186,6 +186,10 @@ pub(super) fn spawn_turn_bridge(
                             inflight_state.full_response = full_response.clone();
                             state_dirty = true;
                         }
+                        StreamMessage::Thinking => {
+                            current_tool_line = Some("💭 Thinking...".to_string());
+                            last_tool_name = None;
+                        }
                         StreamMessage::ToolUse { name, input } => {
                             let summary = format_tool_input(&name, &input);
                             current_tool_line =
@@ -246,7 +250,11 @@ pub(super) fn spawn_turn_bridge(
                             result,
                             session_id: sid,
                         } => {
-                            if !result.is_empty() {
+                            // Only use result as fallback when streaming didn't accumulate text.
+                            // The result event contains only the last assistant message's text,
+                            // so overwriting would lose earlier text from multi-tool turns
+                            // (e.g. text A → tool call → text B would lose text A).
+                            if full_response.trim().is_empty() && !result.is_empty() {
                                 full_response = result;
                                 inflight_state.full_response = full_response.clone();
                             }
