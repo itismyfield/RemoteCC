@@ -179,6 +179,8 @@ pub enum StreamMessage {
     ToolUse { name: String, input: String },
     /// Tool execution result
     ToolResult { content: String, is_error: bool },
+    /// Chain-of-thought thinking block (signal only, no content forwarded)
+    Thinking,
     /// Background task notification
     TaskNotification {
         task_id: String,
@@ -971,6 +973,9 @@ IMPORTANT: Format your responses using Markdown for better readability:
                     StreamMessage::OutputOffset { offset } => {
                         debug_log(&format!("  >>> OutputOffset: {offset}"));
                     }
+                    StreamMessage::Thinking => {
+                        debug_log("  >>> Thinking block received");
+                    }
                 }
 
                 // Send message to channel
@@ -1466,25 +1471,48 @@ fn parse_stream_message(json: &Value) -> Option<StreamMessage> {
         "assistant" => {
             // {"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}
             // or {"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{...}}]}}
+            // Content array may contain [thinking, text] or [thinking, tool_use].
+            // We prioritize text/tool_use over thinking to avoid losing actual content.
             let content = json.get("message")?.get("content")?.as_array()?;
 
+            let mut has_thinking = false;
             for item in content {
-                let item_type = item.get("type")?.as_str()?;
+                let item_type = match item.get("type").and_then(|v| v.as_str()) {
+                    Some(t) => t,
+                    None => continue,
+                };
                 match item_type {
                     "text" => {
-                        let text = item.get("text")?.as_str()?.to_string();
-                        return Some(StreamMessage::Text { content: text });
+                        let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                        if !text.is_empty() {
+                            return Some(StreamMessage::Text {
+                                content: text.to_string(),
+                            });
+                        }
                     }
                     "tool_use" => {
-                        let name = item.get("name")?.as_str()?.to_string();
-                        let input = item
-                            .get("input")
-                            .map(|v| serde_json::to_string_pretty(v).unwrap_or_default())
-                            .unwrap_or_default();
-                        return Some(StreamMessage::ToolUse { name, input });
+                        let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        if !name.is_empty() {
+                            let input = item
+                                .get("input")
+                                .map(|v| serde_json::to_string_pretty(v).unwrap_or_default())
+                                .unwrap_or_default();
+                            return Some(StreamMessage::ToolUse {
+                                name: name.to_string(),
+                                input,
+                            });
+                        }
+                    }
+                    "thinking" => {
+                        has_thinking = true;
                     }
                     _ => {}
                 }
+            }
+            // Only emit Thinking if no text/tool_use was found in the same message.
+            // Use a fixed summary to avoid leaking raw reasoning content.
+            if has_thinking {
+                return Some(StreamMessage::Thinking);
             }
             None
         }
@@ -2701,5 +2729,42 @@ mod tests {
     fn test_tmux_capture_ignores_non_ready_prompt() {
         let capture = "Claude is still working...\n";
         assert!(!tmux_capture_indicates_ready_for_input(capture));
+    }
+
+    // ========== parse_stream_message thinking tests ==========
+
+    #[test]
+    fn test_parse_thinking_only() {
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"Let me analyze this"}]}}"#
+        ).unwrap();
+        let msg = parse_stream_message(&json).unwrap();
+        assert!(matches!(msg, StreamMessage::Thinking));
+    }
+
+    #[test]
+    fn test_parse_thinking_with_text_returns_text() {
+        // When content has [thinking, text], text should be returned (not Thinking)
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"internal"},{"type":"text","text":"visible answer"}]}}"#
+        ).unwrap();
+        let msg = parse_stream_message(&json).unwrap();
+        match msg {
+            StreamMessage::Text { content } => assert_eq!(content, "visible answer"),
+            _ => panic!("Expected Text, got thinking or other"),
+        }
+    }
+
+    #[test]
+    fn test_parse_thinking_with_tool_use_returns_tool() {
+        // When content has [thinking, tool_use], tool_use should be returned
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"planning"},{"type":"tool_use","name":"Read","input":{"file_path":"/tmp/test"}}]}}"#
+        ).unwrap();
+        let msg = parse_stream_message(&json).unwrap();
+        match msg {
+            StreamMessage::ToolUse { name, .. } => assert_eq!(name, "Read"),
+            _ => panic!("Expected ToolUse"),
+        }
     }
 }

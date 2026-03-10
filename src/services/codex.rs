@@ -1136,13 +1136,19 @@ fn handle_codex_json_line(
         }
         "item.started" => {
             if let Some(item) = json.get("item") {
-                if item.get("type").and_then(|v| v.as_str()) == Some("command_execution") {
-                    let command = item.get("command").and_then(|v| v.as_str()).unwrap_or("");
-                    let input = serde_json::json!({ "command": command }).to_string();
-                    let _ = sender.send(StreamMessage::ToolUse {
-                        name: "Bash".to_string(),
-                        input,
-                    });
+                match item.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                    "command_execution" => {
+                        let command = item.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                        let input = serde_json::json!({ "command": command }).to_string();
+                        let _ = sender.send(StreamMessage::ToolUse {
+                            name: "Bash".to_string(),
+                            input,
+                        });
+                    }
+                    "reasoning" => {
+                        let _ = sender.send(StreamMessage::Thinking);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1173,6 +1179,9 @@ fn handle_codex_json_line(
                             .map(|code| code != 0)
                             .unwrap_or(false);
                         let _ = sender.send(StreamMessage::ToolResult { content, is_error });
+                    }
+                    "reasoning" => {
+                        let _ = sender.send(StreamMessage::Thinking);
                     }
                     _ => {}
                 }
@@ -1285,6 +1294,48 @@ mod tests {
     fn test_compose_codex_prompt_returns_plain_prompt_without_overrides() {
         let prompt = compose_codex_prompt("just answer", None, None);
         assert_eq!(prompt, "just answer");
+    }
+
+    #[test]
+    fn test_codex_reasoning_started_sends_thinking() {
+        let (tx, rx) = mpsc::channel();
+        let mut thread_id = None;
+        let mut final_text = String::new();
+        let started_at = std::time::Instant::now();
+
+        let _ = handle_codex_json_line(
+            r#"{"type":"item.started","item":{"type":"reasoning","id":"rs_001","summary":[]}}"#,
+            &tx,
+            &mut thread_id,
+            &mut final_text,
+            started_at,
+        )
+        .unwrap();
+
+        let items: Vec<StreamMessage> = rx.try_iter().collect();
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0], StreamMessage::Thinking));
+    }
+
+    #[test]
+    fn test_codex_reasoning_completed_sends_thinking_with_summary() {
+        let (tx, rx) = mpsc::channel();
+        let mut thread_id = None;
+        let mut final_text = String::new();
+        let started_at = std::time::Instant::now();
+
+        let _ = handle_codex_json_line(
+            r#"{"type":"item.completed","item":{"type":"reasoning","id":"rs_001","summary":[{"type":"summary_text","text":"Analyzing the code structure"}]}}"#,
+            &tx,
+            &mut thread_id,
+            &mut final_text,
+            started_at,
+        )
+        .unwrap();
+
+        let items: Vec<StreamMessage> = rx.try_iter().collect();
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0], StreamMessage::Thinking));
     }
 
     #[test]
