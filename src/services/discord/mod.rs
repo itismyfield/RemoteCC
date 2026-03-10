@@ -570,17 +570,20 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
                 // are not given a spurious recovery follow-up.
                 let inflight_states = inflight::load_inflight_states(provider);
                 for state in &inflight_states {
-                    // Only create if no existing report from --restart-dcserver
-                    if restart_report::load_restart_report(provider, state.channel_id).is_none() {
-                        let report = restart_report::RestartCompletionReport::new(
-                            provider,
-                            state.channel_id,
-                            "sigterm",
-                            "dcserver가 SIGTERM으로 종료되었습니다. 재시작 후 작업을 이어받습니다.",
-                        );
-                        if let Err(e) = restart_report::save_restart_report(&report) {
-                            eprintln!("  ⚠ failed to save restart report for channel {}: {e}", state.channel_id);
-                        }
+                    // Skip only if a "pending" report exists (from --restart-dcserver).
+                    // Overwrite any other stale/failed report so the latest SIGTERM wins.
+                    let existing = restart_report::load_restart_report(provider, state.channel_id);
+                    if existing.as_ref().map(|r| r.status.as_str()) == Some("pending") {
+                        continue;
+                    }
+                    let report = restart_report::RestartCompletionReport::new(
+                        provider,
+                        state.channel_id,
+                        "sigterm",
+                        "dcserver가 SIGTERM으로 종료되었습니다. 재시작 후 작업을 이어받습니다.",
+                    );
+                    if let Err(e) = restart_report::save_restart_report(&report) {
+                        eprintln!("  ⚠ failed to save restart report for channel {}: {e}", state.channel_id);
                     }
                 }
                 if !inflight_states.is_empty() {

@@ -255,9 +255,9 @@ pub(super) async fn flush_restart_reports(
             ),
             "sigterm" => (
                 "♻️",
-                "recovered",
+                "restarted",
                 format!(
-                    "{}\n새 dcserver가 정상 시작되어 작업을 이어받았습니다.",
+                    "{}\n새 dcserver가 시작되었습니다. 작업 복구를 시도합니다.",
                     report.summary
                 ),
                 chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
