@@ -79,14 +79,14 @@ Learn more at [docs.anthropic.com](https://docs.anthropic.com/en/docs/claude-cod
 Run this before shipping Discord runtime changes:
 
 ```bash
-cd /Users/itismyfield/remotecc
+cd ~/remotecc
 scripts/remotecc-discord-smoke.sh
 ```
 
 For live rollout on mac-mini:
 
 ```bash
-cd /Users/itismyfield/remotecc
+cd ~/remotecc
 scripts/remotecc-discord-smoke.sh --deploy-live --reset-wrappers
 ```
 
@@ -102,14 +102,14 @@ Minimum release bar for changes in `src/services/tmux_wrapper.rs`, `src/services
 Use this before trusting restart and inflight auto-recovery changes:
 
 ```bash
-cd /Users/itismyfield/remotecc
+cd ~/remotecc
 REMOTECC_TEST_SENDER_TOKEN='***' scripts/preview-recovery-stress.sh --iterations 10
 ```
 
 To make it a stable deploy gate inside the live smoke flow:
 
 ```bash
-cd /Users/itismyfield/remotecc
+cd ~/remotecc
 REMOTECC_TEST_SENDER_TOKEN='***' scripts/remotecc-discord-smoke.sh --deploy-live --preview-recovery-stress --preview-iterations 10
 ```
 
