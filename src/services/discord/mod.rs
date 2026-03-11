@@ -2461,6 +2461,7 @@ async fn cmd_cc(
         false,
         false,
         false,
+        None,
     )
     .await?;
 

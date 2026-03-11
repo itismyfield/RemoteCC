@@ -576,6 +576,7 @@ pub(super) fn spawn_turn_bridge(
                         true,
                         has_more_queued_turns,
                         true,
+                        None,
                     )
                     .await
                     {
