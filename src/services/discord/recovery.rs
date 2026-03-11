@@ -187,11 +187,23 @@ pub(super) async fn restore_inflight_turns(
 
         if !can_recover {
             let ts = chrono::Local::now().format("%H:%M:%S");
+            // Even without a live tmux session, the output file may contain
+            // response data. Try extracting from the full file first, then
+            // fall back to saved partial response.
+            let extracted_full = output_path
+                .as_deref()
+                .map(|p| extract_response_from_output(p, 0))
+                .unwrap_or_default();
+            let best_response = if !extracted_full.trim().is_empty() {
+                extracted_full
+            } else {
+                state.full_response.clone()
+            };
+            let stale_text = stale_inflight_message(&best_response);
             println!(
-                "  [{ts}] ⚠ cannot recover inflight turn for channel {}: tmux session missing",
-                state.channel_id
+                "  [{ts}] ⚠ cannot recover inflight turn for channel {}: tmux session missing (response len: {})",
+                state.channel_id, best_response.len()
             );
-            let stale_text = stale_inflight_message(&state.full_response);
             let _ = super::formatting::replace_long_message_raw(
                 http,
                 channel_id,
