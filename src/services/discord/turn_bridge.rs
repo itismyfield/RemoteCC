@@ -142,6 +142,7 @@ pub(super) fn spawn_turn_bridge(
         let mut cancelled = false;
         let mut current_tool_line: Option<String> = None;
         let mut last_tool_name: Option<String> = None;
+        let mut last_tool_summary: Option<String> = None;
         let mut accumulated_tokens: u64 = 0;
         let mut spin_idx: usize = 0;
         let mut restart_followup_pending = false;
@@ -183,18 +184,26 @@ pub(super) fn spawn_turn_bridge(
                             full_response.push_str(&content);
                             current_tool_line = None;
                             last_tool_name = None;
+                            last_tool_summary = None;
                             inflight_state.full_response = full_response.clone();
                             state_dirty = true;
                         }
                         StreamMessage::Thinking => {
                             current_tool_line = Some("💭 Thinking...".to_string());
                             last_tool_name = None;
+                            last_tool_summary = None;
                         }
                         StreamMessage::ToolUse { name, input } => {
                             let summary = format_tool_input(&name, &input);
+                            let display_summary = if summary.trim().is_empty() {
+                                "…".to_string()
+                            } else {
+                                truncate_str(&summary, 120).to_string()
+                            };
                             current_tool_line =
-                                Some(format!("⚙ {}: {}", name, truncate_str(&summary, 120)));
+                                Some(format!("⚙ {}: {}", name, display_summary));
                             last_tool_name = Some(name.clone());
+                            last_tool_summary = Some(display_summary);
                             if !restart_followup_pending && is_dcserver_restart_command(&input) {
                                 let mut report = RestartCompletionReport::new(
                                     provider,
@@ -235,7 +244,12 @@ pub(super) fn spawn_turn_bridge(
                         StreamMessage::ToolResult { content, is_error } => {
                             if let Some(ref tn) = last_tool_name {
                                 let status = if is_error { "✗" } else { "✓" };
-                                current_tool_line = Some(format!("{} {}", status, tn));
+                                let detail = last_tool_summary
+                                    .as_deref()
+                                    .filter(|s| !s.is_empty() && *s != "…")
+                                    .map(|s| format!("{} {}: {}", status, tn, s))
+                                    .unwrap_or_else(|| format!("{} {}", status, tn));
+                                current_tool_line = Some(detail);
                             }
                             let _ = content;
                         }
