@@ -111,35 +111,19 @@ pub(super) async fn handle_event(
                         }
                     }
 
-                    let mode = if is_hard_intervention(text) {
-                        InterventionMode::Hard
-                    } else {
-                        InterventionMode::Soft
-                    };
-
-                    let (inserted, hard_token) = {
+                    let inserted = {
                         let queue = d.intervention_queue.entry(channel_id).or_default();
-                        let inserted = enqueue_intervention(
+                        enqueue_intervention(
                             queue,
                             Intervention {
                                 author_id: user_id,
                                 message_id: new_message.id,
                                 text: text.to_string(),
-                                mode,
+                                mode: InterventionMode::Soft,
                                 created_at: Instant::now(),
                             },
-                        );
-                        let hard_token = if mode == InterventionMode::Hard {
-                            d.cancel_tokens.get(&channel_id).cloned()
-                        } else {
-                            None
-                        };
-                        (inserted, hard_token)
+                        )
                     };
-
-                    if let Some(token) = hard_token {
-                        cancel_active_token(&token, true);
-                    }
 
                     drop(d);
 
@@ -151,10 +135,6 @@ pub(super) async fn handle_event(
                         return Ok(());
                     }
 
-                    if mode == InterventionMode::Hard {
-                        rate_limit_wait(&data.shared, channel_id).await;
-                        let _ = channel_id.say(&ctx.http, "🛑 현재 작업을 중단할게.").await;
-                    }
                     return Ok(());
                 }
             }
