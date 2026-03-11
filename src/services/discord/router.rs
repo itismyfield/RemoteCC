@@ -190,6 +190,22 @@ pub(super) async fn handle_event(
             let ts = chrono::Local::now().format("%H:%M:%S");
             let preview = truncate_str(text, 60);
             println!("  [{ts}] ◀ [{user_name}] {preview}");
+
+            // Extract reply context if user replied to another message
+            let reply_context = new_message.referenced_message.as_ref().map(|ref_msg| {
+                let author = &ref_msg.author.name;
+                let content = ref_msg.content.trim();
+                if content.is_empty() {
+                    format!("[Reply to {}'s message (no text content)]", author)
+                } else {
+                    let truncated = truncate_str(content, 500);
+                    format!(
+                        "[Reply context]\nAuthor: {}\nContent: {}",
+                        author, truncated
+                    )
+                }
+            });
+
             handle_text_message(
                 ctx,
                 channel_id,
@@ -202,6 +218,7 @@ pub(super) async fn handle_event(
                 false,
                 false,
                 false,
+                reply_context,
             )
             .await?;
         }
@@ -222,6 +239,7 @@ pub(super) async fn handle_text_message(
     reply_to_user_message: bool,
     defer_watcher_resume: bool,
     wait_for_completion: bool,
+    reply_context: Option<String>,
 ) -> Result<(), Error> {
     // Get session info, allowed tools, and pending uploads
     let (session_info, provider, allowed_tools, pending_uploads) = {
@@ -401,6 +419,9 @@ pub(super) async fn handle_text_message(
         build_shared_memory_context(&binding.role_id, provider, channel_id, session_id.is_some())
     }) {
         context_chunks.push(shared_memory);
+    }
+    if let Some(ref reply_ctx) = reply_context {
+        context_chunks.push(reply_ctx.clone());
     }
     context_chunks.push(sanitized_input);
     let context_prompt = context_chunks.join("\n\n");
