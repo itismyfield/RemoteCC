@@ -244,7 +244,16 @@ fn tmux_session_alive(tmux_session_name: &str) -> bool {
 }
 
 fn tmux_capture_indicates_ready_for_input(capture: &str) -> bool {
-    capture.contains("Ready for input (type message + Enter)")
+    // Only check the last few non-empty lines of the capture.
+    // The "Ready for input" prompt from a *previous* turn can linger in
+    // the scrollback buffer while a new message is being processed, so
+    // checking the entire capture leads to false positives.
+    capture
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(3)
+        .any(|l| l.contains("Ready for input (type message + Enter)"))
 }
 
 pub(crate) fn tmux_session_ready_for_input(tmux_session_name: &str) -> bool {
