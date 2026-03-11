@@ -89,7 +89,7 @@ pub(super) async fn handle_event(
             // Auto-restore session
             auto_restore_session(&data.shared, channel_id, ctx).await;
 
-            // Steering while AI is in progress for this channel
+            // Queue messages while AI is in progress (executed as next turn after current finishes)
             {
                 let mut d = data.shared.core.lock().await;
                 if d.cancel_tokens.contains_key(&channel_id) {
@@ -102,7 +102,7 @@ pub(super) async fn handle_event(
                                 .say(
                                     &ctx.http,
                                     format!(
-                                        "AI request in progress. Only <@{}> can steer this turn.",
+                                        "AI request in progress. Only <@{}> can queue messages for this turn.",
                                         owner_id.get()
                                     ),
                                 )

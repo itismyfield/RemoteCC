@@ -167,7 +167,8 @@ pub(super) struct CoreState {
     pub(super) cancel_tokens: HashMap<ChannelId, Arc<CancelToken>>,
     /// Per-channel owner of the currently running request
     pub(super) active_request_owner: HashMap<ChannelId, UserId>,
-    /// Per-channel queued interventions collected while a request is in progress
+    /// Per-channel message queue: messages arriving during an active turn are queued here
+    /// and executed as subsequent turns after the current one finishes.
     intervention_queue: HashMap<ChannelId, Vec<Intervention>>,
     /// Per-channel active meeting (one meeting per channel)
     active_meetings: HashMap<ChannelId, meeting::Meeting>,
@@ -255,6 +256,97 @@ pub(super) fn requeue_intervention_front(
     if queue.len() > MAX_INTERVENTIONS_PER_CHANNEL {
         queue.truncate(MAX_INTERVENTIONS_PER_CHANNEL);
     }
+}
+
+// ─── Pending queue persistence (SIGTERM → restore) ──────────────────────────
+
+/// Serializable form of a queued intervention for disk persistence.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PendingQueueItem {
+    author_id: u64,
+    message_id: u64,
+    text: String,
+}
+
+/// Save all non-empty intervention queues to `discord_pending_queue/{provider}/`.
+fn save_pending_queues(provider: ProviderKind, queues: &HashMap<ChannelId, Vec<Intervention>>) {
+    let Some(root) = runtime_store::discord_pending_queue_root() else {
+        return;
+    };
+    let dir = root.join(provider.as_str());
+    let _ = fs::create_dir_all(&dir);
+    // Clean stale files first
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    for (channel_id, queue) in queues {
+        if queue.is_empty() {
+            continue;
+        }
+        let items: Vec<PendingQueueItem> = queue
+            .iter()
+            .map(|i| PendingQueueItem {
+                author_id: i.author_id.get(),
+                message_id: i.message_id.get(),
+                text: i.text.clone(),
+            })
+            .collect();
+        if let Ok(json) = serde_json::to_string_pretty(&items) {
+            let path = dir.join(format!("{}.json", channel_id.get()));
+            let _ = runtime_store::atomic_write(&path, &json);
+        }
+    }
+}
+
+/// Load persisted pending queues and delete the files.
+fn load_pending_queues(provider: ProviderKind) -> HashMap<ChannelId, Vec<Intervention>> {
+    let Some(root) = runtime_store::discord_pending_queue_root() else {
+        return HashMap::new();
+    };
+    let dir = root.join(provider.as_str());
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return HashMap::new();
+    };
+    let now = Instant::now();
+    let mut result: HashMap<ChannelId, Vec<Intervention>> = HashMap::new();
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let channel_id: u64 = match path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.parse().ok())
+        {
+            Some(id) => id,
+            None => continue,
+        };
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(items) = serde_json::from_str::<Vec<PendingQueueItem>>(&content) else {
+            let _ = fs::remove_file(&path);
+            continue;
+        };
+        let interventions: Vec<Intervention> = items
+            .into_iter()
+            .map(|item| Intervention {
+                author_id: UserId::new(item.author_id),
+                message_id: MessageId::new(item.message_id),
+                text: item.text,
+                mode: InterventionMode::Soft,
+                created_at: now,
+            })
+            .collect();
+        if !interventions.is_empty() {
+            result.insert(ChannelId::new(channel_id), interventions);
+        }
+        let _ = fs::remove_file(&path);
+    }
+    result
 }
 
 /// Scan for provider-specific skills available to this bot.
@@ -503,6 +595,21 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
                 let shared_for_tmux2 = shared_for_tmux.clone();
                 tokio::spawn(async move {
                     restore_inflight_turns(&http_for_tmux, &shared_for_tmux2, provider).await;
+
+                    // Restore pending intervention queues saved during previous SIGTERM
+                    let restored_queues = load_pending_queues(provider);
+                    if !restored_queues.is_empty() {
+                        let total: usize = restored_queues.values().map(|q| q.len()).sum();
+                        let mut data = shared_for_tmux2.core.lock().await;
+                        for (channel_id, items) in restored_queues {
+                            let queue = data.intervention_queue.entry(channel_id).or_default();
+                            queue.extend(items);
+                        }
+                        drop(data);
+                        let ts = chrono::Local::now().format("%H:%M:%S");
+                        println!("  [{ts}] 📋 Restored {total} pending queue item(s) from disk");
+                    }
+
                     restore_tmux_watchers(&http_for_tmux, &shared_for_tmux2).await;
                     cleanup_orphan_tmux_sessions(&shared_for_tmux2).await;
                 });
@@ -618,6 +725,17 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
                 if !inflight_states.is_empty() {
                     let ts2 = chrono::Local::now().format("%H:%M:%S");
                     println!("  [{ts2}] 📝 saved {} restart report(s) for inflight channels", inflight_states.len());
+                }
+
+                // Persist pending intervention queues so they survive restart
+                {
+                    let data = shared_for_signal.core.lock().await;
+                    let queue_count: usize = data.intervention_queue.values().map(|q| q.len()).sum();
+                    if queue_count > 0 {
+                        save_pending_queues(provider, &data.intervention_queue);
+                        let ts3 = chrono::Local::now().format("%H:%M:%S");
+                        println!("  [{ts3}] 📋 saved {queue_count} pending queue item(s) to disk");
+                    }
                 }
 
                 std::process::exit(0);
