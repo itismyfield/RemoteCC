@@ -103,7 +103,6 @@ pub(super) struct WorktreeInfo {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InterventionMode {
     Soft,
-    Hard,
 }
 
 #[derive(Clone, Debug)]
@@ -202,11 +201,6 @@ struct Data {
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Data, Error>;
 
-fn is_hard_intervention(text: &str) -> bool {
-    let t = text.to_lowercase();
-    let hard_keywords = ["중단", "멈춰", "취소", "stop", "abort", "cancel"];
-    hard_keywords.iter().any(|k| t.contains(k))
-}
 
 fn prune_interventions(queue: &mut Vec<Intervention>) {
     let now = Instant::now();
@@ -542,6 +536,7 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
 
     // Graceful shutdown: on SIGTERM, cancel all tmux watchers before dying
     let shared_for_signal = shared.clone();
+    let token_for_signal = token.to_string();
     tokio::spawn(async move {
         #[cfg(unix)]
         {
@@ -569,6 +564,40 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
                 // completed (and cleared their inflight state) during the window
                 // are not given a spurious recovery follow-up.
                 let inflight_states = inflight::load_inflight_states(provider);
+
+                // Update in-flight placeholder messages to indicate restart
+                if !inflight_states.is_empty() {
+                    let http = serenity::Http::new(&token_for_signal);
+                    for state in &inflight_states {
+                        let channel = ChannelId::new(state.channel_id);
+                        let msg_id = MessageId::new(state.current_msg_id);
+                        let restart_notice = if state.full_response.trim().is_empty() {
+                            "⚠️ dcserver 재시작으로 중단됨 — 곧 복원됩니다".to_string()
+                        } else {
+                            let partial = formatting::format_for_discord(state.full_response.trim());
+                            format!("{partial}\n\n⚠️ dcserver 재시작으로 중단됨 — 곧 복원됩니다")
+                        };
+                        match channel
+                            .edit_message(&http, msg_id, EditMessage::new().content(&restart_notice))
+                            .await
+                        {
+                            Ok(_) => {
+                                let ts_ok = chrono::Local::now().format("%H:%M:%S");
+                                println!(
+                                    "  [{ts_ok}] ✓ Updated placeholder msg {} in channel {} with restart notice",
+                                    state.current_msg_id, state.channel_id
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "  ⚠ Failed to update placeholder msg {} in channel {}: {e}",
+                                    state.current_msg_id, state.channel_id
+                                );
+                            }
+                        }
+                    }
+                }
+
                 for state in &inflight_states {
                     // Skip only if a "pending" report exists (from --restart-dcserver).
                     // Overwrite any other stale/failed report so the latest SIGTERM wins.
