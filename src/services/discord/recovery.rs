@@ -92,16 +92,68 @@ pub(super) async fn restore_inflight_turns(
     let settings_snapshot = shared.settings.read().await.clone();
 
     for state in states {
-        // Skip channels that have a pending restart follow-up report — the report
-        // flush loop handles those, and running recovery alongside it causes
-        // duplicate messages to the same channel.
+        // If a restart report exists for this channel, check whether the agent
+        // has already finished before deciding to skip recovery.  When the output
+        // file contains a completed result we deliver it directly and clear both
+        // the inflight state and the restart report, so the flush loop won't
+        // overwrite the message with a generic follow-up.
         if super::restart_report::load_restart_report(provider, state.channel_id).is_some() {
+            let output_path_for_check: Option<String> = state
+                .output_path
+                .clone()
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    state
+                        .channel_name
+                        .as_ref()
+                        .map(|name| tmux_runtime_paths(&provider.build_tmux_session_name(name)).0)
+                });
+            let completed_during_downtime = output_path_for_check
+                .as_deref()
+                .map(|path| output_has_result_after_offset(path, state.last_offset))
+                .unwrap_or(false);
+
+            if completed_during_downtime {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!(
+                    "  [{ts}] ✓ recovering completed turn for channel {} (restart report exists but output has result)",
+                    state.channel_id
+                );
+                let extracted = output_path_for_check
+                    .as_deref()
+                    .map(|p| extract_response_from_output(p, state.last_offset))
+                    .unwrap_or_default();
+                let final_text = if extracted.trim().is_empty() {
+                    if state.full_response.trim().is_empty() {
+                        "(복구됨 — 응답 텍스트 없음)".to_string()
+                    } else {
+                        super::formatting::format_for_discord(&state.full_response)
+                    }
+                } else {
+                    super::formatting::format_for_discord(&extracted)
+                };
+                let channel_id = ChannelId::new(state.channel_id);
+                let current_msg_id = MessageId::new(state.current_msg_id);
+                let _ = super::formatting::replace_long_message_raw(
+                    http,
+                    channel_id,
+                    current_msg_id,
+                    &final_text,
+                    shared,
+                )
+                .await;
+                super::restart_report::clear_restart_report(provider, state.channel_id);
+                clear_inflight_state(provider, state.channel_id);
+                continue;
+            }
+
+            // Agent is still running — keep inflight state so the next restart
+            // (or a later check) can recover the completed response.
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!(
-                "  [{ts}] ⏭ skipping inflight recovery for channel {}: restart report exists",
+                "  [{ts}] ⏭ skipping inflight recovery for channel {}: restart report exists, agent still running (keeping inflight state)",
                 state.channel_id
             );
-            clear_inflight_state(provider, state.channel_id);
             continue;
         }
 

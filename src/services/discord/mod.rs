@@ -762,12 +762,13 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
                     if existing.as_ref().map(|r| r.status.as_str()) == Some("pending") {
                         continue;
                     }
-                    let report = restart_report::RestartCompletionReport::new(
+                    let mut report = restart_report::RestartCompletionReport::new(
                         provider,
                         state.channel_id,
                         "sigterm",
                         "dcserver가 SIGTERM으로 종료되었습니다. 재시작 후 작업을 이어받습니다.",
                     );
+                    report.current_msg_id = Some(state.current_msg_id);
                     if let Err(e) = restart_report::save_restart_report(&report) {
                         eprintln!("  ⚠ failed to save restart report for channel {}: {e}", state.channel_id);
                     }

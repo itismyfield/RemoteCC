@@ -221,6 +221,22 @@ pub(super) async fn flush_restart_reports(
     for report in reports {
         let channel_id = serenity::ChannelId::new(report.channel_id);
         if report.status == "pending" {
+            // Skip pending reports if the turn that created them is still active.
+            // The turn will clear the report on normal completion.
+            // Only flush pending reports at startup (no active turns) or after
+            // the creating turn has finished without clearing (e.g. crash).
+            let has_active_turn = {
+                let data = shared.core.lock().await;
+                data.cancel_tokens.contains_key(&channel_id)
+            };
+            let has_finalizing = shared
+                .finalizing_turns
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0;
+            if has_active_turn || has_finalizing {
+                continue;
+            }
+
             let age = report_age(&report).unwrap_or_default();
             if age < PENDING_REPORT_GRACE {
                 if let Some(message_id) = report.current_msg_id {

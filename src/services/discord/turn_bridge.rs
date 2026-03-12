@@ -1,4 +1,4 @@
-use super::restart_report::{save_restart_report, RestartCompletionReport};
+use super::restart_report::{clear_restart_report, save_restart_report, RestartCompletionReport};
 use super::*;
 
 fn tail_with_ellipsis(text: &str, max_chars: usize) -> String {
@@ -640,6 +640,18 @@ pub(super) fn spawn_turn_bridge(
 
         clear_inflight_state(provider, channel_id.get());
         shared_owned.recovering_channels.remove(&channel_id);
+
+        // If this turn triggered a deferred restart and completed normally,
+        // clear the pending report so the new process doesn't overwrite
+        // the already-sent response.
+        if restart_followup_pending {
+            clear_restart_report(provider, channel_id.get());
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ✓ Cleared restart report for channel {} (turn completed normally)",
+                channel_id
+            );
+        }
 
         // Finalization complete — decrement counter and check deferred restart
         let finalizing_remaining = shared_owned
