@@ -2020,7 +2020,16 @@ pub(crate) fn read_output_file_until_result(
                         .map(|meta| meta.len())
                         .unwrap_or(current_offset);
                     let has_new_bytes = file_len > current_offset;
-                    if !has_new_bytes && tmux_session_ready_for_input(tmux_session_name) {
+                    // Only consider ready-for-input if output has grown at least
+                    // once since the turn started.  When a follow-up message is
+                    // written to the FIFO but Claude hasn't begun processing yet,
+                    // the previous turn's "Ready for input" prompt still lingers
+                    // in the tmux pane — causing a false-positive completion.
+                    let output_ever_grew = current_offset > start_offset;
+                    if !has_new_bytes
+                        && output_ever_grew
+                        && tmux_session_ready_for_input(tmux_session_name)
+                    {
                         consecutive_ready_count += 1;
                         // Require 3 consecutive ready checks (~15s) to avoid false
                         // positives during Claude Code auto-continue transitions.
