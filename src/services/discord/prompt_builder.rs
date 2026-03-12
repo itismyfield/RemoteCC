@@ -1,4 +1,6 @@
-use super::settings::{discord_token_hash, load_role_prompt, render_peer_agent_guidance};
+use super::settings::{
+    discord_token_hash, load_role_prompt, load_shared_prompt, render_peer_agent_guidance,
+};
 use super::*;
 
 pub(super) fn build_system_prompt(
@@ -42,6 +44,17 @@ pub(super) fn build_system_prompt(
     );
 
     if let Some(binding) = role_binding {
+        // Inject shared agent prompt (AGENTS.md) before role-specific identity
+        if let Some(shared_prompt) = load_shared_prompt() {
+            system_prompt_owned.push_str("\n\n[Shared Agent Rules]\n");
+            system_prompt_owned.push_str(&shared_prompt);
+            eprintln!(
+                "  [role-map] Injected shared prompt ({} chars) for channel {}",
+                shared_prompt.len(),
+                channel_id.get()
+            );
+        }
+
         match load_role_prompt(binding) {
             Some(role_prompt) => {
                 system_prompt_owned.push_str(

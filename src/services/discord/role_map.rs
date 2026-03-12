@@ -85,6 +85,13 @@ pub(super) fn resolve_workspace(
         .map(|s| s.to_string())
 }
 
+pub(super) fn load_shared_prompt_path() -> Option<String> {
+    let json = load_role_map_json()?;
+    json.get("sharedPromptFile")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
 pub(super) fn load_peer_agents() -> Vec<PeerAgentInfo> {
     let Some(json) = load_role_map_json() else {
         return Vec::new();
