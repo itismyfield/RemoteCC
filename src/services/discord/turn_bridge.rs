@@ -218,6 +218,14 @@ pub(super) fn spawn_turn_bridge(
                                     ),
                                 );
                                 report.current_msg_id = Some(current_msg_id.get());
+                                report.channel_name = pcd_session_name.clone();
+                                let version = env!("CARGO_PKG_VERSION");
+                                report.post_restart_prompt = Some(format!(
+                                    "dcserver v{version} 재시작 완료. 이전 요청을 이어서 진행해주세요.\n\
+                                     원래 요청: {}\n\
+                                     Continue from where you left off.",
+                                    truncate_str(&user_text_owned, 200),
+                                ));
                                 if save_restart_report(&report).is_ok() {
                                     restart_followup_pending = true;
                                     let handoff_text =
