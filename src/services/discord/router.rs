@@ -447,6 +447,17 @@ pub(super) async fn handle_text_message(
     if let Some(ref reply_ctx) = reply_context {
         context_chunks.push(reply_ctx.clone());
     }
+    // Re-inject compact formatting reminder for interactive follow-up turns.
+    // System prompt is only sent at session creation; after context compaction
+    // these rules can be lost.
+    if session_id.is_some() {
+        context_chunks.push(
+            "<system-reminder>\n\
+             Discord formatting: no markdown tables, minimize code blocks, keep messages concise.\n\
+             </system-reminder>"
+                .to_string(),
+        );
+    }
     context_chunks.push(sanitized_input);
     let context_prompt = context_chunks.join("\n\n");
 
