@@ -444,6 +444,11 @@ pub(super) fn spawn_turn_bridge(
 
         let can_chain_locally =
             serenity_ctx.is_some() && request_owner.is_some() && token.is_some();
+        // Mark this turn as finalizing — deferred restart must wait until we finish
+        // sending the Discord response and cleaning up state.
+        shared_owned
+            .finalizing_turns
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let has_queued_turns = {
             let mut data = shared_owned.core.lock().await;
             data.cancel_tokens.remove(&channel_id);
@@ -459,10 +464,7 @@ pub(super) fn spawn_turn_bridge(
             if remove_queue {
                 data.intervention_queue.remove(&channel_id);
             }
-            let remaining_turns = data.cancel_tokens.len();
             drop(data);
-            // Check deferred restart after turn completion
-            super::check_deferred_restart(remaining_turns);
             has_pending
         };
 
@@ -524,14 +526,45 @@ pub(super) fn spawn_turn_bridge(
             println!("  [{ts}] ⚠ Prompt too long (channel {})", channel_id);
         } else {
             if full_response.is_empty() {
-                if rx_disconnected {
-                    full_response = "(No response — 프로세스가 응답 없이 종료됨)".to_string();
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    eprintln!("  [{ts}] ⚠ Empty response: rx disconnected before any text (channel {})", channel_id);
-                } else {
-                    full_response = "(No response)".to_string();
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    eprintln!("  [{ts}] ⚠ Empty response: done without text (channel {})", channel_id);
+                // Fallback: try to extract response from tmux output file
+                if let Some(ref path) = inflight_state.output_path {
+                    let recovered = super::recovery::extract_response_from_output_pub(
+                        path,
+                        inflight_state.last_offset.saturating_sub(
+                            inflight_state.last_offset.min(8192),
+                        ),
+                    );
+                    if !recovered.trim().is_empty() {
+                        let ts = chrono::Local::now().format("%H:%M:%S");
+                        eprintln!(
+                            "  [{ts}] ↻ Recovered {} chars from output file for channel {}",
+                            recovered.len(),
+                            channel_id
+                        );
+                        full_response = recovered;
+                    }
+                }
+
+                if full_response.is_empty() {
+                    if rx_disconnected {
+                        full_response =
+                            "(No response — 프로세스가 응답 없이 종료됨)".to_string();
+                        let ts = chrono::Local::now().format("%H:%M:%S");
+                        eprintln!(
+                            "  [{ts}] ⚠ Empty response: rx disconnected before any text \
+                             (channel {}, output_path={:?}, last_offset={})",
+                            channel_id,
+                            inflight_state.output_path,
+                            inflight_state.last_offset
+                        );
+                    } else {
+                        full_response = "(No response)".to_string();
+                        let ts = chrono::Local::now().format("%H:%M:%S");
+                        eprintln!(
+                            "  [{ts}] ⚠ Empty response: done without text (channel {})",
+                            channel_id
+                        );
+                    }
                 }
             }
 
@@ -607,6 +640,16 @@ pub(super) fn spawn_turn_bridge(
 
         clear_inflight_state(provider, channel_id.get());
         shared_owned.recovering_channels.remove(&channel_id);
+
+        // Finalization complete — decrement counter and check deferred restart
+        let finalizing_remaining = shared_owned
+            .finalizing_turns
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
+            - 1;
+        {
+            let active = shared_owned.core.lock().await.cancel_tokens.len();
+            super::check_deferred_restart(active, finalizing_remaining);
+        }
 
         if has_queued_turns {
             if let (Some(ctx), Some(owner), Some(tok)) =

@@ -72,10 +72,14 @@ const SESSION_MAX_IDLE: Duration = Duration::from_secs(24 * 60 * 60); // 1 day
 const RESTART_REPORT_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const DEFERRED_RESTART_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Check if a deferred restart has been requested and no active turns remain.
+/// Check if a deferred restart has been requested and no active or finalizing turns remain.
 /// If so, remove the marker and exit the process (launchd will restart it).
-pub(super) fn check_deferred_restart(active_turn_count: usize) {
-    if active_turn_count > 0 {
+///
+/// `finalizing_count` = number of turns currently sending their final Discord response
+/// and doing cleanup. These turns already removed their cancel_token but haven't finished
+/// sending the response yet. We MUST wait for them to avoid losing completion messages.
+pub(super) fn check_deferred_restart(active_turn_count: usize, finalizing_count: usize) {
+    if active_turn_count > 0 || finalizing_count > 0 {
         return;
     }
     let Some(root) = crate::remotecc_runtime_root() else {
@@ -217,6 +221,9 @@ pub(super) struct SharedData {
     pub(super) recovering_channels: dashmap::DashMap<ChannelId, std::time::Instant>,
     /// Global shutdown flag — when set, watchers exit quietly via cancel path
     pub(super) shutting_down: Arc<std::sync::atomic::AtomicBool>,
+    /// Number of turns currently in finalization phase (response sending + cleanup).
+    /// Deferred restart must wait until this reaches 0 to avoid killing mid-send turns.
+    pub(super) finalizing_turns: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Poise user data type
@@ -539,6 +546,7 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
         tmux_watchers: dashmap::DashMap::new(),
         recovering_channels: dashmap::DashMap::new(),
         shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        finalizing_turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     });
 
     let token_owned = token.to_string();
@@ -622,8 +630,11 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
                 tokio::spawn(async move {
                     loop {
                         tokio::time::sleep(DEFERRED_RESTART_POLL_INTERVAL).await;
-                        let count = shared_for_deferred.core.lock().await.cancel_tokens.len();
-                        check_deferred_restart(count);
+                        let active = shared_for_deferred.core.lock().await.cancel_tokens.len();
+                        let finalizing = shared_for_deferred
+                            .finalizing_turns
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        check_deferred_restart(active, finalizing);
                     }
                 });
 
