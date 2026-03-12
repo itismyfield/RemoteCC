@@ -42,7 +42,7 @@ use formatting::{
 use inflight::{
     clear_inflight_state, load_inflight_states, save_inflight_state, InflightTurnState,
 };
-use pcd::{build_pcd_session_key, derive_pcd_session_info, post_pcd_session_status};
+use pcd::{build_pcd_session_key, derive_pcd_session_info, parse_dispatch_id, post_pcd_session_status};
 use prompt_builder::build_system_prompt;
 use recovery::restore_inflight_turns;
 use restart_report::flush_restart_reports;

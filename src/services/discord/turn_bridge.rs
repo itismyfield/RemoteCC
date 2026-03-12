@@ -103,6 +103,7 @@ pub(super) struct TurnBridgeContext {
     pub(super) pcd_session_name: Option<String>,
     pub(super) pcd_session_info: Option<String>,
     pub(super) pcd_cwd: Option<String>,
+    pub(super) dispatch_id: Option<String>,
     pub(super) current_msg_id: MessageId,
     pub(super) response_sent_offset: usize,
     pub(super) full_response: String,
@@ -135,6 +136,7 @@ pub(super) fn spawn_turn_bridge(
         let pcd_session_name = bridge.pcd_session_name.clone();
         let pcd_session_info = bridge.pcd_session_info.clone();
         let pcd_cwd = bridge.pcd_cwd.clone();
+        let dispatch_id = bridge.dispatch_id.clone();
 
         let mut full_response = bridge.full_response.clone();
         let mut last_edit_text = String::new();
@@ -410,6 +412,7 @@ pub(super) fn spawn_turn_bridge(
                     pcd_session_info.as_deref(),
                     None,
                     pcd_cwd.as_deref(),
+                    dispatch_id.as_deref(),
                 )
                 .await;
                 last_pcd_heartbeat = std::time::Instant::now();
@@ -425,6 +428,7 @@ pub(super) fn spawn_turn_bridge(
             pcd_session_info.as_deref(),
             (accumulated_tokens > 0).then_some(accumulated_tokens),
             pcd_cwd.as_deref(),
+            dispatch_id.as_deref(),
         )
         .await;
 
