@@ -75,6 +75,13 @@ pub(super) async fn tmux_output_watcher(
     let mut current_offset = initial_offset;
 
     loop {
+        // Always consume resume_offset first — the turn bridge may have set it
+        // between the previous paused check and now, so reading it here prevents
+        // the watcher from using a stale current_offset after unpausing.
+        if let Some(new_offset) = resume_offset.lock().ok().and_then(|mut g| g.take()) {
+            current_offset = new_offset;
+        }
+
         // Check cancel or global shutdown (both exit quietly, no "session ended" message)
         if cancel.load(Ordering::Relaxed) || shared.shutting_down.load(Ordering::Relaxed) {
             break;
@@ -83,10 +90,6 @@ pub(super) async fn tmux_output_watcher(
         // If paused (Discord handler is processing its own turn), wait
         if paused.load(Ordering::Relaxed) {
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-            // Check if resumed with a new offset
-            if let Some(new_offset) = resume_offset.lock().ok().and_then(|mut g| g.take()) {
-                current_offset = new_offset;
-            }
             continue;
         }
 
