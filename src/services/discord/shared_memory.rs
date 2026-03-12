@@ -9,12 +9,12 @@ use crate::services::provider::ProviderKind;
 
 const SHARED_MEMORY_VERSION: u32 = 1;
 const MAX_STORED_TURNS: usize = 40;
-const MAX_CONTEXT_TURNS: usize = 6;
-const MAX_CONTEXT_CHARS: usize = 6_000;
+const MAX_CONTEXT_TURNS: usize = 3;
+const MAX_CONTEXT_CHARS: usize = 3_000;
 const MAX_STORED_USER_CHARS: usize = 1_500;
 const MAX_STORED_ASSISTANT_CHARS: usize = 4_000;
 const MAX_CONTEXT_USER_CHARS: usize = 280;
-const MAX_CONTEXT_ASSISTANT_CHARS: usize = 700;
+const MAX_CONTEXT_ASSISTANT_CHARS: usize = 200;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SharedAgentTurn {
@@ -93,11 +93,19 @@ fn build_context_from_store(
     provider: ProviderKind,
     channel_id: ChannelId,
     has_provider_session: bool,
+    last_injected_ts: Option<&str>,
 ) -> Option<String> {
     let relevant: Vec<&SharedAgentTurn> = store
         .turns
         .iter()
         .filter(|turn| {
+            // Skip turns already injected in this session
+            if let Some(ts) = last_injected_ts {
+                if turn.created_at.as_str() <= ts {
+                    return false;
+                }
+            }
+
             if !has_provider_session {
                 return true;
             }
@@ -160,9 +168,17 @@ pub(super) fn build_shared_memory_context(
     provider: ProviderKind,
     channel_id: ChannelId,
     has_provider_session: bool,
+    last_injected_ts: Option<&str>,
 ) -> Option<String> {
     let root = shared_agent_memory_root()?;
-    build_shared_memory_context_at_root(&root, role_id, provider, channel_id, has_provider_session)
+    build_shared_memory_context_at_root(
+        &root,
+        role_id,
+        provider,
+        channel_id,
+        has_provider_session,
+        last_injected_ts,
+    )
 }
 
 fn build_shared_memory_context_at_root(
@@ -171,10 +187,19 @@ fn build_shared_memory_context_at_root(
     provider: ProviderKind,
     channel_id: ChannelId,
     has_provider_session: bool,
+    last_injected_ts: Option<&str>,
 ) -> Option<String> {
     let path = shared_agent_memory_path(&root, role_id);
     let store = load_store_from_path(&path, role_id);
-    build_context_from_store(&store, provider, channel_id, has_provider_session)
+    build_context_from_store(&store, provider, channel_id, has_provider_session, last_injected_ts)
+}
+
+/// Returns the timestamp of the newest turn in context, for dedup tracking.
+pub(super) fn latest_shared_memory_ts(role_id: &str) -> Option<String> {
+    let root = shared_agent_memory_root()?;
+    let path = shared_agent_memory_path(&root, role_id);
+    let store = load_store_from_path(&path, role_id);
+    store.turns.last().map(|t| t.created_at.clone())
 }
 
 pub(super) fn append_shared_memory_turn(
@@ -298,7 +323,7 @@ mod tests {
 
         let loaded = load_store_from_path(&path, "ch-pmd");
         let rendered =
-            build_context_from_store(&loaded, ProviderKind::Claude, ChannelId::new(1), true)
+            build_context_from_store(&loaded, ProviderKind::Claude, ChannelId::new(1), true, None)
                 .expect("context");
 
         assert!(rendered.contains("codex remembered"));
@@ -349,6 +374,7 @@ mod tests {
             ProviderKind::Codex,
             ChannelId::new(30),
             false,
+            None,
         )
         .expect("context");
 
