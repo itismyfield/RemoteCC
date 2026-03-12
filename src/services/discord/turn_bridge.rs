@@ -530,9 +530,7 @@ pub(super) fn spawn_turn_bridge(
                 if let Some(ref path) = inflight_state.output_path {
                     let recovered = super::recovery::extract_response_from_output_pub(
                         path,
-                        inflight_state.last_offset.saturating_sub(
-                            inflight_state.last_offset.min(8192),
-                        ),
+                        inflight_state.last_offset,
                     );
                     if !recovered.trim().is_empty() {
                         let ts = chrono::Local::now().format("%H:%M:%S");
@@ -638,12 +636,9 @@ pub(super) fn spawn_turn_bridge(
             }
         }
 
-        clear_inflight_state(provider, channel_id.get());
-        shared_owned.recovering_channels.remove(&channel_id);
-
-        // If this turn triggered a deferred restart and completed normally,
-        // clear the pending report so the new process doesn't overwrite
-        // the already-sent response.
+        // Clear restart report BEFORE clearing inflight state (which removes
+        // the cancel token) to prevent the flush loop from processing the
+        // report in the gap between cancel token removal and report deletion.
         if restart_followup_pending {
             clear_restart_report(provider, channel_id.get());
             let ts = chrono::Local::now().format("%H:%M:%S");
@@ -652,6 +647,9 @@ pub(super) fn spawn_turn_bridge(
                 channel_id
             );
         }
+
+        clear_inflight_state(provider, channel_id.get());
+        shared_owned.recovering_channels.remove(&channel_id);
 
         // Finalization complete — decrement counter and check deferred restart
         let finalizing_remaining = shared_owned
