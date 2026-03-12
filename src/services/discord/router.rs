@@ -610,6 +610,34 @@ pub(super) async fn handle_text_message(
         watcher.paused.store(true, Ordering::Relaxed);
     }
 
+    // Auto-sync worktree before sending message to session
+    {
+        let script = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".remotecc/scripts/worktree-autosync.sh");
+        if script.exists() {
+            let ws = current_path.clone();
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            match std::process::Command::new(&script)
+                .arg(&ws)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+            {
+                Ok(out) => {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    let msg = stdout.trim();
+                    match out.status.code() {
+                        Some(0) => println!("  [{ts}] 🔄 worktree-autosync [{ws}]: {msg}"),
+                        Some(1) => println!("  [{ts}] ⏭ worktree-autosync [{ws}]: skipped — {msg}"),
+                        _ => eprintln!("  [{ts}] ⚠ worktree-autosync [{ws}]: error — {msg}"),
+                    }
+                }
+                Err(e) => eprintln!("  [{ts}] ⚠ worktree-autosync: failed to run — {e}"),
+            }
+        }
+    }
+
     // Run the provider in a blocking thread
     tokio::task::spawn_blocking(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match provider {
