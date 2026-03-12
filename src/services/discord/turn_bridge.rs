@@ -140,6 +140,7 @@ pub(super) fn spawn_turn_bridge(
         let mut last_edit_text = String::new();
         let mut done = false;
         let mut cancelled = false;
+        let mut rx_disconnected = false;
         let mut current_tool_line: Option<String> = None;
         let mut last_tool_name: Option<String> = None;
         let mut last_tool_summary: Option<String> = None;
@@ -352,6 +353,7 @@ pub(super) fn spawn_turn_bridge(
                     },
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        rx_disconnected = true;
                         done = true;
                         break;
                     }
@@ -478,7 +480,15 @@ pub(super) fn spawn_turn_bridge(
             println!("  [{ts}] ■ Stopped");
         } else {
             if full_response.is_empty() {
-                full_response = "(No response)".to_string();
+                if rx_disconnected {
+                    full_response = "(No response — 프로세스가 응답 없이 종료됨)".to_string();
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    eprintln!("  [{ts}] ⚠ Empty response: rx disconnected before any text (channel {})", channel_id);
+                } else {
+                    full_response = "(No response)".to_string();
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    eprintln!("  [{ts}] ⚠ Empty response: done without text (channel {})", channel_id);
+                }
             }
 
             full_response = format_for_discord(&full_response);
