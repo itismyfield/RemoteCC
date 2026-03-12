@@ -172,19 +172,64 @@ pub(super) async fn handle_event(
             println!("  [{ts}] ◀ [{user_name}] {preview}");
 
             // Extract reply context if user replied to another message
-            let reply_context = new_message.referenced_message.as_ref().map(|ref_msg| {
-                let author = &ref_msg.author.name;
-                let content = ref_msg.content.trim();
-                if content.is_empty() {
-                    format!("[Reply to {}'s message (no text content)]", author)
+            let reply_context = if let Some(ref_msg) = new_message.referenced_message.as_ref() {
+                let ref_author = &ref_msg.author.name;
+                let ref_content = ref_msg.content.trim();
+                let ref_text = if ref_content.is_empty() {
+                    format!("[Reply to {}'s message (no text content)]", ref_author)
                 } else {
-                    let truncated = truncate_str(content, 500);
+                    let truncated = truncate_str(ref_content, 500);
                     format!(
                         "[Reply context]\nAuthor: {}\nContent: {}",
-                        author, truncated
+                        ref_author, truncated
                     )
+                };
+
+                // Fetch preceding messages for Q&A context (best-effort)
+                let mut context_parts = Vec::new();
+                if let Ok(preceding) = channel_id
+                    .messages(
+                        &ctx.http,
+                        serenity::builder::GetMessages::new()
+                            .before(ref_msg.id)
+                            .limit(4),
+                    )
+                    .await
+                {
+                    // preceding comes newest-first; reverse for chronological order
+                    let mut msgs: Vec<_> = preceding
+                        .iter()
+                        .filter(|m| !m.content.trim().is_empty())
+                        .collect();
+                    msgs.reverse();
+                    // Keep last 2 Q&A-style messages (budget: ~1000 chars total)
+                    let mut budget: usize = 1000;
+                    for m in msgs.iter().rev().take(4).collect::<Vec<_>>().into_iter().rev() {
+                        let entry = format!(
+                            "{}: {}",
+                            m.author.name,
+                            truncate_str(m.content.trim(), 300)
+                        );
+                        if entry.len() > budget {
+                            break;
+                        }
+                        budget -= entry.len();
+                        context_parts.push(entry);
+                    }
                 }
-            });
+
+                if context_parts.is_empty() {
+                    Some(ref_text)
+                } else {
+                    let preceding_ctx = context_parts.join("\n");
+                    Some(format!(
+                        "[Reply context — preceding conversation]\n{}\n\n{}",
+                        preceding_ctx, ref_text
+                    ))
+                }
+            } else {
+                None
+            };
 
             handle_text_message(
                 ctx,
