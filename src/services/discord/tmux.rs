@@ -533,8 +533,25 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
             continue;
         };
 
-        if shared.recovering_channels.contains_key(channel_id) {
-            continue;
+        if let Some(started) = shared.recovering_channels.get(channel_id) {
+            if started.elapsed() < std::time::Duration::from_secs(60) {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!(
+                    "  [{ts}] ⏳ watcher skip for {} — recovery in progress ({:.0}s ago)",
+                    session_name,
+                    started.elapsed().as_secs_f64()
+                );
+                continue;
+            }
+            // Stale recovery — remove marker and proceed with watcher
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ⚠ clearing stale recovery marker for {} ({:.0}s elapsed)",
+                session_name,
+                started.elapsed().as_secs_f64()
+            );
+            drop(started);
+            shared.recovering_channels.remove(channel_id);
         }
 
         if shared.tmux_watchers.contains_key(channel_id) {

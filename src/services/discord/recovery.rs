@@ -244,7 +244,7 @@ pub(super) async fn restore_inflight_turns(
             continue;
         };
 
-        shared.recovering_channels.insert(channel_id, ());
+        shared.recovering_channels.insert(channel_id, std::time::Instant::now());
 
         let channel_key = channel_id.get().to_string();
         let last_path = settings_snapshot.last_sessions.get(&channel_key).cloned();
