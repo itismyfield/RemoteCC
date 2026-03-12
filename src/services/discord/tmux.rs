@@ -430,6 +430,7 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
 
                         last_active: tokio::time::Instant::now(),
                         worktree: None,
+                        last_shared_memory_ts: None,
                     });
 
             // Restore current_path from saved settings so message handler accepts messages

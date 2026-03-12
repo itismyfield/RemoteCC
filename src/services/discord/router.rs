@@ -222,7 +222,7 @@ pub(super) async fn handle_text_message(
     reply_context: Option<String>,
 ) -> Result<(), Error> {
     // Get session info, allowed tools, and pending uploads
-    let (session_info, provider, allowed_tools, pending_uploads) = {
+    let (session_info, provider, allowed_tools, pending_uploads, last_shared_mem_ts) = {
         let mut data = shared.core.lock().await;
         let info = data.sessions.get(&channel_id).and_then(|session| {
             session.current_path.as_ref().map(|_| {
@@ -232,12 +232,12 @@ pub(super) async fn handle_text_message(
                 )
             })
         });
-        let uploads = data
+        let (uploads, shared_ts) = data
             .sessions
             .get_mut(&channel_id)
             .map(|s| {
                 s.cleared = false;
-                std::mem::take(&mut s.pending_uploads)
+                (std::mem::take(&mut s.pending_uploads), s.last_shared_memory_ts.clone())
             })
             .unwrap_or_default();
         drop(data);
@@ -247,6 +247,7 @@ pub(super) async fn handle_text_message(
             settings.provider,
             settings.allowed_tools.clone(),
             uploads,
+            shared_ts,
         )
     };
 
@@ -319,6 +320,7 @@ pub(super) async fn handle_text_message(
                                     channel_id: Some(channel_id.get()),
                                     last_active: tokio::time::Instant::now(),
                                     worktree: None,
+                                    last_shared_memory_ts: None,
                                 });
                         session.current_path = Some(eff_path.clone());
                         session.channel_name = ch_name_resolved;
@@ -396,9 +398,24 @@ pub(super) async fn handle_text_message(
         context_chunks.push(pending_uploads.join("\n"));
     }
     if let Some(shared_memory) = role_binding.as_ref().and_then(|binding| {
-        build_shared_memory_context(&binding.role_id, provider, channel_id, session_id.is_some())
+        build_shared_memory_context(
+            &binding.role_id,
+            provider,
+            channel_id,
+            session_id.is_some(),
+            last_shared_mem_ts.as_deref(),
+        )
     }) {
         context_chunks.push(shared_memory);
+        // Update last_shared_memory_ts for dedup in next turn
+        if let Some(binding) = role_binding.as_ref() {
+            if let Some(ts) = latest_shared_memory_ts(&binding.role_id) {
+                let mut data = shared.core.lock().await;
+                if let Some(session) = data.sessions.get_mut(&channel_id) {
+                    session.last_shared_memory_ts = Some(ts);
+                }
+            }
+        }
     }
     if let Some(ref reply_ctx) = reply_context {
         context_chunks.push(reply_ctx.clone());
@@ -608,6 +625,34 @@ pub(super) async fn handle_text_message(
     // Pause tmux watcher if one exists (so it doesn't read our turn's output)
     if let Some(watcher) = shared.tmux_watchers.get(&channel_id) {
         watcher.paused.store(true, Ordering::Relaxed);
+    }
+
+    // Auto-sync worktree before sending message to session
+    {
+        let script = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".remotecc/scripts/worktree-autosync.sh");
+        if script.exists() {
+            let ws = current_path.clone();
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            match std::process::Command::new(&script)
+                .arg(&ws)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+            {
+                Ok(out) => {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    let msg = stdout.trim();
+                    match out.status.code() {
+                        Some(0) => println!("  [{ts}] 🔄 worktree-autosync [{ws}]: {msg}"),
+                        Some(1) => println!("  [{ts}] ⏭ worktree-autosync [{ws}]: skipped — {msg}"),
+                        _ => eprintln!("  [{ts}] ⚠ worktree-autosync [{ws}]: error — {msg}"),
+                    }
+                }
+                Err(e) => eprintln!("  [{ts}] ⚠ worktree-autosync: failed to run — {e}"),
+            }
+        }
     }
 
     // Run the provider in a blocking thread

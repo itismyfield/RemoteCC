@@ -52,7 +52,7 @@ use settings::{
     channel_supports_provider, channel_upload_dir, cleanup_channel_uploads, cleanup_old_uploads,
     load_bot_settings, resolve_role_binding, save_bot_settings, RoleBinding,
 };
-use shared_memory::{append_shared_memory_turn, build_shared_memory_context};
+use shared_memory::{append_shared_memory_turn, build_shared_memory_context, latest_shared_memory_ts};
 use tmux::{cleanup_orphan_tmux_sessions, restore_tmux_watchers, tmux_output_watcher};
 use turn_bridge::{cancel_active_token, spawn_turn_bridge, tmux_runtime_paths, TurnBridgeContext};
 
@@ -87,6 +87,8 @@ pub(super) struct DiscordSession {
     pub(super) last_active: tokio::time::Instant,
     /// If this session runs in a git worktree, store the info here
     pub(super) worktree: Option<WorktreeInfo>,
+    /// Timestamp of newest shared-memory turn already injected (dedup)
+    pub(super) last_shared_memory_ts: Option<String>,
 }
 
 /// Worktree info for sessions that were auto-redirected to avoid conflicts
@@ -1266,6 +1268,7 @@ async fn cmd_start(
 
                 last_active: tokio::time::Instant::now(),
                 worktree: None,
+                last_shared_memory_ts: None,
             });
         session.channel_id = Some(channel_id.get());
         session.channel_name = ch_name;
@@ -2975,6 +2978,7 @@ async fn auto_restore_session(
 
                     last_active: tokio::time::Instant::now(),
                     worktree: None,
+                    last_shared_memory_ts: None,
                 });
             session.channel_id = Some(channel_id.get());
             session.last_active = tokio::time::Instant::now();

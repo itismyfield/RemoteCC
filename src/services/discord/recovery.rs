@@ -272,6 +272,7 @@ pub(super) async fn restore_inflight_turns(
                     category_name: None,
                     last_active: tokio::time::Instant::now(),
                     worktree: None,
+                    last_shared_memory_ts: None,
                 });
             session.channel_id = Some(channel_id.get());
             session.last_active = tokio::time::Instant::now();
