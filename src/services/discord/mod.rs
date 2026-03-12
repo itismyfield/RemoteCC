@@ -71,6 +71,29 @@ const SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60); // 1 ho
 const SESSION_MAX_IDLE: Duration = Duration::from_secs(24 * 60 * 60); // 1 day
 const RESTART_REPORT_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Check if a deferred restart has been requested and no active turns remain.
+/// If so, remove the marker and exit the process (launchd will restart it).
+pub(super) fn check_deferred_restart(active_turn_count: usize) {
+    if active_turn_count > 0 {
+        return;
+    }
+    let Some(root) = crate::remotecc_runtime_root() else {
+        return;
+    };
+    let marker = root.join("restart_pending");
+    if !marker.exists() {
+        return;
+    }
+    let version = fs::read_to_string(&marker).unwrap_or_default();
+    let version = version.trim();
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    println!("  [{ts}] 🔄 Deferred restart: all turns complete, restarting for v{version}...");
+    // Remove marker before exiting
+    let _ = fs::remove_file(&marker);
+    // Exit cleanly — launchd KeepAlive will restart us
+    std::process::exit(0);
+}
+
 /// Per-channel session state
 pub(super) struct DiscordSession {
     pub(super) session_id: Option<String>,

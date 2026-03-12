@@ -1,3 +1,4 @@
+use super::shared_memory::latest_shared_memory_ts;
 use super::turn_bridge::stale_inflight_message;
 use super::*;
 
@@ -284,6 +285,14 @@ pub(super) async fn restore_inflight_turns(
             }
             if session.remote_profile_name.is_none() {
                 session.remote_profile_name = saved_remote;
+            }
+            // Restore shared memory dedup timestamp to prevent re-injection after restart
+            if session.last_shared_memory_ts.is_none() {
+                let role_id = resolve_role_binding(channel_id, channel_name.as_deref())
+                    .map(|b| b.role_id.clone());
+                if let Some(ref rid) = role_id {
+                    session.last_shared_memory_ts = latest_shared_memory_ts(rid);
+                }
             }
             data.cancel_tokens.insert(channel_id, cancel_token.clone());
             data.active_request_owner

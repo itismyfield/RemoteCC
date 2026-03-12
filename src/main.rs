@@ -496,7 +496,7 @@ fn kickstart_launchd_job(label: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn remotecc_runtime_root() -> Option<PathBuf> {
+pub(crate) fn remotecc_runtime_root() -> Option<PathBuf> {
     if let Ok(override_root) = env::var(REMOTECC_ROOT_DIR_ENV) {
         let trimmed = override_root.trim();
         if !trimmed.is_empty() {
@@ -797,7 +797,48 @@ fn handle_restart_dcserver(
         }
     }
 
-    // Kill ALL existing dcserver processes first (prevents duplicates)
+    // Deferred restart: write marker file and wait for dcserver to self-exit
+    // after all active turns complete. Falls back to force-kill on timeout.
+    const DEFERRED_TIMEOUT: Duration = Duration::from_secs(120);
+    if let Some(root) = remotecc_runtime_root() {
+        let marker = root.join("restart_pending");
+        let _ = fs::write(&marker, VERSION);
+        println!("   ⏳ Deferred restart requested — waiting for active turns to complete (max {}s)", DEFERRED_TIMEOUT.as_secs());
+
+        let start = Instant::now();
+        loop {
+            // If marker file is gone, dcserver consumed it and exited
+            if !marker.exists() {
+                println!("   ✓ dcserver acknowledged restart marker");
+                break;
+            }
+            // Check if dcserver process is still running
+            let pid_file = root.join("dcserver.pid");
+            if let Ok(pid_str) = fs::read_to_string(&pid_file) {
+                if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                    // Check if process still exists via /bin/kill -0
+                    let status = std::process::Command::new("kill")
+                        .args(["-0", &pid.to_string()])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                    if matches!(status, Ok(s) if !s.success()) {
+                        println!("   ✓ dcserver process exited gracefully");
+                        let _ = fs::remove_file(&marker);
+                        break;
+                    }
+                }
+            }
+            if start.elapsed() >= DEFERRED_TIMEOUT {
+                eprintln!("   ⚠ Deferred restart timeout — falling back to force kill");
+                let _ = fs::remove_file(&marker);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    // Kill remaining dcserver processes (either timeout fallback or normal cleanup)
     kill_existing_dcserver_processes();
 
     let launchd_label = current_dcserver_launchd_label();
