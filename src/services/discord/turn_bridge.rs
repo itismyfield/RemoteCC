@@ -103,6 +103,7 @@ pub(super) struct TurnBridgeContext {
     pub(super) pcd_session_name: Option<String>,
     pub(super) pcd_session_info: Option<String>,
     pub(super) pcd_cwd: Option<String>,
+    pub(super) dispatch_id: Option<String>,
     pub(super) current_msg_id: MessageId,
     pub(super) response_sent_offset: usize,
     pub(super) full_response: String,
@@ -135,11 +136,13 @@ pub(super) fn spawn_turn_bridge(
         let pcd_session_name = bridge.pcd_session_name.clone();
         let pcd_session_info = bridge.pcd_session_info.clone();
         let pcd_cwd = bridge.pcd_cwd.clone();
+        let dispatch_id = bridge.dispatch_id.clone();
 
         let mut full_response = bridge.full_response.clone();
         let mut last_edit_text = String::new();
         let mut done = false;
         let mut cancelled = false;
+        let mut rx_disconnected = false;
         let mut current_tool_line: Option<String> = None;
         let mut last_tool_name: Option<String> = None;
         let mut last_tool_summary: Option<String> = None;
@@ -352,6 +355,7 @@ pub(super) fn spawn_turn_bridge(
                     },
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        rx_disconnected = true;
                         done = true;
                         break;
                     }
@@ -408,6 +412,7 @@ pub(super) fn spawn_turn_bridge(
                     pcd_session_info.as_deref(),
                     None,
                     pcd_cwd.as_deref(),
+                    dispatch_id.as_deref(),
                 )
                 .await;
                 last_pcd_heartbeat = std::time::Instant::now();
@@ -423,6 +428,7 @@ pub(super) fn spawn_turn_bridge(
             pcd_session_info.as_deref(),
             (accumulated_tokens > 0).then_some(accumulated_tokens),
             pcd_cwd.as_deref(),
+            dispatch_id.as_deref(),
         )
         .await;
 
@@ -478,7 +484,15 @@ pub(super) fn spawn_turn_bridge(
             println!("  [{ts}] ■ Stopped");
         } else {
             if full_response.is_empty() {
-                full_response = "(No response)".to_string();
+                if rx_disconnected {
+                    full_response = "(No response — 프로세스가 응답 없이 종료됨)".to_string();
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    eprintln!("  [{ts}] ⚠ Empty response: rx disconnected before any text (channel {})", channel_id);
+                } else {
+                    full_response = "(No response)".to_string();
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    eprintln!("  [{ts}] ⚠ Empty response: done without text (channel {})", channel_id);
+                }
             }
 
             full_response = format_for_discord(&full_response);

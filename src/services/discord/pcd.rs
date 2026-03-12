@@ -8,6 +8,22 @@ use crate::services::provider::ProviderKind;
 
 const PCD_SESSION_INFO_MAX_CHARS: usize = 60;
 
+/// Parse `DISPATCH:<uuid> - <title>` format and return the dispatch_id (uuid part).
+pub(super) fn parse_dispatch_id(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    let rest = trimmed.strip_prefix("DISPATCH:")?;
+    // UUID is the part before " - "
+    let id = if let Some(idx) = rest.find(" - ") {
+        rest[..idx].trim()
+    } else {
+        rest.trim()
+    };
+    if id.is_empty() {
+        return None;
+    }
+    Some(id.to_string())
+}
+
 pub(super) async fn build_pcd_session_key(
     shared: &Arc<SharedData>,
     channel_id: serenity::ChannelId,
@@ -78,6 +94,7 @@ pub(super) async fn post_pcd_session_status(
     session_info: Option<&str>,
     tokens: Option<u64>,
     cwd: Option<&str>,
+    dispatch_id: Option<&str>,
 ) {
     let Some(session_key) = session_key else {
         return;
@@ -101,6 +118,9 @@ pub(super) async fn post_pcd_session_status(
     }
     if let Some(cwd) = cwd.and_then(clean_nonempty) {
         body["cwd"] = serde_json::json!(cwd);
+    }
+    if let Some(did) = dispatch_id.and_then(clean_nonempty) {
+        body["dispatch_id"] = serde_json::json!(did);
     }
 
     match reqwest::Client::new()

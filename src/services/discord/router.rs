@@ -534,6 +534,7 @@ pub(super) async fn handle_text_message(
         channel_name.as_deref(),
         Some(&current_path),
     );
+    let dispatch_id = parse_dispatch_id(user_text);
     post_pcd_session_status(
         pcd_session_key.as_deref(),
         pcd_session_name.as_deref(),
@@ -543,6 +544,7 @@ pub(super) async fn handle_text_message(
         Some(&pcd_session_info),
         None,
         Some(&current_path),
+        dispatch_id.as_deref(),
     )
     .await;
 
@@ -688,6 +690,7 @@ pub(super) async fn handle_text_message(
             pcd_session_name,
             pcd_session_info: Some(pcd_session_info),
             pcd_cwd: Some(current_path.clone()),
+            dispatch_id,
             current_msg_id: placeholder_msg_id,
             response_sent_offset: 0,
             full_response: String::new(),
