@@ -444,6 +444,11 @@ pub(super) fn spawn_turn_bridge(
 
         let can_chain_locally =
             serenity_ctx.is_some() && request_owner.is_some() && token.is_some();
+        // Mark this turn as finalizing — deferred restart must wait until we finish
+        // sending the Discord response and cleaning up state.
+        shared_owned
+            .finalizing_turns
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let has_queued_turns = {
             let mut data = shared_owned.core.lock().await;
             data.cancel_tokens.remove(&channel_id);
@@ -459,10 +464,7 @@ pub(super) fn spawn_turn_bridge(
             if remove_queue {
                 data.intervention_queue.remove(&channel_id);
             }
-            let remaining_turns = data.cancel_tokens.len();
             drop(data);
-            // Check deferred restart after turn completion
-            super::check_deferred_restart(remaining_turns);
             has_pending
         };
 
@@ -607,6 +609,16 @@ pub(super) fn spawn_turn_bridge(
 
         clear_inflight_state(provider, channel_id.get());
         shared_owned.recovering_channels.remove(&channel_id);
+
+        // Finalization complete — decrement counter and check deferred restart
+        let finalizing_remaining = shared_owned
+            .finalizing_turns
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
+            - 1;
+        {
+            let active = shared_owned.core.lock().await.cancel_tokens.len();
+            super::check_deferred_restart(active, finalizing_remaining);
+        }
 
         if has_queued_turns {
             if let (Some(ctx), Some(owner), Some(tok)) =
