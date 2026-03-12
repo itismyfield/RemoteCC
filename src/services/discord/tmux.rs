@@ -7,9 +7,29 @@ use serenity::ChannelId;
 use crate::services::claude;
 use crate::services::provider::parse_provider_and_channel_from_tmux_name;
 
-use super::formatting::{format_for_discord, send_long_message_raw};
+use super::formatting::{format_for_discord, format_tool_input, normalize_empty_lines, send_long_message_raw};
 use super::settings::{channel_supports_provider, resolve_role_binding};
-use super::{SharedData, TmuxWatcherHandle};
+use super::{rate_limit_wait, SharedData, TmuxWatcherHandle, DISCORD_MSG_LIMIT};
+
+/// Tail a string to fit within max_chars, prepending "…" if truncated.
+fn watcher_tail(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(keep)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("…{}", tail)
+}
 
 fn current_tmux_owner_marker() -> String {
     std::env::var("REMOTECC_ROOT_DIR")
@@ -147,14 +167,22 @@ pub(super) async fn tmux_output_watcher(
         let mut all_data = String::from_utf8_lossy(&data).to_string();
         let mut state = StreamLineState::new();
         let mut full_response = String::new();
+        let mut tool_state = WatcherToolState::new();
+
+        // Create a placeholder message for real-time status display
+        const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let mut spin_idx: usize = 0;
+        let mut placeholder_msg_id: Option<serenity::MessageId> = None;
+        let mut last_edit_text = String::new();
 
         // Process any complete lines we already have
-        let mut found_result = process_watcher_lines(&mut all_data, &mut state, &mut full_response);
+        let mut found_result = process_watcher_lines(&mut all_data, &mut state, &mut full_response, &mut tool_state);
 
         // Keep reading until result or timeout
         if !found_result {
             let turn_start = tokio::time::Instant::now();
             let turn_timeout = tokio::time::Duration::from_secs(600); // 10 min max
+            let mut last_status_update = tokio::time::Instant::now();
 
             while !found_result && turn_start.elapsed() < turn_timeout {
                 if cancel.load(Ordering::Relaxed)
@@ -185,10 +213,54 @@ pub(super) async fn tmux_output_watcher(
                         current_offset = off;
                         all_data.push_str(&String::from_utf8_lossy(&chunk));
                         found_result =
-                            process_watcher_lines(&mut all_data, &mut state, &mut full_response);
+                            process_watcher_lines(&mut all_data, &mut state, &mut full_response, &mut tool_state);
                     }
                     _ => {
                         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                    }
+                }
+
+                // Update Discord placeholder every ~1 second with status
+                if last_status_update.elapsed() >= tokio::time::Duration::from_secs(1) {
+                    last_status_update = tokio::time::Instant::now();
+                    let indicator = SPINNER[spin_idx % SPINNER.len()];
+                    spin_idx += 1;
+
+                    let tool_status = tool_state
+                        .current_tool_line
+                        .as_deref()
+                        .unwrap_or("Processing...");
+                    let footer = format!("\n\n{} {}", indicator, tool_status);
+                    let body_budget = DISCORD_MSG_LIMIT.saturating_sub(footer.len() + 10);
+                    let display_text = if full_response.is_empty() {
+                        format!("{} {}", indicator, tool_status)
+                    } else {
+                        let normalized = normalize_empty_lines(&full_response);
+                        let body = watcher_tail(&normalized, body_budget.max(1));
+                        format!("{}{}", body, footer)
+                    };
+
+                    if display_text != last_edit_text {
+                        match placeholder_msg_id {
+                            Some(msg_id) => {
+                                // Edit existing placeholder
+                                rate_limit_wait(&shared, channel_id).await;
+                                let _ = channel_id
+                                    .edit_message(
+                                        &http,
+                                        msg_id,
+                                        serenity::EditMessage::new().content(&display_text),
+                                    )
+                                    .await;
+                            }
+                            None => {
+                                // Create new placeholder
+                                if let Ok(msg) = channel_id.say(&http, &display_text).await {
+                                    placeholder_msg_id = Some(msg.id);
+                                }
+                            }
+                        }
+                        last_edit_text = display_text;
                     }
                 }
             }
@@ -196,6 +268,10 @@ pub(super) async fn tmux_output_watcher(
 
         // If paused was set while we were reading, discard — Discord handler will handle it
         if paused.load(Ordering::Relaxed) {
+            // Clean up placeholder if we created one
+            if let Some(msg_id) = placeholder_msg_id {
+                let _ = channel_id.delete_message(&http, msg_id).await;
+            }
             continue;
         }
 
@@ -208,10 +284,41 @@ pub(super) async fn tmux_output_watcher(
                 "  [{ts}] 👁 Relaying terminal response to Discord ({} chars)",
                 prefixed.len()
             );
-            if let Err(e) = send_long_message_raw(&http, channel_id, &prefixed, &shared).await {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                println!("  [{ts}] 👁 Failed to relay: {e}");
+            match placeholder_msg_id {
+                Some(msg_id) => {
+                    // Update the placeholder with final response (may need splitting)
+                    if prefixed.len() <= DISCORD_MSG_LIMIT {
+                        rate_limit_wait(&shared, channel_id).await;
+                        let _ = channel_id
+                            .edit_message(
+                                &http,
+                                msg_id,
+                                serenity::EditMessage::new().content(&prefixed),
+                            )
+                            .await;
+                    } else {
+                        // Response too long — delete placeholder and send via send_long_message_raw
+                        let _ = channel_id.delete_message(&http, msg_id).await;
+                        if let Err(e) =
+                            send_long_message_raw(&http, channel_id, &prefixed, &shared).await
+                        {
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            println!("  [{ts}] 👁 Failed to relay: {e}");
+                        }
+                    }
+                }
+                None => {
+                    if let Err(e) =
+                        send_long_message_raw(&http, channel_id, &prefixed, &shared).await
+                    {
+                        let ts = chrono::Local::now().format("%H:%M:%S");
+                        println!("  [{ts}] 👁 Failed to relay: {e}");
+                    }
+                }
             }
+        } else if let Some(msg_id) = placeholder_msg_id {
+            // No response text but placeholder exists — clean up
+            let _ = channel_id.delete_message(&http, msg_id).await;
         }
     }
 
@@ -221,13 +328,28 @@ pub(super) async fn tmux_output_watcher(
     println!("  [{ts}] 👁 tmux watcher stopped for #{tmux_session_name}");
 }
 
+/// Tracks tool/thinking status during watcher output processing.
+pub(super) struct WatcherToolState {
+    /// Current tool status line (e.g. "⚙ Bash: `ls`")
+    pub current_tool_line: Option<String>,
+}
+
+impl WatcherToolState {
+    pub fn new() -> Self {
+        Self {
+            current_tool_line: None,
+        }
+    }
+}
+
 /// Process buffered lines for the tmux watcher.
-/// Extracts text content and detects result events.
+/// Extracts text content, tracks tool status, and detects result events.
 /// Returns true if a "result" event was found.
 pub(super) fn process_watcher_lines(
     buffer: &mut String,
     state: &mut claude::StreamLineState,
     full_response: &mut String,
+    tool_state: &mut WatcherToolState,
 ) -> bool {
     let mut found_result = false;
 
@@ -248,15 +370,39 @@ pub(super) fn process_watcher_lines(
                         if let Some(content) = message.get("content") {
                             if let Some(arr) = content.as_array() {
                                 for block in arr {
-                                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                    let block_type = block.get("type").and_then(|t| t.as_str());
+                                    if block_type == Some("text") {
                                         if let Some(text) =
                                             block.get("text").and_then(|t| t.as_str())
                                         {
                                             full_response.push_str(text);
+                                            tool_state.current_tool_line = None;
                                         }
+                                    } else if block_type == Some("tool_use") {
+                                        let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("Tool");
+                                        let input_str = block.get("input").map(|i| i.to_string()).unwrap_or_default();
+                                        let summary = format_tool_input(name, &input_str);
+                                        let display = if summary.is_empty() {
+                                            format!("⚙ {}", name)
+                                        } else {
+                                            let truncated: String = summary.chars().take(120).collect();
+                                            format!("⚙ {}: {}", name, truncated)
+                                        };
+                                        tool_state.current_tool_line = Some(display);
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+                "content_block_start" => {
+                    if let Some(cb) = val.get("content_block") {
+                        let cb_type = cb.get("type").and_then(|t| t.as_str());
+                        if cb_type == Some("thinking") {
+                            tool_state.current_tool_line = Some("💭 Thinking...".to_string());
+                        } else if cb_type == Some("tool_use") {
+                            let name = cb.get("name").and_then(|n| n.as_str()).unwrap_or("Tool");
+                            tool_state.current_tool_line = Some(format!("⚙ {}", name));
                         }
                     }
                 }
@@ -264,6 +410,15 @@ pub(super) fn process_watcher_lines(
                     if let Some(delta) = val.get("delta") {
                         if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
                             full_response.push_str(text);
+                            tool_state.current_tool_line = None;
+                        }
+                    }
+                }
+                "content_block_stop" => {
+                    // Tool completed — mark with checkmark
+                    if let Some(ref line) = tool_state.current_tool_line {
+                        if line.starts_with("⚙") {
+                            tool_state.current_tool_line = Some(line.replacen("⚙", "✓", 1));
                         }
                     }
                 }
