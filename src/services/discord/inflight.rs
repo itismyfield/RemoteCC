@@ -125,6 +125,9 @@ pub(super) fn load_inflight_states(provider: ProviderKind) -> Vec<InflightTurnSt
     load_inflight_states_from_root(&root, provider)
 }
 
+/// Maximum age for inflight state files before they are considered stale and removed.
+const INFLIGHT_MAX_AGE_SECS: u64 = 300; // 5 minutes
+
 fn load_inflight_states_from_root(root: &Path, provider: ProviderKind) -> Vec<InflightTurnState> {
     let dir = inflight_provider_dir(root, provider);
     let Ok(entries) = fs::read_dir(dir) else {
@@ -136,6 +139,23 @@ fn load_inflight_states_from_root(root: &Path, provider: ProviderKind) -> Vec<In
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
+        }
+        // Check file age — remove files older than INFLIGHT_MAX_AGE_SECS
+        if let Ok(meta) = fs::metadata(&path) {
+            if let Ok(modified) = meta.modified() {
+                if let Ok(age) = modified.elapsed() {
+                    if age.as_secs() > INFLIGHT_MAX_AGE_SECS {
+                        let ts = chrono::Local::now().format("%H:%M:%S");
+                        println!(
+                            "  [{ts}] ⚠ removing stale inflight state file ({:.0}s old): {}",
+                            age.as_secs_f64(),
+                            path.display()
+                        );
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
+                }
+            }
         }
         let Ok(content) = fs::read_to_string(&path) else {
             let ts = chrono::Local::now().format("%H:%M:%S");

@@ -93,24 +93,6 @@ pub(super) async fn handle_event(
             {
                 let mut d = data.shared.core.lock().await;
                 if d.cancel_tokens.contains_key(&channel_id) {
-                    let request_owner = d.active_request_owner.get(&channel_id).copied();
-                    if let Some(owner_id) = request_owner {
-                        if owner_id != user_id {
-                            drop(d);
-                            rate_limit_wait(&data.shared, channel_id).await;
-                            let _ = channel_id
-                                .say(
-                                    &ctx.http,
-                                    format!(
-                                        "AI request in progress. Only <@{}> can queue messages for this turn.",
-                                        owner_id.get()
-                                    ),
-                                )
-                                .await;
-                            return Ok(());
-                        }
-                    }
-
                     let inserted = {
                         let queue = d.intervention_queue.entry(channel_id).or_default();
                         enqueue_intervention(

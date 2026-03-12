@@ -189,7 +189,8 @@ pub(super) struct SharedData {
     /// Per-channel tmux output watchers for terminal→Discord relay
     pub(super) tmux_watchers: dashmap::DashMap<ChannelId, TmuxWatcherHandle>,
     /// Per-channel in-flight turn recovery marker (restart resume in progress)
-    pub(super) recovering_channels: dashmap::DashMap<ChannelId, ()>,
+    /// Value is the Instant when recovery started, used for stale-recovery timeout.
+    pub(super) recovering_channels: dashmap::DashMap<ChannelId, std::time::Instant>,
     /// Global shutdown flag — when set, watchers exit quietly via cancel path
     pub(super) shutting_down: Arc<std::sync::atomic::AtomicBool>,
 }
