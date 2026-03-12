@@ -256,74 +256,16 @@ pub(super) async fn flush_restart_reports(
             }
         }
 
-        let (status_badge, status_label, summary, completed_at_display) = match report.status.as_str() {
-            "ok" => (
-                "✅",
-                "ok",
-                report.summary.clone(),
-                report.completed_at.clone(),
-            ),
-            "rolled_back" => (
-                "⚠️",
-                "rolled_back",
-                report.summary.clone(),
-                report.completed_at.clone(),
-            ),
-            "sigterm" => (
-                "♻️",
-                "restarted",
-                format!(
-                    "{}\n새 dcserver가 시작되었습니다. 작업 복구를 시도합니다.",
-                    report.summary
-                ),
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-            ),
-            "pending" => (
-                "⏳",
-                "pending",
-                report.summary.clone(),
-                report.completed_at.clone(),
-            ),
-            _ => (
-                "❌",
-                "failed",
-                report.summary.clone(),
-                report.completed_at.clone(),
-            ),
+        // Build a concise follow-up message (sent as a NEW message, never
+        // editing the original response to avoid overwriting agent output).
+        let version = env!("CARGO_PKG_VERSION");
+        let text = match report.status.as_str() {
+            "ok" => format!("✅ dcserver v{version} 재시작 완료"),
+            "sigterm" => format!("♻️ dcserver v{version} 재시작 완료 — 작업 복구를 시도합니다."),
+            "rolled_back" => format!("⚠️ dcserver 롤백됨: {}", report.summary),
+            "pending" => format!("⏳ dcserver 재시작 대기 중 (v{version})"),
+            _ => format!("❌ dcserver restart failed: {}", report.summary),
         };
-        let text = format!(
-            "{status_badge} dcserver restart follow-up\n- status: `{}`\n- completed_at: `{}`\n- {}\n",
-            status_label, completed_at_display, summary
-        );
-        let mut sent = false;
-
-        if let Some(message_id) = report.current_msg_id {
-            match channel_id
-                .edit_message(
-                    http,
-                    serenity::MessageId::new(message_id),
-                    serenity::EditMessage::new().content(&text),
-                )
-                .await
-            {
-                Ok(_) => {
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    println!(
-                        "  [{ts}] ✓ Flushed restart follow-up by editing message {} in channel {}",
-                        message_id, report.channel_id
-                    );
-                    clear_restart_report(provider, report.channel_id);
-                    continue;
-                }
-                Err(e) => {
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    println!(
-                        "  [{ts}] ⚠ restart follow-up edit failed for channel {} msg {}: {}",
-                        report.channel_id, message_id, e
-                    );
-                }
-            }
-        }
 
         for attempt in 1..=5 {
             match send_long_message_raw(http, channel_id, &text, shared).await {
@@ -334,7 +276,6 @@ pub(super) async fn flush_restart_reports(
                         report.channel_id, attempt
                     );
                     clear_restart_report(provider, report.channel_id);
-                    sent = true;
                     break;
                 }
                 Err(e) => {
@@ -353,10 +294,6 @@ pub(super) async fn flush_restart_reports(
                     }
                 }
             }
-        }
-
-        if !sent {
-            continue;
         }
     }
 }
