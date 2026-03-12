@@ -755,6 +755,23 @@ fn handle_restart_dcserver(
         return;
     }
 
+    // Check if restart is actually needed by comparing running version with this binary's version
+    if let Some(root) = remotecc_runtime_root() {
+        let version_file = root.join("dcserver.version");
+        if let Ok(running_version) = std::fs::read_to_string(&version_file) {
+            let running = running_version.trim();
+            if running == VERSION {
+                println!("✅ dcserver is already running v{VERSION} — restart skipped");
+                write_restart_report(
+                    "skipped",
+                    format!("dcserver가 이미 v{VERSION}을 실행 중이므로 재시작을 건너뛰었습니다."),
+                );
+                return;
+            }
+            println!("   Running: v{running} → Deploying: v{VERSION}");
+        }
+    }
+
     println!("🔄 Restarting Discord bot server...");
     println!("   Configured bots: {}", configs.len());
 
@@ -997,12 +1014,10 @@ fn handle_dcserver(token: Option<String>) {
     // Single-instance guard: kill any existing dcserver before starting
     kill_existing_dcserver_processes();
 
-    // Write PID file for future instance detection
-    if let Some(home) = dirs::home_dir() {
-        let pid_file = remotecc_runtime_root()
-            .unwrap_or_else(|| home.join(".remotecc"))
-            .join("dcserver.pid");
-        let _ = std::fs::write(&pid_file, std::process::id().to_string());
+    // Write PID file and version file for future instance detection
+    if let Some(root) = remotecc_runtime_root() {
+        let _ = std::fs::write(root.join("dcserver.pid"), std::process::id().to_string());
+        let _ = std::fs::write(root.join("dcserver.version"), VERSION);
     }
 
     // Prevent CLAUDECODE from leaking into child tmux sessions
