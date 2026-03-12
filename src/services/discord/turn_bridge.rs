@@ -285,7 +285,16 @@ pub(super) fn spawn_turn_bridge(
                         StreamMessage::Error {
                             message, stderr, ..
                         } => {
-                            if !stderr.is_empty() {
+                            let combined = format!("{} {}", message, stderr).to_lowercase();
+                            if combined.contains("prompt is too long")
+                                || combined.contains("prompt too long")
+                                || combined.contains("context_length_exceeded")
+                                || combined.contains("max_tokens")
+                                || combined.contains("context window")
+                                || combined.contains("token limit")
+                            {
+                                full_response = "⚠️ __prompt too long__".to_string();
+                            } else if !stderr.is_empty() {
                                 full_response = format!(
                                     "Error: {}\nstderr: {}",
                                     message,
@@ -459,6 +468,8 @@ pub(super) fn spawn_turn_bridge(
 
         remove_reaction_raw(&http, channel_id, user_msg_id, '⏳').await;
 
+        let is_prompt_too_long = full_response.contains("__prompt too long__");
+
         if cancelled {
             if let Ok(guard) = cancel_token.child_pid.lock() {
                 if let Some(pid) = *guard {
@@ -487,6 +498,30 @@ pub(super) fn spawn_turn_bridge(
 
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!("  [{ts}] ■ Stopped");
+        } else if is_prompt_too_long {
+            let mention = request_owner
+                .map(|uid| format!("<@{}>", uid.get()))
+                .unwrap_or_default();
+            full_response = format!(
+                "{} ⚠️ 프롬프트가 너무 깁니다. 대화 컨텍스트가 모델 한도를 초과했습니다.\n\n\
+                 다음 메시지를 보내면 자동으로 새 턴이 시작됩니다.\n\
+                 컨텍스트를 줄이려면 `/compact` 또는 `/clear`를 사용해 주세요.",
+                mention
+            );
+            rate_limit_wait(&shared_owned, channel_id).await;
+            let _ = super::formatting::replace_long_message_raw(
+                &http,
+                channel_id,
+                current_msg_id,
+                &full_response,
+                &shared_owned,
+            )
+            .await;
+
+            add_reaction_raw(&http, channel_id, user_msg_id, '⚠').await;
+
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!("  [{ts}] ⚠ Prompt too long (channel {})", channel_id);
         } else {
             if full_response.is_empty() {
                 if rx_disconnected {
@@ -534,7 +569,7 @@ pub(super) fn spawn_turn_bridge(
         {
             let mut data = shared_owned.core.lock().await;
             if let Some(session) = data.sessions.get_mut(&channel_id) {
-                if !session.cleared {
+                if !session.cleared && !is_prompt_too_long {
                     if let Some(sid) = new_session_id {
                         session.session_id = Some(sid);
                     }
