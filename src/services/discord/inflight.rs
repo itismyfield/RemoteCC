@@ -26,6 +26,8 @@ pub(super) struct InflightTurnState {
     pub last_offset: u64,
     pub full_response: String,
     pub response_sent_offset: usize,
+    #[serde(default)]
+    pub current_tool_line: Option<String>,
     pub started_at: String,
     pub updated_at: String,
 }
@@ -63,6 +65,7 @@ impl InflightTurnState {
             last_offset,
             full_response: String::new(),
             response_sent_offset: 0,
+            current_tool_line: None,
             started_at: now.clone(),
             updated_at: now,
         }

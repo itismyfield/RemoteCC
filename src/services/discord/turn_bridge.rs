@@ -143,7 +143,7 @@ pub(super) fn spawn_turn_bridge(
         let mut done = false;
         let mut cancelled = false;
         let mut rx_disconnected = false;
-        let mut current_tool_line: Option<String> = None;
+        let mut current_tool_line: Option<String> = bridge.inflight_state.current_tool_line.clone();
         let mut last_tool_name: Option<String> = None;
         let mut last_tool_summary: Option<String> = None;
         let mut accumulated_tokens: u64 = 0;
@@ -398,7 +398,8 @@ pub(super) fn spawn_turn_bridge(
                 state_dirty = true;
             }
 
-            if state_dirty {
+            if state_dirty || inflight_state.current_tool_line != current_tool_line {
+                inflight_state.current_tool_line = current_tool_line.clone();
                 let _ = save_inflight_state(&inflight_state);
             }
 
