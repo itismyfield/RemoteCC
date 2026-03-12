@@ -33,6 +33,11 @@ fn output_has_result_after_offset(output_path: &str, start_offset: u64) -> bool 
 
 /// Extract accumulated assistant text from output JSONL after the given offset.
 fn extract_response_from_output(output_path: &str, start_offset: u64) -> String {
+    extract_response_from_output_pub(output_path, start_offset)
+}
+
+/// Public wrapper for turn_bridge fallback recovery.
+pub(super) fn extract_response_from_output_pub(output_path: &str, start_offset: u64) -> String {
     let Ok(bytes) = std::fs::read(output_path) else {
         return String::new();
     };
