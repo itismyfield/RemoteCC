@@ -70,6 +70,7 @@ const UPLOAD_MAX_AGE: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 const SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60); // 1 hour
 const SESSION_MAX_IDLE: Duration = Duration::from_secs(24 * 60 * 60); // 1 day
 const RESTART_REPORT_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+const DEFERRED_RESTART_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Check if a deferred restart has been requested and no active turns remain.
 /// If so, remove the marker and exit the process (launchd will restart it).
@@ -613,6 +614,16 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
                         )
                         .await;
                         tokio::time::sleep(RESTART_REPORT_FLUSH_INTERVAL).await;
+                    }
+                });
+
+                // Background: poll for deferred restart marker when idle
+                let shared_for_deferred = shared_for_tmux.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(DEFERRED_RESTART_POLL_INTERVAL).await;
+                        let count = shared_for_deferred.core.lock().await.cancel_tokens.len();
+                        check_deferred_restart(count);
                     }
                 });
 
