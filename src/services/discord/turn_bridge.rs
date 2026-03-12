@@ -449,6 +449,10 @@ pub(super) fn spawn_turn_bridge(
             if remove_queue {
                 data.intervention_queue.remove(&channel_id);
             }
+            let remaining_turns = data.cancel_tokens.len();
+            drop(data);
+            // Check deferred restart after turn completion
+            super::check_deferred_restart(remaining_turns);
             has_pending
         };
 
