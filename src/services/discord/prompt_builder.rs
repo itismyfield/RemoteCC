@@ -1,4 +1,6 @@
-use super::settings::{discord_token_hash, load_role_prompt, render_peer_agent_guidance};
+use super::settings::{
+    discord_token_hash, load_role_prompt, load_shared_prompt, render_peer_agent_guidance,
+};
 use super::*;
 
 pub(super) fn build_system_prompt(
@@ -27,7 +29,6 @@ pub(super) fn build_system_prompt(
          (e.g. \"mod.rs:2700 부근의 시스템 프롬프트를 확인합니다\" not just \"코드를 확인합니다\"). \
          The user sees only your text output, not the tool calls themselves.\n\n\
          Discord formatting rules:\n\
-         - Do NOT use markdown tables — Discord cannot render them. Use simple lists or key: value pairs instead.\n\
          - Minimize code blocks. Use inline `code` for short references. Only use code blocks for actual code snippets the user needs.\n\
          - Keep messages concise and scannable on mobile screens. Prefer short paragraphs and bullet points.\n\
          - Avoid long horizontal lines or decorative separators.\n\n\
@@ -43,6 +44,17 @@ pub(super) fn build_system_prompt(
     );
 
     if let Some(binding) = role_binding {
+        // Inject shared agent prompt (AGENTS.md) before role-specific identity
+        if let Some(shared_prompt) = load_shared_prompt() {
+            system_prompt_owned.push_str("\n\n[Shared Agent Rules]\n");
+            system_prompt_owned.push_str(&shared_prompt);
+            eprintln!(
+                "  [role-map] Injected shared prompt ({} chars) for channel {}",
+                shared_prompt.len(),
+                channel_id.get()
+            );
+        }
+
         match load_role_prompt(binding) {
             Some(role_prompt) => {
                 system_prompt_owned.push_str(

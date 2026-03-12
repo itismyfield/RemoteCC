@@ -13,6 +13,7 @@ use crate::services::provider::ProviderKind;
 use super::formatting::normalize_allowed_tools;
 use super::role_map::{
     load_peer_agents as load_peer_agents_from_role_map,
+    load_shared_prompt_path as load_shared_prompt_path_from_role_map,
     resolve_role_binding as resolve_role_binding_from_role_map,
     resolve_workspace as resolve_workspace_from_role_map,
 };
@@ -90,6 +91,19 @@ pub(super) fn resolve_workspace(
 pub(super) fn load_role_prompt(binding: &RoleBinding) -> Option<String> {
     let raw = fs::read_to_string(Path::new(&binding.prompt_file)).ok()?;
     const MAX_CHARS: usize = 12_000;
+    if raw.chars().count() <= MAX_CHARS {
+        return Some(raw);
+    }
+    let truncated: String = raw.chars().take(MAX_CHARS).collect();
+    Some(truncated)
+}
+
+/// Load the shared agent prompt (e.g. AGENTS.md) configured in role_map.json.
+/// Returns None if not configured or file not found.
+pub(super) fn load_shared_prompt() -> Option<String> {
+    let path_str = load_shared_prompt_path_from_role_map()?;
+    let raw = fs::read_to_string(Path::new(&path_str)).ok()?;
+    const MAX_CHARS: usize = 6_000;
     if raw.chars().count() <= MAX_CHARS {
         return Some(raw);
     }

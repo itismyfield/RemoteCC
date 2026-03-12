@@ -193,7 +193,7 @@ pub(super) fn extract_skill_description(content: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{canonical_tool_name, normalize_allowed_tools};
+    use super::{canonical_tool_name, convert_markdown_tables, normalize_allowed_tools};
 
     #[test]
     fn test_canonical_tool_name_is_case_insensitive() {
@@ -227,6 +227,32 @@ mod tests {
                 "AskUserQuestion".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn test_convert_markdown_table_to_list() {
+        let input = "Before\n\n| Name | Role | Status |\n|------|------|--------|\n| Alice | Dev | Active |\n| Bob | QA | On Leave |\n\nAfter";
+        let result = convert_markdown_tables(input);
+        assert!(result.contains("- **Name**: Alice, **Role**: Dev, **Status**: Active"));
+        assert!(result.contains("- **Name**: Bob, **Role**: QA, **Status**: On Leave"));
+        assert!(result.contains("Before"));
+        assert!(result.contains("After"));
+        assert!(!result.contains("|---"));
+    }
+
+    #[test]
+    fn test_table_inside_code_block_untouched() {
+        let input = "```\n| A | B |\n|---|---|\n| 1 | 2 |\n```";
+        let result = convert_markdown_tables(input);
+        assert!(result.contains("| A | B |"));
+        assert!(result.contains("| 1 | 2 |"));
+    }
+
+    #[test]
+    fn test_no_table_passthrough() {
+        let input = "Just some text\n- list item\n- another";
+        let result = convert_markdown_tables(input);
+        assert_eq!(result, input);
     }
 }
 
@@ -481,9 +507,80 @@ pub(super) fn format_tool_input(name: &str, input: &str) -> String {
     }
 }
 
+/// Convert markdown tables to Discord-friendly list format.
+/// Each data row becomes a bullet with "Header: Value" pairs.
+fn convert_markdown_tables(input: &str) -> String {
+    let raw_lines: Vec<&str> = input.lines().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    let mut in_code = false;
+
+    while i < raw_lines.len() {
+        let line = raw_lines[i];
+        if line.trim_start().starts_with("```") {
+            in_code = !in_code;
+            out.push(line.to_string());
+            i += 1;
+            continue;
+        }
+        if in_code {
+            out.push(line.to_string());
+            i += 1;
+            continue;
+        }
+
+        // Detect table: header row + separator row
+        if line.contains('|')
+            && i + 1 < raw_lines.len()
+            && is_table_separator(raw_lines[i + 1])
+        {
+            let headers = parse_table_cells(line);
+            if headers.len() >= 2 {
+                i += 2; // skip header + separator
+                while i < raw_lines.len() && raw_lines[i].contains('|') {
+                    let cells = parse_table_cells(raw_lines[i]);
+                    let pairs: Vec<String> = headers
+                        .iter()
+                        .zip(cells.iter())
+                        .filter(|(h, v)| !h.is_empty() || !v.is_empty())
+                        .map(|(h, v)| format!("**{}**: {}", h, v))
+                        .collect();
+                    if !pairs.is_empty() {
+                        out.push(format!("- {}", pairs.join(", ")));
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+        }
+
+        out.push(line.to_string());
+        i += 1;
+    }
+    out.join("\n")
+}
+
+fn is_table_separator(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.contains('|')
+        && trimmed
+            .chars()
+            .all(|c| c == '|' || c == '-' || c == ':' || c == ' ')
+}
+
+fn parse_table_cells(line: &str) -> Vec<String> {
+    let trimmed = line.trim().trim_matches('|');
+    trimmed
+        .split('|')
+        .map(|cell| cell.trim().to_string())
+        .collect()
+}
+
 /// Mechanical formatting for Discord readability.
 /// Converts markdown headers to bold, ensures spacing around lists, etc.
 pub(super) fn format_for_discord(s: &str) -> String {
+    // Pre-process: convert markdown tables to bullet lists
+    let s = convert_markdown_tables(s);
     let mut lines: Vec<String> = Vec::new();
     let mut in_code_block = false;
 
