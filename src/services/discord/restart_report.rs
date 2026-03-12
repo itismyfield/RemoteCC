@@ -211,15 +211,15 @@ pub(super) async fn flush_restart_reports(
         return;
     }
 
-    let ts = chrono::Local::now().format("%H:%M:%S");
-    println!(
-        "  [{ts}] 📬 Found {} pending restart follow-up report(s) for provider {}",
-        reports.len(),
-        provider.as_str()
-    );
-
     for report in reports {
         let channel_id = serenity::ChannelId::new(report.channel_id);
+
+        // "skipped" reports don't need Discord follow-up — just clean up
+        if report.status == "skipped" {
+            clear_restart_report(provider, report.channel_id);
+            continue;
+        }
+
         if report.status == "pending" {
             // Skip pending reports if the turn that created them is still active.
             // The turn will clear the report on normal completion.
