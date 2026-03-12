@@ -92,6 +92,19 @@ pub(super) async fn restore_inflight_turns(
     let settings_snapshot = shared.settings.read().await.clone();
 
     for state in states {
+        // Skip channels that have a pending restart follow-up report — the report
+        // flush loop handles those, and running recovery alongside it causes
+        // duplicate messages to the same channel.
+        if super::restart_report::load_restart_report(provider, state.channel_id).is_some() {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ⏭ skipping inflight recovery for channel {}: restart report exists",
+                state.channel_id
+            );
+            clear_inflight_state(provider, state.channel_id);
+            continue;
+        }
+
         let channel_id = ChannelId::new(state.channel_id);
         let current_msg_id = MessageId::new(state.current_msg_id);
         let user_msg_id = MessageId::new(state.user_msg_id);
