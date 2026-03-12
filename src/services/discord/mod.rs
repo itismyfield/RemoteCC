@@ -604,27 +604,6 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
                     migrate_session_categories(&ctx_clone, &shared_for_migrate).await;
                 });
 
-                // Background: flush delayed restart follow-up reports until they are delivered
-                let http_for_restart_reports = ctx.http.clone();
-                let shared_for_restart_reports = shared_for_tmux.clone();
-                flush_restart_reports(
-                    &http_for_restart_reports,
-                    &shared_for_restart_reports,
-                    provider,
-                )
-                .await;
-                tokio::spawn(async move {
-                    loop {
-                        flush_restart_reports(
-                            &http_for_restart_reports,
-                            &shared_for_restart_reports,
-                            provider,
-                        )
-                        .await;
-                        tokio::time::sleep(RESTART_REPORT_FLUSH_INTERVAL).await;
-                    }
-                });
-
                 // Background: poll for deferred restart marker when idle
                 let shared_for_deferred = shared_for_tmux.clone();
                 tokio::spawn(async move {
@@ -638,9 +617,14 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
                     }
                 });
 
-                // Background: restore tmux watchers for surviving tmux sessions, then clean orphans
+                // Restore inflight turns FIRST, then flush restart reports.
+                // Recovery skips channels that have a pending restart report,
+                // so the report must still be on disk when recovery runs.
+                // After recovery completes, the flush loop starts and delivers/clears reports.
                 let http_for_tmux = ctx.http.clone();
                 let shared_for_tmux2 = shared_for_tmux.clone();
+                let http_for_restart_reports = ctx.http.clone();
+                let shared_for_restart_reports = shared_for_tmux.clone();
                 tokio::spawn(async move {
                     restore_inflight_turns(&http_for_tmux, &shared_for_tmux2, provider).await;
 
@@ -660,6 +644,24 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
 
                     restore_tmux_watchers(&http_for_tmux, &shared_for_tmux2).await;
                     cleanup_orphan_tmux_sessions(&shared_for_tmux2).await;
+
+                    // NOW flush restart reports (recovery is done, safe to delete them)
+                    flush_restart_reports(
+                        &http_for_restart_reports,
+                        &shared_for_restart_reports,
+                        provider,
+                    )
+                    .await;
+                    // Continue flushing in a loop for any reports created later
+                    loop {
+                        tokio::time::sleep(RESTART_REPORT_FLUSH_INTERVAL).await;
+                        flush_restart_reports(
+                            &http_for_restart_reports,
+                            &shared_for_restart_reports,
+                            provider,
+                        )
+                        .await;
+                    }
                 });
 
                 // Background: periodic cleanup for stale Discord upload files
