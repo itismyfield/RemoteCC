@@ -453,7 +453,7 @@ pub(super) async fn handle_text_message(
     if session_id.is_some() {
         context_chunks.push(
             "<system-reminder>\n\
-             Discord formatting: no markdown tables, minimize code blocks, keep messages concise.\n\
+             Discord formatting: no markdown tables, minimize code blocks, keep messages concise. When writing .md files, use standard markdown including tables.\n\
              </system-reminder>"
                 .to_string(),
         );
