@@ -11,6 +11,8 @@ use super::runtime_store::{atomic_write, discord_restart_reports_root};
 use super::SharedData;
 use crate::services::provider::ProviderKind;
 
+use super::turn_bridge::tmux_runtime_paths;
+
 const RESTART_REPORT_VERSION: u32 = 1;
 const PENDING_REPORT_GRACE: Duration = Duration::from_secs(3);
 pub(crate) const RESTART_REPORT_CHANNEL_ENV: &str = "REMOTECC_REPORT_CHANNEL_ID";
@@ -33,6 +35,13 @@ pub(crate) struct RestartCompletionReport {
     pub status: String,
     pub summary: String,
     pub completed_at: String,
+    /// Optional prompt to inject into the agent's tmux session after restart,
+    /// so the agent can automatically continue remaining work.
+    #[serde(default)]
+    pub post_restart_prompt: Option<String>,
+    /// Channel name used to derive the tmux session name for FIFO injection.
+    #[serde(default)]
+    pub channel_name: Option<String>,
 }
 
 impl RestartCompletionReport {
@@ -50,6 +59,8 @@ impl RestartCompletionReport {
             status: status.into(),
             summary: summary.into(),
             completed_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            post_restart_prompt: None,
+            channel_name: None,
         }
     }
 
@@ -193,6 +204,48 @@ fn load_restart_reports_in_root(
     reports
 }
 
+/// Write a continuation prompt into the agent's tmux input FIFO so it
+/// automatically picks up remaining work after a dcserver restart.
+fn inject_post_restart_prompt(
+    provider: ProviderKind,
+    channel_name: Option<&str>,
+    prompt: &str,
+) {
+    let Some(name) = channel_name else {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        println!("  [{ts}] ⚠ post-restart prompt skipped: no channel name");
+        return;
+    };
+    let tmux_session = provider.build_tmux_session_name(name);
+    let (_, input_fifo) = tmux_runtime_paths(&tmux_session);
+    let fifo_path = Path::new(&input_fifo);
+    if !fifo_path.exists() {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        println!(
+            "  [{ts}] ⚠ post-restart prompt skipped: FIFO not found ({})",
+            input_fifo
+        );
+        return;
+    }
+    match fs::write(fifo_path, prompt) {
+        Ok(()) => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ✓ Injected post-restart prompt into {} ({} chars)",
+                tmux_session,
+                prompt.len()
+            );
+        }
+        Err(e) => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ⚠ post-restart prompt injection failed for {}: {}",
+                tmux_session, e
+            );
+        }
+    }
+}
+
 fn report_age(report: &RestartCompletionReport) -> Option<Duration> {
     let created_at =
         chrono::NaiveDateTime::parse_from_str(&report.completed_at, "%Y-%m-%d %H:%M:%S").ok()?;
@@ -276,6 +329,17 @@ pub(super) async fn flush_restart_reports(
                         report.channel_id, attempt
                     );
                     clear_restart_report(provider, report.channel_id);
+
+                    // Inject continuation prompt into the agent's tmux
+                    // session so it automatically resumes remaining work.
+                    if let Some(ref prompt) = report.post_restart_prompt {
+                        inject_post_restart_prompt(
+                            provider,
+                            report.channel_name.as_deref(),
+                            prompt,
+                        );
+                    }
+
                     break;
                 }
                 Err(e) => {
