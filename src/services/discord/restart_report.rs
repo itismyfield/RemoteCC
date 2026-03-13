@@ -338,6 +338,11 @@ pub(super) async fn flush_restart_reports(
             // it is gone (dcserver restarted). Force flush even if a new turn is
             // active — otherwise the report is stuck forever.
             if (has_active_turn || has_finalizing) && age < Duration::from_secs(30) {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!(
+                    "  [{ts}] ⏳ pending restart report for channel {} deferred (age={:.0}s, active={}, finalizing={})",
+                    report.channel_id, age.as_secs_f64(), has_active_turn, has_finalizing
+                );
                 continue;
             }
 
@@ -388,6 +393,11 @@ pub(super) async fn flush_restart_reports(
                 clear_restart_report(provider, report.channel_id);
                 continue;
             }
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ⚠ FIFO injection failed/timed out for channel {}, falling back to Discord message",
+                report.channel_id
+            );
             // FIFO injection failed or timed out — fall through to Discord message
         }
 

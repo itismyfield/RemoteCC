@@ -147,13 +147,14 @@ pub(super) async fn restore_inflight_turns(
                 continue;
             }
 
-            // Agent is still running — keep inflight state so the next restart
-            // (or a later check) can recover the completed response.
+            // Agent may still be running but restart report will handle follow-up.
+            // Clear inflight state so cancel_tokens don't block the flush loop.
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!(
-                "  [{ts}] ⏭ skipping inflight recovery for channel {}: restart report exists, agent still running (keeping inflight state)",
+                "  [{ts}] ⏭ skipping inflight recovery for channel {}: restart report exists, delegating to flush loop",
                 state.channel_id
             );
+            clear_inflight_state(provider, state.channel_id);
             continue;
         }
 
