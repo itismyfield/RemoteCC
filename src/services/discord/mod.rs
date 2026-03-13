@@ -62,7 +62,7 @@ pub use settings::{
 
 /// Discord message length limit
 pub(super) const DISCORD_MSG_LIMIT: usize = 2000;
-const MAX_INTERVENTIONS_PER_CHANNEL: usize = 3;
+const MAX_INTERVENTIONS_PER_CHANNEL: usize = 30;
 const INTERVENTION_TTL: Duration = Duration::from_secs(10 * 60);
 const INTERVENTION_DEDUP_WINDOW: Duration = Duration::from_secs(10);
 const UPLOAD_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
