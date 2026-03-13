@@ -62,7 +62,7 @@ pub use settings::{
 
 /// Discord message length limit
 pub(super) const DISCORD_MSG_LIMIT: usize = 2000;
-const MAX_INTERVENTIONS_PER_CHANNEL: usize = 3;
+const MAX_INTERVENTIONS_PER_CHANNEL: usize = 30;
 const INTERVENTION_TTL: Duration = Duration::from_secs(10 * 60);
 const INTERVENTION_DEDUP_WINDOW: Duration = Duration::from_secs(10);
 const UPLOAD_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -631,15 +631,25 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
                     // Restore pending intervention queues saved during previous SIGTERM
                     let restored_queues = load_pending_queues(provider);
                     if !restored_queues.is_empty() {
-                        let total: usize = restored_queues.values().map(|q| q.len()).sum();
+                        let mut added = 0usize;
+                        let mut skipped = 0usize;
                         let mut data = shared_for_tmux2.core.lock().await;
                         for (channel_id, items) in restored_queues {
                             let queue = data.intervention_queue.entry(channel_id).or_default();
-                            queue.extend(items);
+                            let existing_ids: std::collections::HashSet<u64> =
+                                queue.iter().map(|i| i.message_id.get()).collect();
+                            for item in items {
+                                if existing_ids.contains(&item.message_id.get()) {
+                                    skipped += 1;
+                                } else {
+                                    queue.push(item);
+                                    added += 1;
+                                }
+                            }
                         }
                         drop(data);
                         let ts = chrono::Local::now().format("%H:%M:%S");
-                        println!("  [{ts}] 📋 Restored {total} pending queue item(s) from disk");
+                        println!("  [{ts}] 📋 Restored {added} pending queue item(s) from disk (skipped {skipped} duplicates)");
                     }
 
                     restore_tmux_watchers(&http_for_tmux, &shared_for_tmux2).await;
