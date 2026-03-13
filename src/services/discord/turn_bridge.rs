@@ -529,10 +529,12 @@ pub(super) fn spawn_turn_bridge(
             println!("  [{ts}] ⚠ Prompt too long (channel {})", channel_id);
         } else if rx_disconnected && tmux_handed_off && full_response.is_empty() {
             // Tmux watcher is handling response delivery — this is normal.
-            // Don't generate "(No response)" since the watcher will update Discord directly.
+            // Delete the turn bridge placeholder so it doesn't linger as a zombie spinner.
+            // The watcher creates its own placeholder when it has output to display.
+            let _ = channel_id.delete_message(&http, current_msg_id).await;
             let ts = chrono::Local::now().format("%H:%M:%S");
             eprintln!(
-                "  [{ts}] ✓ tmux handoff complete, watcher handles response (channel {})",
+                "  [{ts}] ✓ tmux handoff complete, placeholder cleaned up, watcher handles response (channel {})",
                 channel_id
             );
         } else {
