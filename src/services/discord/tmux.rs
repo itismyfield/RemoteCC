@@ -179,7 +179,7 @@ pub(super) async fn tmux_output_watcher(
         let mut last_edit_text = String::new();
 
         // Process any complete lines we already have
-        let mut found_result = process_watcher_lines(&mut all_data, &mut state, &mut full_response, &mut tool_state);
+        let (mut found_result, mut is_prompt_too_long) = process_watcher_lines(&mut all_data, &mut state, &mut full_response, &mut tool_state);
 
         // Keep reading until result or timeout
         if !found_result {
@@ -215,8 +215,10 @@ pub(super) async fn tmux_output_watcher(
                     Ok(Ok((chunk, off))) if !chunk.is_empty() => {
                         current_offset = off;
                         all_data.push_str(&String::from_utf8_lossy(&chunk));
-                        found_result =
+                        let (fr, ptl) =
                             process_watcher_lines(&mut all_data, &mut state, &mut full_response, &mut tool_state);
+                        found_result = fr;
+                        is_prompt_too_long = is_prompt_too_long || ptl;
                     }
                     _ => {
                         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
@@ -275,6 +277,35 @@ pub(super) async fn tmux_output_watcher(
             if let Some(msg_id) = placeholder_msg_id {
                 let _ = channel_id.delete_message(&http, msg_id).await;
             }
+            continue;
+        }
+
+        // Handle prompt-too-long: kill session so next message creates a fresh one
+        if is_prompt_too_long {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!("  [{ts}] 👁 Prompt too long detected in watcher for {tmux_session_name}, killing session");
+
+            let sess = tmux_session_name.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = std::process::Command::new("tmux")
+                    .args(["kill-session", "-t", &sess])
+                    .status();
+            })
+            .await;
+
+            let notice = "⚠️ 컨텍스트 한도 초과로 세션을 초기화했습니다. 다음 메시지부터 새 세션으로 처리됩니다.";
+            match placeholder_msg_id {
+                Some(msg_id) => {
+                    rate_limit_wait(&shared, channel_id).await;
+                    let _ = channel_id
+                        .edit_message(&http, msg_id, serenity::EditMessage::new().content(notice))
+                        .await;
+                }
+                None => {
+                    let _ = channel_id.say(&http, notice).await;
+                }
+            }
+            // Don't break — let the watcher exit naturally when session-alive check fails
             continue;
         }
 
@@ -348,13 +379,15 @@ impl WatcherToolState {
 /// Process buffered lines for the tmux watcher.
 /// Extracts text content, tracks tool status, and detects result events.
 /// Returns true if a "result" event was found.
+/// Return value: (found_result, is_prompt_too_long)
 pub(super) fn process_watcher_lines(
     buffer: &mut String,
     state: &mut claude::StreamLineState,
     full_response: &mut String,
     tool_state: &mut WatcherToolState,
-) -> bool {
+) -> (bool, bool) {
     let mut found_result = false;
+    let mut is_prompt_too_long = false;
 
     while let Some(pos) = buffer.find('\n') {
         let line: String = buffer.drain(..=pos).collect();
@@ -426,11 +459,23 @@ pub(super) fn process_watcher_lines(
                     }
                 }
                 "result" => {
-                    // Extract text from result if full_response is still empty
-                    if full_response.is_empty() {
-                        if let Some(result_str) = val.get("result").and_then(|r| r.as_str()) {
-                            full_response.push_str(result_str);
+                    let is_error = val.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let result_str = val.get("result").and_then(|r| r.as_str()).unwrap_or("");
+
+                    if is_error {
+                        let lower = result_str.to_lowercase();
+                        if lower.contains("prompt is too long")
+                            || lower.contains("prompt too long")
+                            || lower.contains("context_length_exceeded")
+                            || lower.contains("conversation too long")
+                        {
+                            is_prompt_too_long = true;
                         }
+                    }
+
+                    // Extract text from result if full_response is still empty
+                    if full_response.is_empty() && !is_prompt_too_long {
+                        full_response.push_str(result_str);
                     }
                     state.final_result = Some(String::new());
                     found_result = true;
@@ -440,7 +485,7 @@ pub(super) fn process_watcher_lines(
         }
     }
 
-    found_result
+    (found_result, is_prompt_too_long)
 }
 
 /// On startup, scan for surviving tmux sessions (remoteCC-*) and restore watchers.
