@@ -185,6 +185,7 @@ pub(super) async fn tmux_output_watcher(
         let (mut found_result, mut is_prompt_too_long, mut is_auth_error) = process_watcher_lines(&mut all_data, &mut state, &mut full_response, &mut tool_state);
 
         // Keep reading until result or timeout
+        let mut was_paused = false;
         if !found_result {
             let turn_start = tokio::time::Instant::now();
             let turn_timeout = tokio::time::Duration::from_secs(600); // 10 min max
@@ -192,9 +193,12 @@ pub(super) async fn tmux_output_watcher(
 
             while !found_result && turn_start.elapsed() < turn_timeout {
                 if cancel.load(Ordering::Relaxed)
-                    || paused.load(Ordering::Relaxed)
                     || shared.shutting_down.load(Ordering::Relaxed)
                 {
+                    break;
+                }
+                if paused.load(Ordering::Relaxed) {
+                    was_paused = true;
                     break;
                 }
 
@@ -275,8 +279,8 @@ pub(super) async fn tmux_output_watcher(
             }
         }
 
-        // If paused was set while we were reading, discard — Discord handler will handle it
-        if paused.load(Ordering::Relaxed) {
+        // If paused was set while we were reading (even if already unpaused), discard partial data
+        if was_paused || paused.load(Ordering::Relaxed) {
             // Clean up placeholder if we created one
             if let Some(msg_id) = placeholder_msg_id {
                 let _ = channel_id.delete_message(&http, msg_id).await;
