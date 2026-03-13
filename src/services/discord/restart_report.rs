@@ -1,10 +1,8 @@
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use poise::serenity_prelude as serenity;
 use serde::{Deserialize, Serialize};
 
@@ -13,10 +11,7 @@ use super::runtime_store::{atomic_write, discord_restart_reports_root};
 use super::SharedData;
 use crate::services::provider::ProviderKind;
 
-use super::turn_bridge::tmux_runtime_paths;
-
 const RESTART_REPORT_VERSION: u32 = 1;
-const PENDING_REPORT_GRACE: Duration = Duration::from_secs(3);
 pub(crate) const RESTART_REPORT_CHANNEL_ENV: &str = "REMOTECC_REPORT_CHANNEL_ID";
 pub(crate) const RESTART_REPORT_PROVIDER_ENV: &str = "REMOTECC_REPORT_PROVIDER";
 
@@ -37,11 +32,7 @@ pub(crate) struct RestartCompletionReport {
     pub status: String,
     pub summary: String,
     pub completed_at: String,
-    /// Optional prompt to inject into the agent's tmux session after restart,
-    /// so the agent can automatically continue remaining work.
-    #[serde(default)]
-    pub post_restart_prompt: Option<String>,
-    /// Channel name used to derive the tmux session name for FIFO injection.
+    /// Channel name for log context.
     #[serde(default)]
     pub channel_name: Option<String>,
 }
@@ -61,7 +52,6 @@ impl RestartCompletionReport {
             status: status.into(),
             summary: summary.into(),
             completed_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-            post_restart_prompt: None,
             channel_name: None,
         }
     }
@@ -206,93 +196,6 @@ fn load_restart_reports_in_root(
     reports
 }
 
-/// Write a continuation prompt into the agent's tmux input FIFO so it
-/// automatically picks up remaining work after a dcserver restart.
-///
-/// The wire format depends on the provider:
-/// - **Codex**: `__REMOTECC_B64__:{base64(prompt)}\n` — the codex tmux wrapper
-///   decodes this and feeds it to `codex exec` as a new turn.
-/// - **Claude**: `{"type":"user","message":{"role":"user","content":"..."}}\n`
-///   — the Claude tmux wrapper forwards this as stream-json to Claude stdin.
-/// Returns `true` if injection succeeded.
-fn inject_post_restart_prompt(
-    provider: ProviderKind,
-    channel_name: Option<&str>,
-    prompt: &str,
-) -> bool {
-    let Some(name) = channel_name else {
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        println!("  [{ts}] ⚠ post-restart prompt skipped: no channel name");
-        return false;
-    };
-    let tmux_session = provider.build_tmux_session_name(name);
-    let (_, input_fifo) = tmux_runtime_paths(&tmux_session);
-    let fifo_path = Path::new(&input_fifo);
-    if !fifo_path.exists() {
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        println!(
-            "  [{ts}] ⚠ post-restart prompt skipped: FIFO not found ({})",
-            input_fifo
-        );
-        return false;
-    }
-
-    // Format the payload according to provider expectations.
-    let wire_line = match provider {
-        ProviderKind::Codex => {
-            // codex_tmux_wrapper decodes __REMOTECC_B64__: prefix then feeds
-            // the decoded string to `codex exec` as a single turn.
-            format!(
-                "__REMOTECC_B64__:{}",
-                BASE64_STANDARD.encode(prompt.as_bytes())
-            )
-        }
-        ProviderKind::Claude => {
-            // Claude tmux_wrapper Thread 3 forwards each line directly to
-            // Claude's stdin, which expects stream-json format.
-            let msg = serde_json::json!({
-                "type": "user",
-                "message": {
-                    "role": "user",
-                    "content": prompt
-                }
-            });
-            // to_string produces a single-line JSON (no embedded newlines).
-            serde_json::to_string(&msg).unwrap_or_default()
-        }
-    };
-
-    // Open with write-only (no O_CREAT/O_TRUNC) and use writeln for newline.
-    let result = std::fs::OpenOptions::new()
-        .write(true)
-        .open(fifo_path)
-        .and_then(|mut f| {
-            writeln!(f, "{}", wire_line)?;
-            f.flush()
-        });
-
-    match result {
-        Ok(()) => {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            println!(
-                "  [{ts}] ✓ Injected post-restart prompt into {} ({} bytes, provider={})",
-                tmux_session,
-                wire_line.len(),
-                provider.as_str(),
-            );
-            true
-        }
-        Err(e) => {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            println!(
-                "  [{ts}] ⚠ post-restart prompt injection failed for {}: {}",
-                tmux_session, e
-            );
-            false
-        }
-    }
-}
-
 fn report_age(report: &RestartCompletionReport) -> Option<Duration> {
     let created_at =
         chrono::NaiveDateTime::parse_from_str(&report.completed_at, "%Y-%m-%d %H:%M:%S").ok()?;
@@ -323,8 +226,6 @@ pub(super) async fn flush_restart_reports(
         if report.status == "pending" {
             // Skip pending reports if the turn that created them is still active.
             // The turn will clear the report on normal completion.
-            // Only flush pending reports at startup (no active turns) or after
-            // the creating turn has finished without clearing (e.g. crash).
             let age = report_age(&report).unwrap_or_default();
             let has_active_turn = {
                 let data = shared.core.lock().await;
@@ -345,76 +246,13 @@ pub(super) async fn flush_restart_reports(
                 );
                 continue;
             }
-
-            if age < PENDING_REPORT_GRACE {
-                if let Some(message_id) = report.current_msg_id {
-                    let provisional_text = format!(
-                        "♻️ dcserver restart 진행 중\n- status: `restarting`\n- updated_at: `{}`\n- 원래 답변은 재시작으로 잠시 끊겼습니다.\n- 새 dcserver가 이 메시지에서 마무리를 이어받는 중입니다.\n",
-                        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-                    );
-                    let _ = channel_id
-                        .edit_message(
-                            http,
-                            serenity::MessageId::new(message_id),
-                            serenity::EditMessage::new().content(&provisional_text),
-                        )
-                        .await;
-                }
-                continue;
-            }
         }
 
-        // If there's a continuation prompt, try to inject it directly into the
-        // agent's tmux session.  When injection succeeds the agent silently
-        // resumes work — no extra Discord notification is needed.
-        // NOTE: FIFO write blocks if no reader exists, so we wrap in
-        // spawn_blocking + timeout to prevent stalling the flush loop.
-        if let Some(ref prompt) = report.post_restart_prompt {
-            let p = provider;
-            let ch = report.channel_name.clone();
-            let pr = prompt.clone();
-            let injected = tokio::time::timeout(
-                Duration::from_secs(5),
-                tokio::task::spawn_blocking(move || {
-                    inject_post_restart_prompt(p, ch.as_deref(), &pr)
-                }),
-            )
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .unwrap_or(false);
-
-            if injected {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                println!(
-                    "  [{ts}] ✓ Flushed restart report for channel {} via FIFO injection",
-                    report.channel_id
-                );
-                clear_restart_report(provider, report.channel_id);
-                continue;
-            }
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            println!(
-                "  [{ts}] ⚠ FIFO injection failed/timed out for channel {}, falling back to Discord message",
-                report.channel_id
-            );
-            // FIFO injection failed or timed out — fall through to Discord message
-        }
-
-        // No continuation prompt or FIFO injection failed — notify via Discord.
+        // Notify via Discord.
         let text = match report.status.as_str() {
             "rolled_back" => format!("⚠️ dcserver 롤백됨: {}", report.summary),
             s if s == "ok" || s == "pending" || s == "sigterm" => {
-                if report.post_restart_prompt.is_some() {
-                    // Had a continuation prompt but FIFO injection failed —
-                    // the agent session may be dead or not yet ready.
-                    format!(
-                        "⚠️ dcserver 재시작 완료. 에이전트 세션 연결 실패로 자동 복구되지 못했습니다.\n\
-                         이전 요청을 다시 보내주세요."
-                    )
-                } else {
-                    "재시작이 완료되었고 이어서 진행해야할 일은 없습니다.".to_string()
-                }
+                "재시작이 완료되었고 이어서 진행해야할 일은 없습니다.".to_string()
             }
             _ => format!("❌ dcserver restart failed: {}", report.summary),
         };
@@ -470,7 +308,6 @@ mod tests {
             status: "ok".to_string(),
             summary: "ready".to_string(),
             completed_at: "2026-03-08 18:00:00".to_string(),
-            post_restart_prompt: None,
             channel_name: None,
         };
 
@@ -495,7 +332,6 @@ mod tests {
                 status: "ok".to_string(),
                 summary: "codex-ready".to_string(),
                 completed_at: "2026-03-08 19:00:00".to_string(),
-                post_restart_prompt: None,
                 channel_name: None,
             },
         )
@@ -511,7 +347,6 @@ mod tests {
                 status: "ok".to_string(),
                 summary: "claude-ready".to_string(),
                 completed_at: "2026-03-08 19:00:01".to_string(),
-                post_restart_prompt: None,
                 channel_name: None,
             },
         )
