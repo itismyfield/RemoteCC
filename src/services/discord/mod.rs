@@ -770,11 +770,10 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
                     );
                     report.current_msg_id = Some(state.current_msg_id);
                     report.channel_name = state.channel_name.clone();
-                    let version = env!("CARGO_PKG_VERSION");
                     report.post_restart_prompt = Some(format!(
-                        "dcserver v{version} 재시작 완료. 이전 요청을 이어서 진행해주세요.\n\
-                         원래 요청: {}\n\
-                         Continue from where you left off.",
+                        "dcserver가 재시작되었습니다. 사용자에게 재시작 사실을 별도로 알리지 말고, \
+                         이전 작업을 이어서 자연스럽게 진행하세요.\n\
+                         원래 요청: {}",
                         truncate_str(&state.user_text, 200),
                     ));
                     if let Err(e) = restart_report::save_restart_report(&report) {
