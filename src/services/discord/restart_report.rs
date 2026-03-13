@@ -362,12 +362,24 @@ pub(super) async fn flush_restart_reports(
         // If there's a continuation prompt, try to inject it directly into the
         // agent's tmux session.  When injection succeeds the agent silently
         // resumes work — no extra Discord notification is needed.
+        // NOTE: FIFO write blocks if no reader exists, so we wrap in
+        // spawn_blocking + timeout to prevent stalling the flush loop.
         if let Some(ref prompt) = report.post_restart_prompt {
-            if inject_post_restart_prompt(
-                provider,
-                report.channel_name.as_deref(),
-                prompt,
-            ) {
+            let p = provider;
+            let ch = report.channel_name.clone();
+            let pr = prompt.clone();
+            let injected = tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::task::spawn_blocking(move || {
+                    inject_post_restart_prompt(p, ch.as_deref(), &pr)
+                }),
+            )
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or(false);
+
+            if injected {
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 println!(
                     "  [{ts}] ✓ Flushed restart report for channel {} via FIFO injection",
@@ -376,7 +388,7 @@ pub(super) async fn flush_restart_reports(
                 clear_restart_report(provider, report.channel_id);
                 continue;
             }
-            // FIFO injection failed — fall through to Discord message
+            // FIFO injection failed or timed out — fall through to Discord message
         }
 
         // No continuation prompt or FIFO injection failed — notify via Discord.
