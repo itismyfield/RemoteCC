@@ -147,15 +147,46 @@ pub(super) async fn restore_inflight_turns(
                 continue;
             }
 
-            // Agent may still be running but restart report will handle follow-up.
-            // Clear inflight state so cancel_tokens don't block the flush loop.
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            println!(
-                "  [{ts}] ⏭ skipping inflight recovery for channel {}: restart report exists, delegating to flush loop",
-                state.channel_id
-            );
-            clear_inflight_state(provider, state.channel_id);
-            continue;
+            // Agent may still be running.  If the tmux session is alive, clear
+            // the restart report and fall through to normal recovery (which
+            // re-attaches a watcher to pick up the remaining output).
+            // If the session is dead, delegate to the flush loop for fallback.
+            let tmux_name = state
+                .tmux_session_name
+                .as_deref()
+                .or_else(|| state.channel_name.as_deref())
+                .map(|name| {
+                    if name.starts_with("remoteCC-") {
+                        name.to_string()
+                    } else {
+                        provider.build_tmux_session_name(name)
+                    }
+                });
+            let session_alive = tmux_name.as_deref().map_or(false, |name| {
+                std::process::Command::new("tmux")
+                    .args(["has-session", "-t", name])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+            });
+
+            if session_alive {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!(
+                    "  [{ts}] ↻ restart report exists but tmux session alive for channel {}: clearing report, proceeding with watcher recovery",
+                    state.channel_id
+                );
+                super::restart_report::clear_restart_report(provider, state.channel_id);
+                // Fall through to normal recovery path below (watcher re-attach)
+            } else {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!(
+                    "  [{ts}] ⏭ skipping inflight recovery for channel {}: restart report exists, session dead, delegating to flush loop",
+                    state.channel_id
+                );
+                clear_inflight_state(provider, state.channel_id);
+                continue;
+            }
         }
 
         let channel_id = ChannelId::new(state.channel_id);
