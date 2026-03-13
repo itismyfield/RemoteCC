@@ -182,7 +182,7 @@ pub(super) async fn tmux_output_watcher(
         let mut last_edit_text = String::new();
 
         // Process any complete lines we already have
-        let (mut found_result, mut is_prompt_too_long) = process_watcher_lines(&mut all_data, &mut state, &mut full_response, &mut tool_state);
+        let (mut found_result, mut is_prompt_too_long, mut is_auth_error) = process_watcher_lines(&mut all_data, &mut state, &mut full_response, &mut tool_state);
 
         // Keep reading until result or timeout
         if !found_result {
@@ -218,10 +218,11 @@ pub(super) async fn tmux_output_watcher(
                     Ok(Ok((chunk, off))) if !chunk.is_empty() => {
                         current_offset = off;
                         all_data.push_str(&String::from_utf8_lossy(&chunk));
-                        let (fr, ptl) =
+                        let (fr, ptl, ae) =
                             process_watcher_lines(&mut all_data, &mut state, &mut full_response, &mut tool_state);
                         found_result = fr;
                         is_prompt_too_long = is_prompt_too_long || ptl;
+                        is_auth_error = is_auth_error || ae;
                     }
                     _ => {
                         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
@@ -313,6 +314,35 @@ pub(super) async fn tmux_output_watcher(
             continue;
         }
 
+        // Handle auth error: kill session and notify user to re-authenticate
+        if is_auth_error {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!("  [{ts}] 👁 Auth error detected in watcher for {tmux_session_name}, killing session");
+            prompt_too_long_killed = true; // reuse flag to suppress duplicate "session ended" message
+
+            let sess = tmux_session_name.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = std::process::Command::new("tmux")
+                    .args(["kill-session", "-t", &sess])
+                    .status();
+            })
+            .await;
+
+            let notice = "⚠️ 인증이 만료되었습니다. 세션을 종료합니다.\n관리자가 CLI에서 재인증(`/login`)을 완료한 후 다시 시도해주세요.";
+            match placeholder_msg_id {
+                Some(msg_id) => {
+                    rate_limit_wait(&shared, channel_id).await;
+                    let _ = channel_id
+                        .edit_message(&http, msg_id, serenity::EditMessage::new().content(notice))
+                        .await;
+                }
+                None => {
+                    let _ = channel_id.say(&http, notice).await;
+                }
+            }
+            continue;
+        }
+
         // Send the terminal response to Discord
         if !full_response.trim().is_empty() {
             let formatted = format_for_discord(&full_response);
@@ -383,15 +413,16 @@ impl WatcherToolState {
 /// Process buffered lines for the tmux watcher.
 /// Extracts text content, tracks tool status, and detects result events.
 /// Returns true if a "result" event was found.
-/// Return value: (found_result, is_prompt_too_long)
+/// Return value: (found_result, is_prompt_too_long, is_auth_error)
 pub(super) fn process_watcher_lines(
     buffer: &mut String,
     state: &mut claude::StreamLineState,
     full_response: &mut String,
     tool_state: &mut WatcherToolState,
-) -> (bool, bool) {
+) -> (bool, bool, bool) {
     let mut found_result = false;
     let mut is_prompt_too_long = false;
+    let mut is_auth_error = false;
 
     while let Some(pos) = buffer.find('\n') {
         let line: String = buffer.drain(..=pos).collect();
@@ -475,10 +506,22 @@ pub(super) fn process_watcher_lines(
                         {
                             is_prompt_too_long = true;
                         }
+                        if lower.contains("not logged in")
+                            || lower.contains("authentication error")
+                            || lower.contains("unauthorized")
+                            || lower.contains("please run /login")
+                            || lower.contains("oauth")
+                            || lower.contains("token expired")
+                            || lower.contains("invalid api key")
+                            || lower.contains("api key")
+                                && (lower.contains("missing") || lower.contains("invalid") || lower.contains("expired"))
+                        {
+                            is_auth_error = true;
+                        }
                     }
 
                     // Extract text from result if full_response is still empty
-                    if full_response.is_empty() && !is_prompt_too_long {
+                    if full_response.is_empty() && !is_prompt_too_long && !is_auth_error {
                         full_response.push_str(result_str);
                     }
                     state.final_result = Some(String::new());
@@ -489,7 +532,7 @@ pub(super) fn process_watcher_lines(
         }
     }
 
-    (found_result, is_prompt_too_long)
+    (found_result, is_prompt_too_long, is_auth_error)
 }
 
 /// On startup, scan for surviving tmux sessions (remoteCC-*) and restore watchers.

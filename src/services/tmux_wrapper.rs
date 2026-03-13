@@ -187,6 +187,58 @@ pub fn run(
         exited_t1.store(true, Ordering::Relaxed);
     });
 
+    // === Thread 1b: Stderr monitor — detect auth errors and write synthetic result ===
+    let stderr = child.stderr.take();
+    let output_file_for_stderr = output_file.to_string();
+    let exited_stderr = claude_exited.clone();
+    let _stderr_thread = std::thread::spawn(move || {
+        let Some(stderr) = stderr else { return };
+        let reader = BufReader::new(stderr);
+        let mut collected = String::new();
+        for line in reader.lines() {
+            if exited_stderr.load(Ordering::Relaxed) {
+                break;
+            }
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            eprintln!("\x1b[90m[stderr] {}\x1b[0m", line);
+            collected.push_str(&line);
+            collected.push('\n');
+
+            let lower = line.to_lowercase();
+            if lower.contains("not logged in")
+                || lower.contains("please run /login")
+                || lower.contains("unauthorized")
+                || lower.contains("authentication")
+                || lower.contains("oauth")
+                || lower.contains("token expired")
+                || lower.contains("invalid api key")
+                || lower.contains("api key")
+                    && (lower.contains("missing") || lower.contains("invalid") || lower.contains("expired"))
+            {
+                // Write a synthetic error result to the output file so the watcher
+                // can detect it and stop the spinner.
+                let err_event = serde_json::json!({
+                    "type": "result",
+                    "is_error": true,
+                    "result": format!("Authentication error: {}", line.trim()),
+                    "total_cost_usd": 0.0,
+                });
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&output_file_for_stderr)
+                {
+                    let _ = writeln!(f, "{}", err_event);
+                    let _ = f.flush();
+                }
+                eprintln!("\x1b[31m[auth error detected — wrote synthetic result]\x1b[0m");
+                break;
+            }
+        }
+    });
+
     // === Thread 2: Terminal input — read user typing → Claude stdin ===
     let stdin_t2 = claude_stdin.clone();
     let exited_t2 = claude_exited.clone();
