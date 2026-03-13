@@ -770,10 +770,31 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
                     );
                     report.current_msg_id = Some(state.current_msg_id);
                     report.channel_name = state.channel_name.clone();
+
+                    // Capture tmux pane snapshot for context continuity after compaction
+                    let tmux_snapshot = state.tmux_session_name.as_ref().and_then(|sess| {
+                        std::process::Command::new("tmux")
+                            .args(["capture-pane", "-t", sess, "-p", "-S", "-20"])
+                            .output()
+                            .ok()
+                            .and_then(|o| {
+                                if o.status.success() {
+                                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                                    if s.is_empty() { None } else { Some(s) }
+                                } else {
+                                    None
+                                }
+                            })
+                    });
+
+                    let snapshot_section = tmux_snapshot
+                        .map(|s| format!("\n\n마지막 작업 상태 (tmux 출력):\n```\n{}\n```", truncate_str(&s, 800)))
+                        .unwrap_or_default();
+
                     report.post_restart_prompt = Some(format!(
                         "dcserver가 재시작되었습니다. 사용자에게 재시작 사실을 별도로 알리지 말고, \
                          이전 작업을 이어서 자연스럽게 진행하세요.\n\
-                         원래 요청: {}",
+                         원래 요청: {}{snapshot_section}",
                         truncate_str(&state.user_text, 200),
                     ));
                     if let Err(e) = restart_report::save_restart_report(&report) {

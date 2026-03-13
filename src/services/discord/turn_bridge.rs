@@ -221,9 +221,30 @@ pub(super) fn spawn_turn_bridge(
                                 report.current_msg_id = Some(current_msg_id.get());
                                 report.channel_name = pcd_session_name.clone();
                                 let version = env!("CARGO_PKG_VERSION");
+
+                                // Capture tmux pane snapshot for context continuity
+                                let tmux_snapshot = inflight_state.tmux_session_name.as_ref().and_then(|sess| {
+                                    std::process::Command::new("tmux")
+                                        .args(["capture-pane", "-t", sess, "-p", "-S", "-20"])
+                                        .output()
+                                        .ok()
+                                        .and_then(|o| {
+                                            if o.status.success() {
+                                                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                                                if s.is_empty() { None } else { Some(s) }
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                });
+
+                                let snapshot_section = tmux_snapshot
+                                    .map(|s| format!("\n\n마지막 작업 상태 (tmux 출력):\n```\n{}\n```", truncate_str(&s, 800)))
+                                    .unwrap_or_default();
+
                                 report.post_restart_prompt = Some(format!(
                                     "dcserver v{version} 재시작 완료. 이전 요청을 이어서 진행해주세요.\n\
-                                     원래 요청: {}\n\
+                                     원래 요청: {}{snapshot_section}\n\
                                      Continue from where you left off.",
                                     truncate_str(&user_text_owned, 200),
                                 ));
