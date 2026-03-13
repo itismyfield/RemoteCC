@@ -73,6 +73,7 @@ pub(super) async fn tmux_output_watcher(
     println!("  [{ts}] 👁 tmux watcher started for #{tmux_session_name} at offset {initial_offset}");
 
     let mut current_offset = initial_offset;
+    let mut prompt_too_long_killed = false;
 
     loop {
         // Always consume resume_offset first — the turn bridge may have set it
@@ -124,12 +125,14 @@ pub(super) async fn tmux_output_watcher(
             }
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!("  [{ts}] 👁 tmux session {tmux_session_name} ended, watcher stopping");
-            let _ = channel_id
-                .say(
-                    &http,
-                    "⚠️ 작업 세션이 종료되었습니다. 다음 메시지를 보내면 새 세션이 시작됩니다.",
-                )
-                .await;
+            if !prompt_too_long_killed {
+                let _ = channel_id
+                    .say(
+                        &http,
+                        "⚠️ 작업 세션이 종료되었습니다. 다음 메시지를 보내면 새 세션이 시작됩니다.",
+                    )
+                    .await;
+            }
             break;
         }
 
@@ -284,6 +287,7 @@ pub(super) async fn tmux_output_watcher(
         if is_prompt_too_long {
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!("  [{ts}] 👁 Prompt too long detected in watcher for {tmux_session_name}, killing session");
+            prompt_too_long_killed = true;
 
             let sess = tmux_session_name.clone();
             let _ = tokio::task::spawn_blocking(move || {
