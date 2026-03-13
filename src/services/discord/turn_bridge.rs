@@ -149,6 +149,7 @@ pub(super) fn spawn_turn_bridge(
         let mut accumulated_tokens: u64 = 0;
         let mut spin_idx: usize = 0;
         let mut restart_followup_pending = false;
+        let mut tmux_handed_off = false;
         let mut last_pcd_heartbeat = std::time::Instant::now();
         let current_msg_id = bridge.current_msg_id;
         let response_sent_offset = bridge.response_sent_offset;
@@ -330,6 +331,7 @@ pub(super) fn spawn_turn_bridge(
                             tmux_session_name,
                             last_offset,
                         } => {
+                            tmux_handed_off = true;
                             tmux_last_offset = Some(last_offset);
                             inflight_state.tmux_session_name = Some(tmux_session_name.clone());
                             inflight_state.output_path = Some(output_path.clone());
@@ -532,6 +534,14 @@ pub(super) fn spawn_turn_bridge(
 
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!("  [{ts}] ⚠ Prompt too long (channel {})", channel_id);
+        } else if rx_disconnected && tmux_handed_off && full_response.is_empty() {
+            // Tmux watcher is handling response delivery — this is normal.
+            // Don't generate "(No response)" since the watcher will update Discord directly.
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            eprintln!(
+                "  [{ts}] ✓ tmux handoff complete, watcher handles response (channel {})",
+                channel_id
+            );
         } else {
             if full_response.is_empty() {
                 // Fallback: try to extract response from tmux output file

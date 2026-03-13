@@ -1,8 +1,10 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use poise::serenity_prelude as serenity;
 use serde::{Deserialize, Serialize};
 
@@ -206,6 +208,12 @@ fn load_restart_reports_in_root(
 
 /// Write a continuation prompt into the agent's tmux input FIFO so it
 /// automatically picks up remaining work after a dcserver restart.
+///
+/// The wire format depends on the provider:
+/// - **Codex**: `__REMOTECC_B64__:{base64(prompt)}\n` — the codex tmux wrapper
+///   decodes this and feeds it to `codex exec` as a new turn.
+/// - **Claude**: `{"type":"user","message":{"role":"user","content":"..."}}\n`
+///   — the Claude tmux wrapper forwards this as stream-json to Claude stdin.
 fn inject_post_restart_prompt(
     provider: ProviderKind,
     channel_name: Option<&str>,
@@ -227,13 +235,49 @@ fn inject_post_restart_prompt(
         );
         return;
     }
-    match fs::write(fifo_path, prompt) {
+
+    // Format the payload according to provider expectations.
+    let wire_line = match provider {
+        ProviderKind::Codex => {
+            // codex_tmux_wrapper decodes __REMOTECC_B64__: prefix then feeds
+            // the decoded string to `codex exec` as a single turn.
+            format!(
+                "__REMOTECC_B64__:{}",
+                BASE64_STANDARD.encode(prompt.as_bytes())
+            )
+        }
+        ProviderKind::Claude => {
+            // Claude tmux_wrapper Thread 3 forwards each line directly to
+            // Claude's stdin, which expects stream-json format.
+            let msg = serde_json::json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": prompt
+                }
+            });
+            // to_string produces a single-line JSON (no embedded newlines).
+            serde_json::to_string(&msg).unwrap_or_default()
+        }
+    };
+
+    // Open with write-only (no O_CREAT/O_TRUNC) and use writeln for newline.
+    let result = std::fs::OpenOptions::new()
+        .write(true)
+        .open(fifo_path)
+        .and_then(|mut f| {
+            writeln!(f, "{}", wire_line)?;
+            f.flush()
+        });
+
+    match result {
         Ok(()) => {
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!(
-                "  [{ts}] ✓ Injected post-restart prompt into {} ({} chars)",
+                "  [{ts}] ✓ Injected post-restart prompt into {} ({} bytes, provider={})",
                 tmux_session,
-                prompt.len()
+                wire_line.len(),
+                provider.as_str(),
             );
         }
         Err(e) => {
@@ -388,6 +432,8 @@ mod tests {
             status: "ok".to_string(),
             summary: "ready".to_string(),
             completed_at: "2026-03-08 18:00:00".to_string(),
+            post_restart_prompt: None,
+            channel_name: None,
         };
 
         save_restart_report_in_root(temp.path(), &report).unwrap();
@@ -411,6 +457,8 @@ mod tests {
                 status: "ok".to_string(),
                 summary: "codex-ready".to_string(),
                 completed_at: "2026-03-08 19:00:00".to_string(),
+                post_restart_prompt: None,
+                channel_name: None,
             },
         )
         .unwrap();
@@ -425,6 +473,8 @@ mod tests {
                 status: "ok".to_string(),
                 summary: "claude-ready".to_string(),
                 completed_at: "2026-03-08 19:00:01".to_string(),
+                post_restart_prompt: None,
+                channel_name: None,
             },
         )
         .unwrap();

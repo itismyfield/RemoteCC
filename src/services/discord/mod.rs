@@ -769,6 +769,14 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
                         "dcserver가 SIGTERM으로 종료되었습니다. 재시작 후 작업을 이어받습니다.",
                     );
                     report.current_msg_id = Some(state.current_msg_id);
+                    report.channel_name = state.channel_name.clone();
+                    let version = env!("CARGO_PKG_VERSION");
+                    report.post_restart_prompt = Some(format!(
+                        "dcserver v{version} 재시작 완료. 이전 요청을 이어서 진행해주세요.\n\
+                         원래 요청: {}\n\
+                         Continue from where you left off.",
+                        truncate_str(&state.user_text, 200),
+                    ));
                     if let Err(e) = restart_report::save_restart_report(&report) {
                         eprintln!("  ⚠ failed to save restart report for channel {}: {e}", state.channel_id);
                     }
