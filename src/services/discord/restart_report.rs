@@ -380,7 +380,16 @@ pub(super) async fn flush_restart_reports(
         let text = match report.status.as_str() {
             "rolled_back" => format!("⚠️ dcserver 롤백됨: {}", report.summary),
             s if s == "ok" || s == "pending" || s == "sigterm" => {
-                "재시작이 완료되었고 이어서 진행해야할 일은 없습니다.".to_string()
+                if report.post_restart_prompt.is_some() {
+                    // Had a continuation prompt but FIFO injection failed —
+                    // the agent session may be dead or not yet ready.
+                    format!(
+                        "⚠️ dcserver 재시작 완료. 에이전트 세션 연결 실패로 자동 복구되지 못했습니다.\n\
+                         이전 요청을 다시 보내주세요."
+                    )
+                } else {
+                    "재시작이 완료되었고 이어서 진행해야할 일은 없습니다.".to_string()
+                }
             }
             _ => format!("❌ dcserver restart failed: {}", report.summary),
         };
