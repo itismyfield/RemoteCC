@@ -930,6 +930,7 @@ fn execute_streaming_local_tmux(
     let _ = std::fs::remove_file(&input_fifo_path);
     let _ = std::fs::remove_file(&prompt_path);
     let _ = std::fs::remove_file(&owner_path);
+    let _ = std::fs::remove_file(format!("/tmp/remotecc-{}.sh", tmux_session_name));
 
     std::fs::write(&output_path, "").map_err(|e| format!("Failed to create output file: {}", e))?;
 
@@ -953,35 +954,44 @@ fn execute_streaming_local_tmux(
         std::env::current_exe().map_err(|e| format!("Failed to get executable path: {}", e))?;
     let codex_bin = get_codex_path().ok_or_else(|| "Codex CLI not found".to_string())?;
 
-    let wrapper_cmd = format!(
-        "{} --codex-tmux-wrapper --output-file {} --input-fifo {} --prompt-file {} --cwd {} --codex-bin {}",
-        shell_escape(&exe.display().to_string()),
-        shell_escape(&output_path),
-        shell_escape(&input_fifo_path),
-        shell_escape(&prompt_path),
-        shell_escape(working_dir),
-        shell_escape(codex_bin),
-    );
-    let mut wrapper_env_prefix = vec![
-        "env".to_string(),
-        "-u".to_string(),
-        "CLAUDECODE".to_string(),
-    ];
+    // Write launch script to file to avoid tmux "command too long" errors
+    let script_path = format!("/tmp/remotecc-{}.sh", tmux_session_name);
+
+    let mut env_lines = String::from("unset CLAUDECODE\n");
     if let Some(channel_id) = report_channel_id {
-        wrapper_env_prefix.push(format!(
-            "{}={}",
-            RESTART_REPORT_CHANNEL_ENV,
-            shell_escape(&channel_id.to_string())
+        env_lines.push_str(&format!(
+            "export {}={}\n",
+            RESTART_REPORT_CHANNEL_ENV, channel_id
         ));
     }
     if let Some(provider) = report_provider {
-        wrapper_env_prefix.push(format!(
-            "{}={}",
+        env_lines.push_str(&format!(
+            "export {}={}\n",
             RESTART_REPORT_PROVIDER_ENV,
-            shell_escape(provider.as_str())
+            provider.as_str()
         ));
     }
-    let wrapper_cmd_with_env = format!("{} {}", wrapper_env_prefix.join(" "), wrapper_cmd);
+
+    let script_content = format!(
+        "#!/bin/bash\n\
+        {env}\
+        exec {exe} --codex-tmux-wrapper \\\n  \
+        --output-file {output} \\\n  \
+        --input-fifo {input_fifo} \\\n  \
+        --prompt-file {prompt} \\\n  \
+        --cwd {wd} \\\n  \
+        --codex-bin {codex_bin}\n",
+        env = env_lines,
+        exe = shell_escape(&exe.display().to_string()),
+        output = shell_escape(&output_path),
+        input_fifo = shell_escape(&input_fifo_path),
+        prompt = shell_escape(&prompt_path),
+        wd = shell_escape(working_dir),
+        codex_bin = shell_escape(codex_bin),
+    );
+
+    std::fs::write(&script_path, &script_content)
+        .map_err(|e| format!("Failed to write launch script: {}", e))?;
 
     let tmux_result = Command::new("tmux")
         .args([
@@ -991,7 +1001,7 @@ fn execute_streaming_local_tmux(
             tmux_session_name,
             "-c",
             working_dir,
-            &wrapper_cmd_with_env,
+            &format!("bash {}", shell_escape(&script_path)),
         ])
         .env_remove("CLAUDECODE")
         .output()
@@ -1003,6 +1013,7 @@ fn execute_streaming_local_tmux(
         let _ = std::fs::remove_file(&input_fifo_path);
         let _ = std::fs::remove_file(&prompt_path);
         let _ = std::fs::remove_file(&owner_path);
+        let _ = std::fs::remove_file(&script_path);
         return Err(format!("tmux error: {}", stderr));
     }
 
