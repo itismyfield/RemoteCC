@@ -214,15 +214,16 @@ fn load_restart_reports_in_root(
 ///   decodes this and feeds it to `codex exec` as a new turn.
 /// - **Claude**: `{"type":"user","message":{"role":"user","content":"..."}}\n`
 ///   — the Claude tmux wrapper forwards this as stream-json to Claude stdin.
+/// Returns `true` if injection succeeded.
 fn inject_post_restart_prompt(
     provider: ProviderKind,
     channel_name: Option<&str>,
     prompt: &str,
-) {
+) -> bool {
     let Some(name) = channel_name else {
         let ts = chrono::Local::now().format("%H:%M:%S");
         println!("  [{ts}] ⚠ post-restart prompt skipped: no channel name");
-        return;
+        return false;
     };
     let tmux_session = provider.build_tmux_session_name(name);
     let (_, input_fifo) = tmux_runtime_paths(&tmux_session);
@@ -233,7 +234,7 @@ fn inject_post_restart_prompt(
             "  [{ts}] ⚠ post-restart prompt skipped: FIFO not found ({})",
             input_fifo
         );
-        return;
+        return false;
     }
 
     // Format the payload according to provider expectations.
@@ -279,6 +280,7 @@ fn inject_post_restart_prompt(
                 wire_line.len(),
                 provider.as_str(),
             );
+            true
         }
         Err(e) => {
             let ts = chrono::Local::now().format("%H:%M:%S");
@@ -286,6 +288,7 @@ fn inject_post_restart_prompt(
                 "  [{ts}] ⚠ post-restart prompt injection failed for {}: {}",
                 tmux_session, e
             );
+            false
         }
     }
 }
@@ -353,20 +356,32 @@ pub(super) async fn flush_restart_reports(
             }
         }
 
-        // Build a concise follow-up message (sent as a NEW message, never
-        // editing the original response to avoid overwriting agent output).
-        // "pending" reports reaching this point mean the previous process died
-        // before the turn completed — the restart DID happen, so treat as "ok".
-        let effective_status = if report.status == "pending" {
-            "ok"
-        } else {
-            report.status.as_str()
-        };
-        let version = env!("CARGO_PKG_VERSION");
-        let text = match effective_status {
-            "ok" => format!("✅ dcserver v{version} 재시작 완료"),
-            "sigterm" => format!("♻️ dcserver v{version} 재시작 완료 — 작업 복구를 시도합니다."),
+        // If there's a continuation prompt, try to inject it directly into the
+        // agent's tmux session.  When injection succeeds the agent silently
+        // resumes work — no extra Discord notification is needed.
+        if let Some(ref prompt) = report.post_restart_prompt {
+            if inject_post_restart_prompt(
+                provider,
+                report.channel_name.as_deref(),
+                prompt,
+            ) {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!(
+                    "  [{ts}] ✓ Flushed restart report for channel {} via FIFO injection",
+                    report.channel_id
+                );
+                clear_restart_report(provider, report.channel_id);
+                continue;
+            }
+            // FIFO injection failed — fall through to Discord message
+        }
+
+        // No continuation prompt or FIFO injection failed — notify via Discord.
+        let text = match report.status.as_str() {
             "rolled_back" => format!("⚠️ dcserver 롤백됨: {}", report.summary),
+            s if s == "ok" || s == "pending" || s == "sigterm" => {
+                "재시작이 완료되었고 이어서 진행해야할 일은 없습니다.".to_string()
+            }
             _ => format!("❌ dcserver restart failed: {}", report.summary),
         };
 
@@ -379,17 +394,6 @@ pub(super) async fn flush_restart_reports(
                         report.channel_id, attempt
                     );
                     clear_restart_report(provider, report.channel_id);
-
-                    // Inject continuation prompt into the agent's tmux
-                    // session so it automatically resumes remaining work.
-                    if let Some(ref prompt) = report.post_restart_prompt {
-                        inject_post_restart_prompt(
-                            provider,
-                            report.channel_name.as_deref(),
-                            prompt,
-                        );
-                    }
-
                     break;
                 }
                 Err(e) => {
