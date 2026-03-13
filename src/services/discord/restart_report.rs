@@ -325,6 +325,7 @@ pub(super) async fn flush_restart_reports(
             // The turn will clear the report on normal completion.
             // Only flush pending reports at startup (no active turns) or after
             // the creating turn has finished without clearing (e.g. crash).
+            let age = report_age(&report).unwrap_or_default();
             let has_active_turn = {
                 let data = shared.core.lock().await;
                 data.cancel_tokens.contains_key(&channel_id)
@@ -333,11 +334,13 @@ pub(super) async fn flush_restart_reports(
                 .finalizing_turns
                 .load(std::sync::atomic::Ordering::Relaxed)
                 > 0;
-            if has_active_turn || has_finalizing {
+            // If the report is old enough (>30s), the original turn that created
+            // it is gone (dcserver restarted). Force flush even if a new turn is
+            // active — otherwise the report is stuck forever.
+            if (has_active_turn || has_finalizing) && age < Duration::from_secs(30) {
                 continue;
             }
 
-            let age = report_age(&report).unwrap_or_default();
             if age < PENDING_REPORT_GRACE {
                 if let Some(message_id) = report.current_msg_id {
                     let provisional_text = format!(
