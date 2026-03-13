@@ -311,12 +311,18 @@ pub(super) async fn flush_restart_reports(
 
         // Build a concise follow-up message (sent as a NEW message, never
         // editing the original response to avoid overwriting agent output).
+        // "pending" reports reaching this point mean the previous process died
+        // before the turn completed — the restart DID happen, so treat as "ok".
+        let effective_status = if report.status == "pending" {
+            "ok"
+        } else {
+            report.status.as_str()
+        };
         let version = env!("CARGO_PKG_VERSION");
-        let text = match report.status.as_str() {
+        let text = match effective_status {
             "ok" => format!("✅ dcserver v{version} 재시작 완료"),
             "sigterm" => format!("♻️ dcserver v{version} 재시작 완료 — 작업 복구를 시도합니다."),
             "rolled_back" => format!("⚠️ dcserver 롤백됨: {}", report.summary),
-            "pending" => format!("⏳ dcserver 재시작 대기 중 (v{version})"),
             _ => format!("❌ dcserver restart failed: {}", report.summary),
         };
 
