@@ -1790,6 +1790,11 @@ fn execute_streaming_local_tmux(
         ])
         .output();
 
+    // Stamp generation marker so post-restart watcher restore can detect old sessions
+    let gen_marker_path = format!("/tmp/remotecc-{}.generation", tmux_session_name);
+    let current_gen = crate::services::discord::runtime_store::load_generation();
+    let _ = std::fs::write(&gen_marker_path, current_gen.to_string());
+
     debug_log("tmux session created, storing in cancel token...");
 
     // Store tmux session name in cancel token
@@ -1891,6 +1896,10 @@ fn execute_streaming_local_tmux(
                     let stderr = String::from_utf8_lossy(&tmux_retry.stderr);
                     return Err(format!("tmux retry error: {}", stderr));
                 }
+
+                // Re-stamp generation marker after tmux re-create
+                let gen_marker_retry = format!("/tmp/remotecc-{}.generation", tmux_session_name);
+                let _ = std::fs::write(&gen_marker_retry, crate::services::discord::runtime_store::load_generation().to_string());
 
                 debug_log("tmux session re-created, retrying read...");
             }

@@ -375,6 +375,9 @@ pub struct SessionData {
     /// Remote profile name for SSH execution (None = local)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_profile_name: Option<String>,
+    /// Restart generation at which this session was saved.
+    #[serde(default)]
+    pub born_generation: u64,
 }
 
 /// Get the AI sessions directory path (~/.remotecc/ai_sessions)
@@ -463,6 +466,7 @@ impl AIScreenState {
             discord_channel_name: None,
             discord_category_name: None,
             remote_profile_name: self.remote_profile.as_ref().map(|p| p.name.clone()),
+            born_generation: 0,
         };
 
         let file_path = sessions_dir.join(format!("{}.json", session_id));

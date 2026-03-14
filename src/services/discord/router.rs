@@ -153,6 +153,42 @@ pub(super) async fn handle_event(
                 }
             }
 
+            // Drain mode: when restart is pending, queue new messages instead of
+            // starting new turns. This ensures only existing turns drain to completion.
+            if data
+                .shared
+                .restart_pending
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                let mut d = data.shared.core.lock().await;
+                let queue = d.intervention_queue.entry(channel_id).or_default();
+                enqueue_intervention(
+                    queue,
+                    Intervention {
+                        author_id: user_id,
+                        message_id: new_message.id,
+                        text: text.to_string(),
+                        mode: InterventionMode::Soft,
+                        created_at: Instant::now(),
+                    },
+                );
+                drop(d);
+
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!(
+                    "  [{ts}] ⏸ DRAIN: queued message from [{user_name}] in channel {} (restart pending)",
+                    channel_id
+                );
+                rate_limit_wait(&data.shared, channel_id).await;
+                let _ = channel_id
+                    .say(
+                        &ctx.http,
+                        "⏸ 재시작 대기 중 — 메시지가 큐에 저장되었고, 재시작 후 처리됩니다.",
+                    )
+                    .await;
+                return Ok(());
+            }
+
             // Meeting command from text (e.g. announce bot sending "/meeting start ...")
             if text.starts_with("/meeting ") {
                 let ts = chrono::Local::now().format("%H:%M:%S");
