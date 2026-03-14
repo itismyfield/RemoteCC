@@ -40,10 +40,22 @@ pub(super) async fn handle_event(
             let channel_id = new_message.channel_id;
             let is_dm = new_message.guild_id.is_none();
             let (channel_name, _) = resolve_channel_category(ctx, channel_id).await;
-            let role_binding = resolve_role_binding(channel_id, channel_name.as_deref());
+            // For threads, inherit role binding from the parent channel
+            let (effective_channel_id, effective_channel_name) =
+                if let Some((parent_id, parent_name)) =
+                    resolve_thread_parent(ctx, channel_id).await
+                {
+                    (parent_id, parent_name.or_else(|| channel_name.clone()))
+                } else {
+                    (channel_id, channel_name.clone())
+                };
+            let role_binding = resolve_role_binding(
+                effective_channel_id,
+                effective_channel_name.as_deref(),
+            );
             if !channel_supports_provider(
                 data.provider,
-                channel_name.as_deref(),
+                effective_channel_name.as_deref(),
                 is_dm,
                 role_binding.as_ref(),
             ) {
