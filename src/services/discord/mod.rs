@@ -3061,6 +3061,47 @@ async fn auto_restore_session(
     }
 }
 
+/// Create a lightweight session for a thread, bootstrapped from the parent channel's path.
+async fn bootstrap_thread_session(
+    shared: &Arc<SharedData>,
+    thread_channel_id: ChannelId,
+    parent_path: &str,
+    serenity_ctx: &serenity::prelude::Context,
+) {
+    let (ch_name, cat_name) = resolve_channel_category(serenity_ctx, thread_channel_id).await;
+    let existing = load_existing_session(parent_path, Some(thread_channel_id.get()));
+
+    let mut data = shared.core.lock().await;
+    if data.sessions.contains_key(&thread_channel_id) {
+        return;
+    }
+
+    let session = data
+        .sessions
+        .entry(thread_channel_id)
+        .or_insert_with(|| DiscordSession {
+            session_id: None,
+            current_path: None,
+            history: Vec::new(),
+            pending_uploads: Vec::new(),
+            cleared: false,
+            channel_id: Some(thread_channel_id.get()),
+            channel_name: ch_name,
+            category_name: cat_name,
+            remote_profile_name: None,
+            last_active: tokio::time::Instant::now(),
+            worktree: None,
+            last_shared_memory_ts: None,
+        });
+    session.current_path = Some(parent_path.to_string());
+    if let Some((session_data, _)) = existing {
+        session.session_id = Some(session_data.session_id.clone());
+        session.history = session_data.history.clone();
+    }
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    println!("  [{ts}] ↻ Bootstrapped thread session from parent path: {parent_path}");
+}
+
 /// Load existing session from ai_sessions directory.
 /// Prefers sessions with a non-empty session_id. Among those, picks the most recently modified.
 fn load_existing_session(
