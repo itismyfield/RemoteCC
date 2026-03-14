@@ -11,7 +11,10 @@ use crate::services::discord::restart_report::{
 };
 use crate::services::provider::ProviderKind;
 use crate::services::remote::RemoteProfile;
-use crate::services::tmux_diagnostics::{clear_tmux_exit_reason, record_tmux_exit_reason};
+use crate::services::tmux_diagnostics::{
+    clear_tmux_exit_reason, record_tmux_exit_reason, tmux_session_exists,
+    tmux_session_has_live_pane,
+};
 use crate::utils::format::safe_prefix;
 
 /// Cached path to the claude binary.
@@ -238,11 +241,7 @@ pub enum ReadOutputResult {
 }
 
 fn tmux_session_alive(tmux_session_name: &str) -> bool {
-    Command::new("tmux")
-        .args(["has-session", "-t", tmux_session_name])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    tmux_session_has_live_pane(tmux_session_name)
 }
 
 fn tmux_capture_indicates_ready_for_input(capture: &str) -> bool {
@@ -1642,13 +1641,12 @@ fn execute_streaming_local_tmux(
     let owner_path = tmux_owner_path(tmux_session_name);
 
     // Check if tmux session already exists (follow-up to running session)
-    let session_exists = Command::new("tmux")
-        .args(["has-session", "-t", tmux_session_name])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let session_exists = tmux_session_exists(tmux_session_name);
+    let session_usable = tmux_session_has_live_pane(tmux_session_name)
+        && std::fs::metadata(&output_path).is_ok()
+        && std::path::Path::new(&input_fifo_path).exists();
 
-    if session_exists {
+    if session_usable {
         debug_log("Existing tmux session found — sending follow-up message");
         return send_followup_to_tmux(
             prompt,
@@ -1658,6 +1656,17 @@ fn execute_streaming_local_tmux(
             cancel_token,
             tmux_session_name,
         );
+    }
+
+    if session_exists {
+        debug_log("Stale tmux session found — recreating");
+        record_tmux_exit_reason(
+            tmux_session_name,
+            "stale local session cleanup before recreate",
+        );
+        let _ = Command::new("tmux")
+            .args(["kill-session", "-t", tmux_session_name])
+            .status();
     }
 
     // === Create new tmux session ===
@@ -1772,7 +1781,13 @@ fn execute_streaming_local_tmux(
 
     // Keep tmux session alive after process exits for post-mortem analysis
     let _ = Command::new("tmux")
-        .args(["set-option", "-t", tmux_session_name, "remain-on-exit", "on"])
+        .args([
+            "set-option",
+            "-t",
+            tmux_session_name,
+            "remain-on-exit",
+            "on",
+        ])
         .output();
 
     debug_log("tmux session created, storing in cancel token...");

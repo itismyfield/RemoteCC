@@ -41,18 +41,18 @@ pub(super) async fn handle_event(
             let is_dm = new_message.guild_id.is_none();
             let (channel_name, _) = resolve_channel_category(ctx, channel_id).await;
             // For threads, inherit role binding from the parent channel
-            let (effective_channel_id, effective_channel_name) =
-                if let Some((parent_id, parent_name)) =
-                    resolve_thread_parent(ctx, channel_id).await
-                {
-                    (parent_id, parent_name.or_else(|| channel_name.clone()))
-                } else {
-                    (channel_id, channel_name.clone())
-                };
-            let role_binding = resolve_role_binding(
-                effective_channel_id,
-                effective_channel_name.as_deref(),
-            );
+            let (effective_channel_id, effective_channel_name) = if let Some((
+                parent_id,
+                parent_name,
+            )) =
+                resolve_thread_parent(ctx, channel_id).await
+            {
+                (parent_id, parent_name.or_else(|| channel_name.clone()))
+            } else {
+                (channel_id, channel_name.clone())
+            };
+            let role_binding =
+                resolve_role_binding(effective_channel_id, effective_channel_name.as_deref());
             if !channel_supports_provider(
                 data.provider,
                 effective_channel_name.as_deref(),
@@ -116,13 +116,7 @@ pub(super) async fn handle_event(
                             .and_then(|s| s.current_path.clone())
                     };
                     if let Some(path) = parent_path {
-                        bootstrap_thread_session(
-                            &data.shared,
-                            channel_id,
-                            &path,
-                            ctx,
-                        )
-                        .await;
+                        bootstrap_thread_session(&data.shared, channel_id, &path, ctx).await;
                     }
                 }
             }
@@ -224,12 +218,16 @@ pub(super) async fn handle_event(
                     msgs.reverse();
                     // Keep last 2 Q&A-style messages (budget: ~1000 chars total)
                     let mut budget: usize = 1000;
-                    for m in msgs.iter().rev().take(4).collect::<Vec<_>>().into_iter().rev() {
-                        let entry = format!(
-                            "{}: {}",
-                            m.author.name,
-                            truncate_str(m.content.trim(), 300)
-                        );
+                    for m in msgs
+                        .iter()
+                        .rev()
+                        .take(4)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                    {
+                        let entry =
+                            format!("{}: {}", m.author.name, truncate_str(m.content.trim(), 300));
                         if entry.len() > budget {
                             break;
                         }
@@ -302,7 +300,10 @@ pub(super) async fn handle_text_message(
             .get_mut(&channel_id)
             .map(|s| {
                 s.cleared = false;
-                (std::mem::take(&mut s.pending_uploads), s.last_shared_memory_ts.clone())
+                (
+                    std::mem::take(&mut s.pending_uploads),
+                    s.last_shared_memory_ts.clone(),
+                )
             })
             .unwrap_or_default();
         drop(data);
@@ -645,11 +646,8 @@ pub(super) async fn handle_text_message(
         if remote_profile.is_none() && claude::is_tmux_available() {
             if let Some(ref tmux_name) = tmux_session_name {
                 let (output_path, input_fifo_path) = tmux_runtime_paths(tmux_name);
-                let session_exists = std::process::Command::new("tmux")
-                    .args(["has-session", "-t", tmux_name])
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false);
+                let session_exists =
+                    crate::services::tmux_diagnostics::tmux_session_has_live_pane(tmux_name);
                 let last_offset = std::fs::metadata(&output_path)
                     .map(|m| m.len())
                     .unwrap_or(0);
