@@ -3204,6 +3204,34 @@ async fn resolve_channel_category(
     (ch_name, cat_name)
 }
 
+/// If `channel_id` is a Discord thread, return the parent channel ID and name.
+/// For non-thread channels, returns `None`.
+async fn resolve_thread_parent(
+    ctx: &serenity::prelude::Context,
+    channel_id: serenity::model::id::ChannelId,
+) -> Option<(serenity::model::id::ChannelId, Option<String>)> {
+    let channel = channel_id.to_channel(&ctx.http).await.ok()?;
+    let serenity::model::channel::Channel::Guild(gc) = channel else {
+        return None;
+    };
+    use serenity::model::channel::ChannelType;
+    match gc.kind {
+        ChannelType::PublicThread | ChannelType::PrivateThread => {
+            let parent_id = gc.parent_id?;
+            let parent_name = if let Ok(parent_ch) = parent_id.to_channel(&ctx.http).await {
+                match parent_ch {
+                    serenity::model::channel::Channel::Guild(pg) => Some(pg.name.clone()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            Some((parent_id, parent_name))
+        }
+        _ => None,
+    }
+}
+
 /// On startup, resolve category names for all known channels and update session files.
 async fn migrate_session_categories(ctx: &serenity::prelude::Context, shared: &Arc<SharedData>) {
     let sessions_dir = match ai_screen::ai_sessions_dir() {
