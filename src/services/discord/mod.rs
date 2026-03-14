@@ -1052,9 +1052,13 @@ async fn add_reaction(
     emoji: char,
 ) {
     let reaction = serenity::ReactionType::Unicode(emoji.to_string());
-    let _ = channel_id
+    if let Err(e) = channel_id
         .create_reaction(&ctx.http, message_id, reaction)
-        .await;
+        .await
+    {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        eprintln!("  [{ts}] ⚠ Failed to add reaction '{emoji}' to msg {message_id} in channel {channel_id}: {e}");
+    }
 }
 
 // ─── Event handler ───────────────────────────────────────────────────────────
