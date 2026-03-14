@@ -15,6 +15,7 @@ use crate::services::discord::restart_report::{
 };
 use crate::services::provider::ProviderKind;
 use crate::services::remote::RemoteProfile;
+use crate::services::tmux_diagnostics::clear_tmux_exit_reason;
 
 static CODEX_PATH: OnceLock<Option<String>> = OnceLock::new();
 const TMUX_PROMPT_B64_PREFIX: &str = "__REMOTECC_B64__:";
@@ -59,6 +60,7 @@ fn tmux_owner_path(tmux_session_name: &str) -> String {
 }
 
 fn write_tmux_owner_marker(tmux_session_name: &str) -> Result<(), String> {
+    clear_tmux_exit_reason(tmux_session_name);
     let owner_path = tmux_owner_path(tmux_session_name);
     std::fs::write(&owner_path, current_tmux_owner_marker())
         .map_err(|e| format!("Failed to write tmux owner marker: {}", e))
