@@ -462,9 +462,14 @@ pub(super) fn spawn_turn_bridge(
         shared_owned
             .finalizing_turns
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        shared_owned
+            .global_finalizing
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let has_queued_turns = {
             let mut data = shared_owned.core.lock().await;
-            data.cancel_tokens.remove(&channel_id);
+            if data.cancel_tokens.remove(&channel_id).is_some() {
+                shared_owned.global_active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
             data.active_request_owner.remove(&channel_id);
             let mut remove_queue = false;
             let has_pending = if let Some(queue) = data.intervention_queue.get_mut(&channel_id) {
@@ -679,14 +684,17 @@ pub(super) fn spawn_turn_bridge(
         clear_inflight_state(provider, channel_id.get());
         shared_owned.recovering_channels.remove(&channel_id);
 
-        // Finalization complete — decrement counter and check deferred restart
-        let finalizing_remaining = shared_owned
+        // Finalization complete — decrement counters and check deferred restart
+        shared_owned
             .finalizing_turns
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        let g_finalizing = shared_owned
+            .global_finalizing
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
             - 1;
         {
-            let active = shared_owned.core.lock().await.cancel_tokens.len();
-            super::check_deferred_restart(active, finalizing_remaining);
+            let g_active = shared_owned.global_active.load(std::sync::atomic::Ordering::Relaxed);
+            super::check_deferred_restart(g_active, g_finalizing);
         }
 
         if has_queued_turns {

@@ -77,14 +77,13 @@ const SESSION_MAX_IDLE: Duration = Duration::from_secs(24 * 60 * 60); // 1 day
 const RESTART_REPORT_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const DEFERRED_RESTART_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Check if a deferred restart has been requested and no active or finalizing turns remain.
-/// If so, remove the marker and exit the process (launchd will restart it).
+/// Check if a deferred restart has been requested and no active or finalizing turns remain
+/// **across all providers**.
 ///
-/// `finalizing_count` = number of turns currently sending their final Discord response
-/// and doing cleanup. These turns already removed their cancel_token but haven't finished
-/// sending the response yet. We MUST wait for them to avoid losing completion messages.
-pub(super) fn check_deferred_restart(active_turn_count: usize, finalizing_count: usize) {
-    if active_turn_count > 0 || finalizing_count > 0 {
+/// `global_active` / `global_finalizing` are process-wide counters shared by every provider.
+/// A single provider draining to zero is NOT sufficient — we must wait for every provider.
+pub(super) fn check_deferred_restart(global_active: usize, global_finalizing: usize) {
+    if global_active > 0 || global_finalizing > 0 {
         return;
     }
     let Some(root) = crate::remotecc_runtime_root() else {
@@ -237,6 +236,11 @@ pub(super) struct SharedData {
     /// Set when a `restart_pending` marker is detected. While true, the router
     /// queues new messages instead of starting new turns (drain mode).
     pub(super) restart_pending: Arc<std::sync::atomic::AtomicBool>,
+    /// Process-global active turn counter shared across all providers.
+    /// Deferred restart checks this instead of provider-local cancel_tokens.len().
+    pub(super) global_active: Arc<std::sync::atomic::AtomicUsize>,
+    /// Process-global finalizing turn counter shared across all providers.
+    pub(super) global_finalizing: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Poise user data type
@@ -521,7 +525,12 @@ fn resolve_codex_skill_file(path: &Path) -> Option<std::path::PathBuf> {
 }
 
 /// Entry point: start the Discord bot
-pub async fn run_bot(token: &str, provider: ProviderKind) {
+pub async fn run_bot(
+    token: &str,
+    provider: ProviderKind,
+    global_active: Arc<std::sync::atomic::AtomicUsize>,
+    global_finalizing: Arc<std::sync::atomic::AtomicUsize>,
+) {
     // Initialize debug logging from environment variable
     claude::init_debug_from_env();
 
@@ -561,6 +570,8 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
         finalizing_turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         current_generation: runtime_store::load_generation(),
         restart_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        global_active,
+        global_finalizing,
     });
 
     {
@@ -642,11 +653,10 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
                                 }
                             }
                         }
-                        let active = shared_for_deferred.core.lock().await.cancel_tokens.len();
-                        let finalizing = shared_for_deferred
-                            .finalizing_turns
-                            .load(Ordering::Relaxed);
-                        if active == 0 && finalizing == 0 && shared_for_deferred.restart_pending.load(Ordering::Relaxed) {
+                        // Use process-global counters so we wait for ALL providers
+                        let g_active = shared_for_deferred.global_active.load(Ordering::Relaxed);
+                        let g_finalizing = shared_for_deferred.global_finalizing.load(Ordering::Relaxed);
+                        if g_active == 0 && g_finalizing == 0 && shared_for_deferred.restart_pending.load(Ordering::Relaxed) {
                             // Save pending queues before exiting so they survive restart
                             {
                                 let data = shared_for_deferred.core.lock().await;
@@ -658,7 +668,7 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
                                     println!("  [{ts}] 📋 DRAIN: saved {queue_count} pending queue item(s) before deferred restart");
                                 }
                             }
-                            check_deferred_restart(active, finalizing);
+                            check_deferred_restart(g_active, g_finalizing);
                         }
                     }
                 });
@@ -1159,7 +1169,9 @@ async fn maybe_cleanup_sessions(shared: &Arc<SharedData>) {
                 }
             }
             data.sessions.remove(ch);
-            data.cancel_tokens.remove(ch);
+            if data.cancel_tokens.remove(ch).is_some() {
+                shared.global_active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
             data.active_request_owner.remove(ch);
             data.intervention_queue.remove(ch);
         }
@@ -2018,7 +2030,9 @@ async fn cmd_clear(ctx: Context<'_>) -> Result<(), Error> {
             session.pending_uploads.clear();
             session.cleared = true;
         }
-        data.cancel_tokens.remove(&channel_id);
+        if data.cancel_tokens.remove(&channel_id).is_some() {
+            ctx.data().shared.global_active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
         data.active_request_owner.remove(&channel_id);
         data.intervention_queue.remove(&channel_id);
     }
@@ -2559,7 +2573,9 @@ async fn cmd_cc(
                     session.cleared = true;
                 }
                 cleanup_channel_uploads(channel_id);
-                data.cancel_tokens.remove(&channel_id);
+                if data.cancel_tokens.remove(&channel_id).is_some() {
+                    ctx.data().shared.global_active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 data.active_request_owner.remove(&channel_id);
                 data.intervention_queue.remove(&channel_id);
             }

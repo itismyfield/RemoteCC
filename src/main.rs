@@ -1078,10 +1078,19 @@ fn handle_dcserver(token: Option<String>) {
 
     rt.block_on(async {
         println!();
+        // Process-global counters shared across all providers for deferred restart barrier
+        let global_active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let global_finalizing = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         match token {
             Some(token) => {
                 let provider = services::discord::resolve_discord_bot_provider(&token);
-                services::discord::run_bot(&token, provider).await;
+                services::discord::run_bot(
+                    &token,
+                    provider,
+                    global_active,
+                    global_finalizing,
+                )
+                .await;
             }
             None => {
                 let configs = services::discord::load_discord_bot_launch_configs();
@@ -1107,8 +1116,10 @@ fn handle_dcserver(token: Option<String>) {
 
                 let mut tasks = Vec::new();
                 for config in configs {
+                    let ga = global_active.clone();
+                    let gf = global_finalizing.clone();
                     tasks.push(tokio::spawn(async move {
-                        services::discord::run_bot(&config.token, config.provider).await;
+                        services::discord::run_bot(&config.token, config.provider, ga, gf).await;
                     }));
                 }
 
