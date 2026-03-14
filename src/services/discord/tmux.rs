@@ -6,6 +6,7 @@ use serenity::ChannelId;
 
 use crate::services::claude;
 use crate::services::provider::parse_provider_and_channel_from_tmux_name;
+use crate::services::tmux_diagnostics::{build_tmux_death_diagnostic, record_tmux_exit_reason};
 
 use super::formatting::{format_for_discord, format_tool_input, normalize_empty_lines, send_long_message_raw};
 use super::settings::{channel_supports_provider, resolve_role_binding};
@@ -124,7 +125,15 @@ pub(super) async fn tmux_output_watcher(
                 break;
             }
             let ts = chrono::Local::now().format("%H:%M:%S");
-            println!("  [{ts}] 👁 tmux session {tmux_session_name} ended, watcher stopping");
+            if let Some(diag) =
+                build_tmux_death_diagnostic(&tmux_session_name, Some(&output_path))
+            {
+                println!(
+                    "  [{ts}] 👁 tmux session {tmux_session_name} ended, watcher stopping ({diag})"
+                );
+            } else {
+                println!("  [{ts}] 👁 tmux session {tmux_session_name} ended, watcher stopping");
+            }
             if !prompt_too_long_killed {
                 let _ = channel_id
                     .say(
@@ -296,6 +305,7 @@ pub(super) async fn tmux_output_watcher(
 
             let sess = tmux_session_name.clone();
             let _ = tokio::task::spawn_blocking(move || {
+                record_tmux_exit_reason(&sess, "watcher cleanup: prompt too long");
                 let _ = std::process::Command::new("tmux")
                     .args(["kill-session", "-t", &sess])
                     .status();
@@ -326,6 +336,7 @@ pub(super) async fn tmux_output_watcher(
 
             let sess = tmux_session_name.clone();
             let _ = tokio::task::spawn_blocking(move || {
+                record_tmux_exit_reason(&sess, "watcher cleanup: authentication failed");
                 let _ = std::process::Command::new("tmux")
                     .args(["kill-session", "-t", &sess])
                     .status();
@@ -840,6 +851,7 @@ pub(super) async fn cleanup_orphan_tmux_sessions(shared: &Arc<SharedData>) {
     for name in &orphans {
         let name_clone = name.clone();
         let killed = tokio::task::spawn_blocking(move || {
+            record_tmux_exit_reason(&name_clone, "orphan cleanup: no owning channel session");
             std::process::Command::new("tmux")
                 .args(["kill-session", "-t", &name_clone])
                 .status()

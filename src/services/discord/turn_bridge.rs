@@ -1,5 +1,6 @@
 use super::restart_report::{clear_restart_report, save_restart_report, RestartCompletionReport};
 use super::*;
+use crate::services::tmux_diagnostics::record_tmux_exit_reason;
 
 fn tail_with_ellipsis(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
@@ -22,7 +23,7 @@ fn tail_with_ellipsis(text: &str, max_chars: usize) -> String {
     format!("…{}", tail)
 }
 
-pub(super) fn cancel_active_token(token: &Arc<CancelToken>, cleanup_tmux: bool) {
+pub(super) fn cancel_active_token(token: &Arc<CancelToken>, cleanup_tmux: bool, reason: &str) {
     token.cancelled.store(true, Ordering::Relaxed);
 
     let child_pid = token.child_pid.lock().ok().and_then(|guard| *guard);
@@ -38,11 +39,20 @@ pub(super) fn cancel_active_token(token: &Arc<CancelToken>, cleanup_tmux: bool) 
                 .ok()
                 .and_then(|guard| guard.clone())
             {
+                record_tmux_exit_reason(&name, &format!("explicit cleanup via {reason}"));
                 let _ = std::process::Command::new("tmux")
                     .args(["kill-session", "-t", &name])
                     .output();
             }
         } else {
+            if let Some(name) = token
+                .tmux_session
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone())
+            {
+                record_tmux_exit_reason(&name, &format!("explicit cleanup via {reason}"));
+            }
             token.cancel_with_tmux_cleanup();
         }
     }

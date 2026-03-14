@@ -11,6 +11,7 @@ use crate::services::discord::restart_report::{
 };
 use crate::services::provider::ProviderKind;
 use crate::services::remote::RemoteProfile;
+use crate::services::tmux_diagnostics::{clear_tmux_exit_reason, record_tmux_exit_reason};
 use crate::utils::format::safe_prefix;
 
 /// Cached path to the claude binary.
@@ -79,6 +80,7 @@ fn tmux_owner_path(tmux_session_name: &str) -> String {
 }
 
 fn write_tmux_owner_marker(tmux_session_name: &str) -> Result<(), String> {
+    clear_tmux_exit_reason(tmux_session_name);
     let owner_path = tmux_owner_path(tmux_session_name);
     std::fs::write(&owner_path, current_tmux_owner_marker())
         .map_err(|e| format!("Failed to write tmux owner marker: {}", e))
@@ -295,6 +297,7 @@ impl CancelToken {
         self.cancelled
             .store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(name) = self.tmux_session.lock().unwrap().take() {
+            record_tmux_exit_reason(&name, "explicit cleanup via cancel_with_tmux_cleanup");
             let _ = Command::new("tmux")
                 .args(["kill-session", "-t", &name])
                 .output();
@@ -1819,6 +1822,10 @@ fn execute_streaming_local_tmux(
                 std::thread::sleep(std::time::Duration::from_secs(2));
 
                 // Kill stale session if lingering
+                record_tmux_exit_reason(
+                    tmux_session_name,
+                    "stream retry after repeated tmux session death",
+                );
                 let _ = Command::new("tmux")
                     .args(["kill-session", "-t", tmux_session_name])
                     .output();

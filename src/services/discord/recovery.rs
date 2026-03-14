@@ -1,6 +1,7 @@
 use super::shared_memory::latest_shared_memory_ts;
 use super::turn_bridge::stale_inflight_message;
 use super::*;
+use crate::services::tmux_diagnostics::build_tmux_death_diagnostic;
 
 fn output_has_result_after_offset(output_path: &str, start_offset: u64) -> bool {
     let Ok(bytes) = std::fs::read(output_path) else {
@@ -192,10 +193,20 @@ pub(super) async fn restore_inflight_turns(
                 // Fall through to normal recovery path below (watcher re-attach)
             } else {
                 let ts = chrono::Local::now().format("%H:%M:%S");
-                println!(
-                    "  [{ts}] ⏭ skipping inflight recovery for channel {}: restart report exists, session dead, delegating to flush loop",
-                    state.channel_id
-                );
+                if let Some(diag) = tmux_name
+                    .as_deref()
+                    .and_then(|name| build_tmux_death_diagnostic(name, output_path_for_check.as_deref()))
+                {
+                    println!(
+                        "  [{ts}] ⏭ skipping inflight recovery for channel {}: restart report exists, session dead, delegating to flush loop ({diag})",
+                        state.channel_id
+                    );
+                } else {
+                    println!(
+                        "  [{ts}] ⏭ skipping inflight recovery for channel {}: restart report exists, session dead, delegating to flush loop",
+                        state.channel_id
+                    );
+                }
                 clear_inflight_state(provider, state.channel_id);
                 continue;
             }
@@ -315,10 +326,20 @@ pub(super) async fn restore_inflight_turns(
                 state.full_response.clone()
             };
             let stale_text = stale_inflight_message(&best_response);
-            println!(
-                "  [{ts}] ⚠ cannot recover inflight turn for channel {}: tmux session missing (response len: {})",
-                state.channel_id, best_response.len()
-            );
+            if let Some(diag) = tmux_session_name
+                .as_deref()
+                .and_then(|name| build_tmux_death_diagnostic(name, output_path.as_deref()))
+            {
+                println!(
+                    "  [{ts}] ⚠ cannot recover inflight turn for channel {}: tmux session missing (response len: {}, {diag})",
+                    state.channel_id, best_response.len()
+                );
+            } else {
+                println!(
+                    "  [{ts}] ⚠ cannot recover inflight turn for channel {}: tmux session missing (response len: {})",
+                    state.channel_id, best_response.len()
+                );
+            }
             let _ = super::formatting::replace_long_message_raw(
                 http,
                 channel_id,

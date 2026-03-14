@@ -1936,7 +1936,7 @@ async fn cmd_clear(ctx: Context<'_>) -> Result<(), Error> {
         data.cancel_tokens.get(&channel_id).cloned()
     };
     if let Some(token) = cancel_token {
-        cancel_active_token(&token, true);
+        cancel_active_token(&token, true, "/clear");
     }
 
     {
@@ -1989,7 +1989,7 @@ async fn cmd_stop(ctx: Context<'_>) -> Result<(), Error> {
 
             ctx.say("Stopping...").await?;
 
-            cancel_active_token(&token, true);
+            cancel_active_token(&token, true, "/stop");
             println!("  [{ts}] ■ Cancel signal sent");
         }
         None => {
@@ -2479,7 +2479,7 @@ async fn cmd_cc(
                 data.cancel_tokens.get(&channel_id).cloned()
             };
             if let Some(token) = cancel_token {
-                cancel_active_token(&token, true);
+                cancel_active_token(&token, true, "/cc clear");
             }
             {
                 let mut data = ctx.data().shared.core.lock().await;
@@ -2514,7 +2514,7 @@ async fn cmd_cc(
                         return Ok(());
                     }
                     ctx.say("Stopping...").await?;
-                    cancel_active_token(&token, true);
+                    cancel_active_token(&token, true, "/cc stop");
                     println!("  [{ts}] ■ Cancel signal sent");
                 }
                 None => {
