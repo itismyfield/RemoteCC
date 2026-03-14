@@ -457,6 +457,9 @@ pub(super) async fn restore_inflight_turns(
                     session.last_shared_memory_ts = latest_shared_memory_ts(rid);
                 }
             }
+            if !data.cancel_tokens.contains_key(&channel_id) {
+                shared.global_active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             data.cancel_tokens.insert(channel_id, cancel_token.clone());
             data.active_request_owner
                 .insert(channel_id, UserId::new(state.request_owner_user_id));
