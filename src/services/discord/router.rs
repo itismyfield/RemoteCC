@@ -98,8 +98,34 @@ pub(super) async fn handle_event(
                 return Ok(());
             }
 
-            // Auto-restore session
+            // Auto-restore session (for threads, fall back to parent channel's session)
             auto_restore_session(&data.shared, channel_id, ctx).await;
+            if effective_channel_id != channel_id {
+                // Thread: if no session found for thread, try to bootstrap from parent
+                let needs_parent = {
+                    let d = data.shared.core.lock().await;
+                    !d.sessions.contains_key(&channel_id)
+                };
+                if needs_parent {
+                    auto_restore_session(&data.shared, effective_channel_id, ctx).await;
+                    // Clone parent session's path for the thread
+                    let parent_path = {
+                        let d = data.shared.core.lock().await;
+                        d.sessions
+                            .get(&effective_channel_id)
+                            .and_then(|s| s.current_path.clone())
+                    };
+                    if let Some(path) = parent_path {
+                        bootstrap_thread_session(
+                            &data.shared,
+                            channel_id,
+                            &path,
+                            ctx,
+                        )
+                        .await;
+                    }
+                }
+            }
 
             // Queue messages while AI is in progress (executed as next turn after current finishes)
             {
