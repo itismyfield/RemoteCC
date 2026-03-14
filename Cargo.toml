@@ -1,6 +1,6 @@
 [package]
 name = "remotecc"
-version = "0.4.88"
+version = "0.4.89"
 edition = "2021"
 authors = ["cokac <monogatree@gmail.com>"]
 description = "Multi-panel terminal file manager with AI-powered natural language commands"
