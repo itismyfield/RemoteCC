@@ -763,6 +763,7 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
                         last_active: tokio::time::Instant::now(),
                         worktree: None,
                         last_shared_memory_ts: None,
+                        born_generation: super::runtime_store::load_generation(),
                     });
 
             // Restore shared memory dedup timestamp to prevent re-injection after restart

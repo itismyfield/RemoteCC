@@ -92,7 +92,22 @@ pub(super) async fn restore_inflight_turns(
 
     let settings_snapshot = shared.settings.read().await.clone();
 
+    let current_gen = shared.current_generation;
+
     for state in states {
+        // Generation gate: skip recovery for turns born in a previous generation.
+        // These old sessions should not be followed up — the new dcserver should
+        // start fresh sessions instead.
+        if state.born_generation < current_gen {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ⏭ skipping inflight recovery for channel {}: old generation (born={}, current={})",
+                state.channel_id, state.born_generation, current_gen
+            );
+            clear_inflight_state(provider, state.channel_id);
+            continue;
+        }
+
         // If a restart report exists for this channel, check whether the agent
         // has already finished before deciding to skip recovery.  When the output
         // file contains a completed result we deliver it directly and clear both
@@ -421,6 +436,7 @@ pub(super) async fn restore_inflight_turns(
                     last_active: tokio::time::Instant::now(),
                     worktree: None,
                     last_shared_memory_ts: None,
+                    born_generation: super::runtime_store::load_generation(),
                 });
             session.channel_id = Some(channel_id.get());
             session.last_active = tokio::time::Instant::now();

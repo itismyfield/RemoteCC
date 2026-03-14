@@ -38,6 +38,9 @@ pub(crate) struct RestartCompletionReport {
     /// User message ID for reaction management (⏳ → ✅).
     #[serde(default)]
     pub user_msg_id: Option<u64>,
+    /// Restart generation at time of report creation.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 impl RestartCompletionReport {
@@ -57,6 +60,7 @@ impl RestartCompletionReport {
             completed_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             channel_name: None,
             user_msg_id: None,
+            generation: super::runtime_store::load_generation(),
         }
     }
 
@@ -359,6 +363,7 @@ mod tests {
             completed_at: "2026-03-08 18:00:00".to_string(),
             channel_name: None,
             user_msg_id: None,
+            generation: 0,
         };
 
         save_restart_report_in_root(temp.path(), &report).unwrap();
@@ -384,6 +389,7 @@ mod tests {
                 completed_at: "2026-03-08 19:00:00".to_string(),
                 channel_name: None,
                 user_msg_id: None,
+                generation: 0,
             },
         )
         .unwrap();
@@ -400,6 +406,7 @@ mod tests {
                 completed_at: "2026-03-08 19:00:01".to_string(),
                 channel_name: None,
                 user_msg_id: None,
+                generation: 0,
             },
         )
         .unwrap();

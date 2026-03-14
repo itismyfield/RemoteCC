@@ -7,7 +7,7 @@ mod recovery;
 pub(crate) mod restart_report;
 mod role_map;
 mod router;
-mod runtime_store;
+pub mod runtime_store;
 mod settings;
 mod shared_memory;
 mod tmux;
@@ -122,6 +122,8 @@ pub(super) struct DiscordSession {
     pub(super) worktree: Option<WorktreeInfo>,
     /// Timestamp of newest shared-memory turn already injected (dedup)
     pub(super) last_shared_memory_ts: Option<String>,
+    /// Restart generation at which this session was created/restored.
+    pub(super) born_generation: u64,
 }
 
 /// Worktree info for sessions that were auto-redirected to avoid conflicts
@@ -229,6 +231,9 @@ pub(super) struct SharedData {
     /// Number of turns currently in finalization phase (response sending + cleanup).
     /// Deferred restart must wait until this reaches 0 to avoid killing mid-send turns.
     pub(super) finalizing_turns: Arc<std::sync::atomic::AtomicUsize>,
+    /// Current restart generation — incremented on each --restart-dcserver.
+    /// Used to distinguish old (pre-restart) sessions from fresh ones.
+    pub(super) current_generation: u64,
 }
 
 /// Poise user data type
@@ -551,7 +556,16 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
         recovering_channels: dashmap::DashMap::new(),
         shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         finalizing_turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        current_generation: runtime_store::load_generation(),
     });
+
+    {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        println!(
+            "  [{ts}] 🔑 dcserver generation: {}",
+            shared.current_generation
+        );
+    }
 
     let token_owned = token.to_string();
     let shared_clone = shared.clone();
@@ -1353,6 +1367,7 @@ async fn cmd_start(
                 last_active: tokio::time::Instant::now(),
                 worktree: None,
                 last_shared_memory_ts: None,
+                born_generation: runtime_store::load_generation(),
             });
         session.channel_id = Some(channel_id.get());
         session.channel_name = ch_name;
@@ -3063,6 +3078,7 @@ async fn auto_restore_session(
                     last_active: tokio::time::Instant::now(),
                     worktree: None,
                     last_shared_memory_ts: None,
+                    born_generation: runtime_store::load_generation(),
                 });
             session.channel_id = Some(channel_id.get());
             session.last_active = tokio::time::Instant::now();
@@ -3116,6 +3132,7 @@ async fn bootstrap_thread_session(
             last_active: tokio::time::Instant::now(),
             worktree: None,
             last_shared_memory_ts: None,
+            born_generation: runtime_store::load_generation(),
         });
     session.current_path = Some(parent_path.to_string());
     if let Some((session_data, _)) = existing {
