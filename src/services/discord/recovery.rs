@@ -144,20 +144,8 @@ pub(super) async fn restore_inflight_turns(
                 .await;
                 // Mark user message as completed: ⏳ → ✅
                 let user_msg_id = MessageId::new(state.user_msg_id);
-                let _ = http
-                    .delete_reaction_me(
-                        channel_id,
-                        user_msg_id,
-                        &serenity::model::channel::ReactionType::Unicode("⏳".to_string()),
-                    )
-                    .await;
-                let _ = http
-                    .create_reaction(
-                        channel_id,
-                        user_msg_id,
-                        &serenity::model::channel::ReactionType::Unicode("✅".to_string()),
-                    )
-                    .await;
+                super::formatting::remove_reaction_raw(http, channel_id, user_msg_id, '⏳').await;
+                super::formatting::add_reaction_raw(http, channel_id, user_msg_id, '✅').await;
                 super::restart_report::clear_restart_report(provider, state.channel_id);
                 clear_inflight_state(provider, state.channel_id);
                 continue;
@@ -194,13 +182,13 @@ pub(super) async fn restore_inflight_turns(
                 );
                 super::restart_report::clear_restart_report(provider, state.channel_id);
                 // Add 👀 reaction to bot placeholder to indicate watcher re-attached
-                let _ = http
-                    .create_reaction(
-                        ChannelId::new(state.channel_id),
-                        MessageId::new(state.current_msg_id),
-                        &serenity::model::channel::ReactionType::Unicode("👀".to_string()),
-                    )
-                    .await;
+                super::formatting::add_reaction_raw(
+                    http,
+                    ChannelId::new(state.channel_id),
+                    MessageId::new(state.current_msg_id),
+                    '👀',
+                )
+                .await;
                 // Fall through to normal recovery path below (watcher re-attach)
             } else {
                 let ts = chrono::Local::now().format("%H:%M:%S");
