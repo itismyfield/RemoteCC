@@ -121,6 +121,14 @@ pub(super) fn clear_inflight_state(provider: ProviderKind, channel_id: u64) {
     let _ = fs::remove_file(path);
 }
 
+/// Load a single inflight state by provider + channel_id (returns None if missing).
+pub(super) fn load_inflight_state(provider: ProviderKind, channel_id: u64) -> Option<InflightTurnState> {
+    let root = inflight_runtime_root()?;
+    let path = inflight_state_path(&root, provider, channel_id);
+    let data = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
 pub(super) fn load_inflight_states(provider: ProviderKind) -> Vec<InflightTurnState> {
     let Some(root) = inflight_runtime_root() else {
         return Vec::new();
