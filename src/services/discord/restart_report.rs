@@ -252,7 +252,42 @@ pub(super) async fn flush_restart_reports(
         let text = match report.status.as_str() {
             "rolled_back" => format!("⚠️ dcserver 롤백됨: {}", report.summary),
             s if s == "ok" || s == "pending" || s == "sigterm" => {
-                "재시작이 완료되었고 이어서 진행해야할 일은 없습니다.".to_string()
+                // Check for other pending work before declaring "nothing to do"
+                let mut pending_parts: Vec<String> = Vec::new();
+
+                {
+                    let data = shared.core.lock().await;
+                    if data.cancel_tokens.contains_key(&channel_id) {
+                        pending_parts.push("진행 중인 턴이 있습니다".to_string());
+                    }
+                    if let Some(queue) = data.intervention_queue.get(&channel_id) {
+                        let count = queue.len();
+                        if count > 0 {
+                            pending_parts
+                                .push(format!("대기 중인 메시지 {}건이 있습니다", count));
+                        }
+                    }
+                }
+
+                // Check for other restart reports for this channel
+                let other_reports = load_restart_reports(provider);
+                let other_pending = other_reports
+                    .iter()
+                    .filter(|r| r.channel_id == report.channel_id && r.status == "pending")
+                    .count();
+                if other_pending > 1 {
+                    pending_parts
+                        .push(format!("대기 중인 restart report {}건", other_pending - 1));
+                }
+
+                if pending_parts.is_empty() {
+                    "재시작이 완료되었고 이어서 진행해야할 일은 없습니다.".to_string()
+                } else {
+                    format!(
+                        "재시작이 완료되었습니다. {}.",
+                        pending_parts.join(", ")
+                    )
+                }
             }
             _ => format!("❌ dcserver restart failed: {}", report.summary),
         };
