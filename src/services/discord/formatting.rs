@@ -839,7 +839,10 @@ pub(super) async fn add_reaction_raw(
     emoji: char,
 ) {
     let reaction = serenity::ReactionType::Unicode(emoji.to_string());
-    let _ = channel_id.create_reaction(http, message_id, reaction).await;
+    if let Err(e) = channel_id.create_reaction(http, message_id, reaction).await {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        eprintln!("  [{ts}] ⚠ Failed to add reaction '{emoji}' to msg {message_id} in channel {channel_id}: {e}");
+    }
 }
 
 /// Remove reaction using raw HTTP reference
@@ -850,7 +853,8 @@ pub(super) async fn remove_reaction_raw(
     emoji: char,
 ) {
     let reaction = serenity::ReactionType::Unicode(emoji.to_string());
-    let _ = channel_id
-        .delete_reaction(http, message_id, None, reaction)
-        .await;
+    if let Err(e) = channel_id.delete_reaction(http, message_id, None, reaction).await {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        eprintln!("  [{ts}] ⚠ Failed to remove reaction '{emoji}' from msg {message_id} in channel {channel_id}: {e}");
+    }
 }
