@@ -788,6 +788,7 @@ fn handle_restart_dcserver(
         );
         if let Some(existing) = load_restart_report(context.provider, context.channel_id) {
             pending_report.current_msg_id = existing.current_msg_id;
+            pending_report.user_msg_id = existing.user_msg_id;
         }
         if pending_report.current_msg_id.is_none() {
             pending_report.current_msg_id = context.current_msg_id;

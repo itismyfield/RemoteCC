@@ -251,16 +251,6 @@ pub(super) async fn handle_event(
                 None
             };
 
-            // Add ⏳ reaction to user's message to indicate processing
-            let _ = ctx
-                .http
-                .create_reaction(
-                    channel_id,
-                    new_message.id,
-                    &serenity::model::channel::ReactionType::Unicode("⏳".to_string()),
-                )
-                .await;
-
             handle_text_message(
                 ctx,
                 channel_id,
@@ -276,24 +266,6 @@ pub(super) async fn handle_event(
                 reply_context,
             )
             .await?;
-
-            // Replace ⏳ with ✅ after turn completes
-            let _ = ctx
-                .http
-                .delete_reaction_me(
-                    channel_id,
-                    new_message.id,
-                    &serenity::model::channel::ReactionType::Unicode("⏳".to_string()),
-                )
-                .await;
-            let _ = ctx
-                .http
-                .create_reaction(
-                    channel_id,
-                    new_message.id,
-                    &serenity::model::channel::ReactionType::Unicode("✅".to_string()),
-                )
-                .await;
         }
         _ => {}
     }

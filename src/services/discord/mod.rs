@@ -780,6 +780,7 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
                     );
                     report.current_msg_id = Some(state.current_msg_id);
                     report.channel_name = state.channel_name.clone();
+                    report.user_msg_id = Some(state.user_msg_id);
                     if let Err(e) = restart_report::save_restart_report(&report) {
                         eprintln!("  ⚠ failed to save restart report for channel {}: {e}", state.channel_id);
                     }
