@@ -660,18 +660,23 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
     // Collect sessions to restore
     struct PendingWatcher {
         channel_id: ChannelId,
-        channel_name: String,
         output_path: String,
         session_name: String,
         initial_offset: u64,
     }
 
     let mut pending: Vec<PendingWatcher> = Vec::new();
+    let mut owned_sessions: std::collections::HashMap<ChannelId, String> =
+        std::collections::HashMap::new();
 
     for session_name in &remotecc_sessions {
         let Some((channel_id, channel_name)) = name_to_channel.get(*session_name) else {
             continue;
         };
+
+        owned_sessions
+            .entry(*channel_id)
+            .or_insert_with(|| channel_name.clone());
 
         if let Some(started) = shared.recovering_channels.get(channel_id) {
             if started.elapsed() < std::time::Duration::from_secs(60) {
@@ -725,7 +730,6 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
 
         pending.push(PendingWatcher {
             channel_id: *channel_id,
-            channel_name: channel_name.clone(),
             output_path,
             session_name: session_name.to_string(),
             initial_offset,
@@ -734,27 +738,27 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
 
     // Register sessions in CoreState so cleanup_orphan_tmux_sessions recognizes them
     // and message handlers find an active session with current_path
-    if !pending.is_empty() {
+    if !owned_sessions.is_empty() {
         let settings = shared.settings.read().await;
         let mut data = shared.core.lock().await;
-        for pw in &pending {
-            let channel_key = pw.channel_id.get().to_string();
+        for (channel_id, channel_name) in &owned_sessions {
+            let channel_key = channel_id.get().to_string();
             let last_path = settings.last_sessions.get(&channel_key).cloned();
             let remote_profile = settings.last_remotes.get(&channel_key).cloned();
 
             let session =
                 data.sessions
-                    .entry(pw.channel_id)
+                    .entry(*channel_id)
                     .or_insert_with(|| super::DiscordSession {
                         session_id: None,
                         current_path: None,
                         history: Vec::new(),
                         pending_uploads: Vec::new(),
                         cleared: false,
-                        channel_name: Some(pw.channel_name.clone()),
+                        channel_name: Some(channel_name.clone()),
                         category_name: None,
                         remote_profile_name: remote_profile,
-                        channel_id: Some(pw.channel_id.get()),
+                        channel_id: Some(channel_id.get()),
 
                         last_active: tokio::time::Instant::now(),
                         worktree: None,
@@ -763,8 +767,7 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
 
             // Restore shared memory dedup timestamp to prevent re-injection after restart
             if session.last_shared_memory_ts.is_none() {
-                let role =
-                    super::settings::resolve_role_binding(pw.channel_id, Some(&pw.channel_name));
+                let role = super::settings::resolve_role_binding(*channel_id, Some(channel_name));
                 if let Some(ref binding) = role {
                     session.last_shared_memory_ts =
                         super::shared_memory::latest_shared_memory_ts(&binding.role_id);
