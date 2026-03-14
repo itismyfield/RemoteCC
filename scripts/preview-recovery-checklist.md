@@ -76,6 +76,39 @@ Check these in order:
 4. `~/.remotecc-preview/dcserver.stdout.log`
 5. The wrapper output path recorded in the report for the failed iteration
 
+## Generation-Aware Restart Verification (Phase 2-5)
+
+After deploying code with generation-aware restart changes, verify:
+
+### Quarantine + Fresh Session (Phase 2)
+- `~/.remotecc-preview/generation` increments on each `--restart-dcserver`
+- After restart, log shows `🔒 QUARANTINE: auto-restore skipping old session_id/history`
+- After restart, log shows `🔒 QUARANTINE: watcher skip for ... — old generation`
+- New turns after restart use fresh sessions (no old session_id reuse)
+- Pre-restart tmux sessions remain alive but have no watcher attached
+
+### Durable Queue (Phase 3)
+- During drain, log shows `⏸ DRAIN: restart_pending detected, entering drain mode`
+- New messages during drain are queued: `⏸ DRAIN: queued message from ...`
+- User sees `⏸ 재시작 대기 중` response
+- Turn completion during drain skips dequeue: `⏸ DRAIN: skipping queued turn dequeue`
+- Queue saved before exit: `📋 DRAIN: saved N pending queue item(s)`
+- After restart, queue restored: `📋 FLUSH: restored N pending queue item(s)`
+- Queued messages are executed after restart completes
+
+### Lifecycle Logging (Phase 4)
+- Log includes generation info at startup: `🔑 dcserver generation: N`
+- All state transitions are tagged: QUARANTINE / DRAIN / FLUSH
+- Each log line includes timestamp and channel ID
+
+### Same-version Restart Regression
+- `--restart-dcserver` with same binary version still forces process replacement
+- Generation increments even without version change
+
+### Dead-pane Preservation
+- Dead tmux panes are not killed during restart recovery
+- Dead panes are logged but left for post-mortem
+
 ## Stable Promotion Gate
 
 Do not treat preview recovery as proven until:
@@ -85,3 +118,4 @@ Do not treat preview recovery as proven until:
 - There is no leftover inflight state
 - The fix being tested is already covered by repo tests where practical
 - If preview stress is run from `remotecc-discord-smoke.sh`, stable restart only proceeds after the preview gate passes
+- Generation-aware restart items above are verified in preview logs

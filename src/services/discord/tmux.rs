@@ -708,6 +708,23 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
             continue;
         }
 
+        // Generation gate: quarantine tmux sessions from a previous generation.
+        // Keep the session alive for post-mortem but don't attach a watcher.
+        let gen_marker_path = format!("/tmp/remotecc-{}.generation", session_name);
+        let session_gen = std::fs::read_to_string(&gen_marker_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        let current_gen = super::runtime_store::load_generation();
+        if session_gen < current_gen && current_gen > 0 {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] 🔒 QUARANTINE: watcher skip for {} — old generation (session_gen={}, current_gen={})",
+                session_name, session_gen, current_gen
+            );
+            continue;
+        }
+
         if !tmux_session_has_live_pane(session_name) {
             let ts = chrono::Local::now().format("%H:%M:%S");
             if let Some(diag) = build_tmux_death_diagnostic(session_name, Some(&output_path)) {

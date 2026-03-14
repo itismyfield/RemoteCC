@@ -1042,6 +1042,11 @@ fn execute_streaming_local_tmux(
         ])
         .output();
 
+    // Stamp generation marker so post-restart watcher restore can detect old sessions
+    let gen_marker_path = format!("/tmp/remotecc-{}.generation", tmux_session_name);
+    let current_gen = crate::services::discord::runtime_store::load_generation();
+    let _ = std::fs::write(&gen_marker_path, current_gen.to_string());
+
     if let Some(ref token) = cancel_token {
         *token.tmux_session.lock().unwrap() = Some(tmux_session_name.to_string());
     }

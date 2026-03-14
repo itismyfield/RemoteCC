@@ -234,6 +234,9 @@ pub(super) struct SharedData {
     /// Current restart generation — incremented on each --restart-dcserver.
     /// Used to distinguish old (pre-restart) sessions from fresh ones.
     pub(super) current_generation: u64,
+    /// Set when a `restart_pending` marker is detected. While true, the router
+    /// queues new messages instead of starting new turns (drain mode).
+    pub(super) restart_pending: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Poise user data type
@@ -557,6 +560,7 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
         shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         finalizing_turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         current_generation: runtime_store::load_generation(),
+        restart_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
 
     {
@@ -627,11 +631,35 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
                 tokio::spawn(async move {
                     loop {
                         tokio::time::sleep(DEFERRED_RESTART_POLL_INTERVAL).await;
+                        // Detect restart_pending marker and set the in-memory flag
+                        // so the router queues new messages instead of starting turns.
+                        if !shared_for_deferred.restart_pending.load(Ordering::Relaxed) {
+                            if let Some(root) = crate::remotecc_runtime_root() {
+                                if root.join("restart_pending").exists() {
+                                    shared_for_deferred.restart_pending.store(true, Ordering::SeqCst);
+                                    let ts = chrono::Local::now().format("%H:%M:%S");
+                                    println!("  [{ts}] ⏸ DRAIN: restart_pending detected, entering drain mode — new turns blocked");
+                                }
+                            }
+                        }
                         let active = shared_for_deferred.core.lock().await.cancel_tokens.len();
                         let finalizing = shared_for_deferred
                             .finalizing_turns
-                            .load(std::sync::atomic::Ordering::Relaxed);
-                        check_deferred_restart(active, finalizing);
+                            .load(Ordering::Relaxed);
+                        if active == 0 && finalizing == 0 && shared_for_deferred.restart_pending.load(Ordering::Relaxed) {
+                            // Save pending queues before exiting so they survive restart
+                            {
+                                let data = shared_for_deferred.core.lock().await;
+                                let queue_count: usize =
+                                    data.intervention_queue.values().map(|q| q.len()).sum();
+                                if queue_count > 0 {
+                                    save_pending_queues(provider, &data.intervention_queue);
+                                    let ts = chrono::Local::now().format("%H:%M:%S");
+                                    println!("  [{ts}] 📋 DRAIN: saved {queue_count} pending queue item(s) before deferred restart");
+                                }
+                            }
+                            check_deferred_restart(active, finalizing);
+                        }
                     }
                 });
 
@@ -667,7 +695,7 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
                         }
                         drop(data);
                         let ts = chrono::Local::now().format("%H:%M:%S");
-                        println!("  [{ts}] 📋 Restored {added} pending queue item(s) from disk (skipped {skipped} duplicates)");
+                        println!("  [{ts}] 📋 FLUSH: restored {added} pending queue item(s) from disk (skipped {skipped} duplicates)");
                     }
 
                     restore_tmux_watchers(&http_for_tmux, &shared_for_tmux2).await;
@@ -3083,9 +3111,20 @@ async fn auto_restore_session(
             session.channel_id = Some(channel_id.get());
             session.last_active = tokio::time::Instant::now();
             session.current_path = Some(last_path.clone());
+            let current_gen = runtime_store::load_generation();
             if let Some((session_data, _)) = existing {
-                session.session_id = Some(session_data.session_id.clone());
-                session.history = session_data.history.clone();
+                if session_data.born_generation < current_gen && current_gen > 0 {
+                    // Old generation session — quarantine: start fresh without
+                    // reusing session_id/history from the previous generation.
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    println!(
+                        "  [{ts}] 🔒 QUARANTINE: auto-restore skipping old session_id/history for {last_path} (saved_gen={}, current_gen={current_gen})",
+                        session_data.born_generation
+                    );
+                } else {
+                    session.session_id = Some(session_data.session_id.clone());
+                    session.history = session_data.history.clone();
+                }
             }
             drop(data);
             // Rescan skills with project path
@@ -3479,6 +3518,7 @@ fn save_session_to_file(session: &DiscordSession, current_path: &str) {
         discord_channel_name: effective_channel_name,
         discord_category_name: effective_category_name,
         remote_profile_name: session.remote_profile_name.clone(),
+        born_generation: session.born_generation,
     };
 
     if let Ok(json) = serde_json::to_string_pretty(&session_data) {
