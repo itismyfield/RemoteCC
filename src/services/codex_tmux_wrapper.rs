@@ -125,7 +125,10 @@ pub fn run(
         &mut thread_id,
     ) {
         emit_result_error(&mut output, &err);
-        cleanup(output_file, input_fifo);
+        let exit_reason_path = format!("{}.exit_reason", output_file);
+        let _ = std::fs::write(&exit_reason_path, format!("error:{err}"));
+        // Preserve output files for post-mortem on error
+        eprintln!("\x1b[33m[preserving output files for post-mortem: {output_file}]\x1b[0m");
         std::process::exit(1);
     }
 
@@ -142,9 +145,14 @@ pub fn run(
         }
     }
 
+    // Write exit reason file — codex wrapper exits normally when prompt_rx closes
+    let exit_reason = "exit:0";
+    let exit_reason_path = format!("{}.exit_reason", output_file);
+    let _ = std::fs::write(&exit_reason_path, exit_reason);
+
     cleanup(output_file, input_fifo);
     eprintln!();
-    eprintln!("\x1b[90m--- Session ended ---\x1b[0m");
+    eprintln!("\x1b[90m--- Session ended ({exit_reason}) ---\x1b[0m");
 }
 
 fn decode_external_prompt(line: &str) -> Result<String, String> {
