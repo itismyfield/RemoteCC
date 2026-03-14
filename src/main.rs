@@ -755,20 +755,19 @@ fn handle_restart_dcserver(
         return;
     }
 
-    // Check if restart is actually needed by comparing running version with this binary's version
+    // Increment generation counter — every restart request gets a unique generation,
+    // even for same-version deployments (e.g. code-only changes without version bump).
+    let new_generation =
+        services::discord::runtime_store::increment_generation();
+
+    // Show version transition if available
     if let Some(root) = remotecc_runtime_root() {
         let version_file = root.join("dcserver.version");
         if let Ok(running_version) = std::fs::read_to_string(&version_file) {
             let running = running_version.trim();
-            if running == VERSION {
-                println!("✅ dcserver is already running v{VERSION} — restart skipped");
-                write_restart_report(
-                    "skipped",
-                    format!("dcserver가 이미 v{VERSION}을 실행 중이므로 재시작을 건너뛰었습니다."),
-                );
-                return;
-            }
-            println!("   Running: v{running} → Deploying: v{VERSION}");
+            println!(
+                "   Running: v{running} → Deploying: v{VERSION} (generation {new_generation})"
+            );
         }
     }
 

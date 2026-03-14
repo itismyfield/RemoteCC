@@ -6,9 +6,13 @@ use serenity::ChannelId;
 
 use crate::services::claude;
 use crate::services::provider::parse_provider_and_channel_from_tmux_name;
-use crate::services::tmux_diagnostics::{build_tmux_death_diagnostic, record_tmux_exit_reason};
+use crate::services::tmux_diagnostics::{
+    build_tmux_death_diagnostic, record_tmux_exit_reason, tmux_session_has_live_pane,
+};
 
-use super::formatting::{format_for_discord, format_tool_input, normalize_empty_lines, send_long_message_raw};
+use super::formatting::{
+    format_for_discord, format_tool_input, normalize_empty_lines, send_long_message_raw,
+};
 use super::settings::{channel_supports_provider, resolve_role_binding};
 use super::{rate_limit_wait, SharedData, TmuxWatcherHandle, DISCORD_MSG_LIMIT};
 
@@ -98,13 +102,7 @@ pub(super) async fn tmux_output_watcher(
         // Check if tmux session is still alive
         let alive = tokio::task::spawn_blocking({
             let name = tmux_session_name.clone();
-            move || {
-                std::process::Command::new("tmux")
-                    .args(["has-session", "-t", &name])
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false)
-            }
+            move || tmux_session_has_live_pane(&name)
         })
         .await
         .unwrap_or(false);
@@ -125,8 +123,7 @@ pub(super) async fn tmux_output_watcher(
                 break;
             }
             let ts = chrono::Local::now().format("%H:%M:%S");
-            if let Some(diag) =
-                build_tmux_death_diagnostic(&tmux_session_name, Some(&output_path))
+            if let Some(diag) = build_tmux_death_diagnostic(&tmux_session_name, Some(&output_path))
             {
                 println!(
                     "  [{ts}] 👁 tmux session {tmux_session_name} ended, watcher stopping ({diag})"
@@ -191,7 +188,12 @@ pub(super) async fn tmux_output_watcher(
         let mut last_edit_text = String::new();
 
         // Process any complete lines we already have
-        let (mut found_result, mut is_prompt_too_long, mut is_auth_error) = process_watcher_lines(&mut all_data, &mut state, &mut full_response, &mut tool_state);
+        let (mut found_result, mut is_prompt_too_long, mut is_auth_error) = process_watcher_lines(
+            &mut all_data,
+            &mut state,
+            &mut full_response,
+            &mut tool_state,
+        );
 
         // Keep reading until result or timeout
         let mut was_paused = false;
@@ -201,9 +203,7 @@ pub(super) async fn tmux_output_watcher(
             let mut last_status_update = tokio::time::Instant::now();
 
             while !found_result && turn_start.elapsed() < turn_timeout {
-                if cancel.load(Ordering::Relaxed)
-                    || shared.shutting_down.load(Ordering::Relaxed)
-                {
+                if cancel.load(Ordering::Relaxed) || shared.shutting_down.load(Ordering::Relaxed) {
                     break;
                 }
                 if paused.load(Ordering::Relaxed) {
@@ -231,8 +231,12 @@ pub(super) async fn tmux_output_watcher(
                     Ok(Ok((chunk, off))) if !chunk.is_empty() => {
                         current_offset = off;
                         all_data.push_str(&String::from_utf8_lossy(&chunk));
-                        let (fr, ptl, ae) =
-                            process_watcher_lines(&mut all_data, &mut state, &mut full_response, &mut tool_state);
+                        let (fr, ptl, ae) = process_watcher_lines(
+                            &mut all_data,
+                            &mut state,
+                            &mut full_response,
+                            &mut tool_state,
+                        );
                         found_result = fr;
                         is_prompt_too_long = is_prompt_too_long || ptl;
                         is_auth_error = is_auth_error || ae;
@@ -413,8 +417,7 @@ pub(super) async fn tmux_output_watcher(
                 super::inflight::load_inflight_state(provider_kind, channel_id.get())
             {
                 let user_msg_id = serenity::MessageId::new(state.user_msg_id);
-                super::formatting::remove_reaction_raw(&http, channel_id, user_msg_id, '⏳')
-                    .await;
+                super::formatting::remove_reaction_raw(&http, channel_id, user_msg_id, '⏳').await;
                 super::formatting::add_reaction_raw(&http, channel_id, user_msg_id, '✅').await;
             }
         }
@@ -480,13 +483,20 @@ pub(super) fn process_watcher_lines(
                                             tool_state.current_tool_line = None;
                                         }
                                     } else if block_type == Some("tool_use") {
-                                        let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("Tool");
-                                        let input_str = block.get("input").map(|i| i.to_string()).unwrap_or_default();
+                                        let name = block
+                                            .get("name")
+                                            .and_then(|n| n.as_str())
+                                            .unwrap_or("Tool");
+                                        let input_str = block
+                                            .get("input")
+                                            .map(|i| i.to_string())
+                                            .unwrap_or_default();
                                         let summary = format_tool_input(name, &input_str);
                                         let display = if summary.is_empty() {
                                             format!("⚙ {}", name)
                                         } else {
-                                            let truncated: String = summary.chars().take(120).collect();
+                                            let truncated: String =
+                                                summary.chars().take(120).collect();
                                             format!("⚙ {}: {}", name, truncated)
                                         };
                                         tool_state.current_tool_line = Some(display);
@@ -524,7 +534,10 @@ pub(super) fn process_watcher_lines(
                     }
                 }
                 "result" => {
-                    let is_error = val.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let is_error = val
+                        .get("is_error")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     let result_str = val.get("result").and_then(|r| r.as_str()).unwrap_or("");
 
                     if is_error {
@@ -544,7 +557,9 @@ pub(super) fn process_watcher_lines(
                             || lower.contains("token expired")
                             || lower.contains("invalid api key")
                             || lower.contains("api key")
-                                && (lower.contains("missing") || lower.contains("invalid") || lower.contains("expired"))
+                                && (lower.contains("missing")
+                                    || lower.contains("invalid")
+                                    || lower.contains("expired"))
                         {
                             is_auth_error = true;
                         }
@@ -645,18 +660,23 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
     // Collect sessions to restore
     struct PendingWatcher {
         channel_id: ChannelId,
-        channel_name: String,
         output_path: String,
         session_name: String,
         initial_offset: u64,
     }
 
     let mut pending: Vec<PendingWatcher> = Vec::new();
+    let mut owned_sessions: std::collections::HashMap<ChannelId, String> =
+        std::collections::HashMap::new();
 
     for session_name in &remotecc_sessions {
         let Some((channel_id, channel_name)) = name_to_channel.get(*session_name) else {
             continue;
         };
+
+        owned_sessions
+            .entry(*channel_id)
+            .or_insert_with(|| channel_name.clone());
 
         if let Some(started) = shared.recovering_channels.get(channel_id) {
             if started.elapsed() < std::time::Duration::from_secs(60) {
@@ -688,13 +708,28 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
             continue;
         }
 
+        if !tmux_session_has_live_pane(session_name) {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            if let Some(diag) = build_tmux_death_diagnostic(session_name, Some(&output_path)) {
+                println!(
+                    "  [{ts}] ⏭ watcher skip for {} — tmux pane dead ({diag})",
+                    session_name
+                );
+            } else {
+                println!(
+                    "  [{ts}] ⏭ watcher skip for {} — tmux pane dead",
+                    session_name
+                );
+            }
+            continue;
+        }
+
         let initial_offset = std::fs::metadata(&output_path)
             .map(|m| m.len())
             .unwrap_or(0);
 
         pending.push(PendingWatcher {
             channel_id: *channel_id,
-            channel_name: channel_name.clone(),
             output_path,
             session_name: session_name.to_string(),
             initial_offset,
@@ -703,39 +738,37 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
 
     // Register sessions in CoreState so cleanup_orphan_tmux_sessions recognizes them
     // and message handlers find an active session with current_path
-    if !pending.is_empty() {
+    if !owned_sessions.is_empty() {
         let settings = shared.settings.read().await;
         let mut data = shared.core.lock().await;
-        for pw in &pending {
-            let channel_key = pw.channel_id.get().to_string();
+        for (channel_id, channel_name) in &owned_sessions {
+            let channel_key = channel_id.get().to_string();
             let last_path = settings.last_sessions.get(&channel_key).cloned();
             let remote_profile = settings.last_remotes.get(&channel_key).cloned();
 
             let session =
                 data.sessions
-                    .entry(pw.channel_id)
+                    .entry(*channel_id)
                     .or_insert_with(|| super::DiscordSession {
                         session_id: None,
                         current_path: None,
                         history: Vec::new(),
                         pending_uploads: Vec::new(),
                         cleared: false,
-                        channel_name: Some(pw.channel_name.clone()),
+                        channel_name: Some(channel_name.clone()),
                         category_name: None,
                         remote_profile_name: remote_profile,
-                        channel_id: Some(pw.channel_id.get()),
+                        channel_id: Some(channel_id.get()),
 
                         last_active: tokio::time::Instant::now(),
                         worktree: None,
                         last_shared_memory_ts: None,
+                        born_generation: super::runtime_store::load_generation(),
                     });
 
             // Restore shared memory dedup timestamp to prevent re-injection after restart
             if session.last_shared_memory_ts.is_none() {
-                let role = super::settings::resolve_role_binding(
-                    pw.channel_id,
-                    Some(&pw.channel_name),
-                );
+                let role = super::settings::resolve_role_binding(*channel_id, Some(channel_name));
                 if let Some(ref binding) = role {
                     session.last_shared_memory_ts =
                         super::shared_memory::latest_shared_memory_ts(&binding.role_id);

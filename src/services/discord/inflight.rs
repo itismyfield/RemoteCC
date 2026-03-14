@@ -30,6 +30,9 @@ pub(super) struct InflightTurnState {
     pub current_tool_line: Option<String>,
     pub started_at: String,
     pub updated_at: String,
+    /// Restart generation at which this turn was born.
+    #[serde(default)]
+    pub born_generation: u64,
 }
 
 impl InflightTurnState {
@@ -68,6 +71,7 @@ impl InflightTurnState {
             current_tool_line: None,
             started_at: now.clone(),
             updated_at: now,
+            born_generation: super::runtime_store::load_generation(),
         }
     }
 

@@ -1,7 +1,7 @@
 use super::shared_memory::latest_shared_memory_ts;
 use super::turn_bridge::stale_inflight_message;
 use super::*;
-use crate::services::tmux_diagnostics::build_tmux_death_diagnostic;
+use crate::services::tmux_diagnostics::{build_tmux_death_diagnostic, tmux_session_has_live_pane};
 
 fn output_has_result_after_offset(output_path: &str, start_offset: u64) -> bool {
     let Ok(bytes) = std::fs::read(output_path) else {
@@ -92,7 +92,22 @@ pub(super) async fn restore_inflight_turns(
 
     let settings_snapshot = shared.settings.read().await.clone();
 
+    let current_gen = shared.current_generation;
+
     for state in states {
+        // Generation gate: skip recovery for turns born in a previous generation.
+        // These old sessions should not be followed up — the new dcserver should
+        // start fresh sessions instead.
+        if state.born_generation < current_gen {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ⏭ skipping inflight recovery for channel {}: old generation (born={}, current={})",
+                state.channel_id, state.born_generation, current_gen
+            );
+            clear_inflight_state(provider, state.channel_id);
+            continue;
+        }
+
         // If a restart report exists for this channel, check whether the agent
         // has already finished before deciding to skip recovery.  When the output
         // file contains a completed result we deliver it directly and clear both
@@ -167,13 +182,9 @@ pub(super) async fn restore_inflight_turns(
                         provider.build_tmux_session_name(name)
                     }
                 });
-            let session_alive = tmux_name.as_deref().map_or(false, |name| {
-                std::process::Command::new("tmux")
-                    .args(["has-session", "-t", name])
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false)
-            });
+            let session_alive = tmux_name
+                .as_deref()
+                .map_or(false, tmux_session_has_live_pane);
 
             if session_alive {
                 let ts = chrono::Local::now().format("%H:%M:%S");
@@ -193,10 +204,9 @@ pub(super) async fn restore_inflight_turns(
                 // Fall through to normal recovery path below (watcher re-attach)
             } else {
                 let ts = chrono::Local::now().format("%H:%M:%S");
-                if let Some(diag) = tmux_name
-                    .as_deref()
-                    .and_then(|name| build_tmux_death_diagnostic(name, output_path_for_check.as_deref()))
-                {
+                if let Some(diag) = tmux_name.as_deref().and_then(|name| {
+                    build_tmux_death_diagnostic(name, output_path_for_check.as_deref())
+                }) {
                     println!(
                         "  [{ts}] ⏭ skipping inflight recovery for channel {}: restart report exists, session dead, delegating to flush loop ({diag})",
                         state.channel_id
@@ -395,7 +405,9 @@ pub(super) async fn restore_inflight_turns(
             continue;
         };
 
-        shared.recovering_channels.insert(channel_id, std::time::Instant::now());
+        shared
+            .recovering_channels
+            .insert(channel_id, std::time::Instant::now());
 
         let channel_key = channel_id.get().to_string();
         let last_path = settings_snapshot.last_sessions.get(&channel_key).cloned();
@@ -424,6 +436,7 @@ pub(super) async fn restore_inflight_turns(
                     last_active: tokio::time::Instant::now(),
                     worktree: None,
                     last_shared_memory_ts: None,
+                    born_generation: super::runtime_store::load_generation(),
                 });
             session.channel_id = Some(channel_id.get());
             session.last_active = tokio::time::Instant::now();

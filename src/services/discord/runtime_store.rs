@@ -55,6 +55,29 @@ pub(super) fn shared_agent_memory_root() -> Option<PathBuf> {
     remotecc_root().map(|root| root.join("shared_agent_memory"))
 }
 
+/// Path to the generation counter file.
+pub fn generation_path() -> Option<PathBuf> {
+    remotecc_root().map(|root| root.join("generation"))
+}
+
+/// Load the current generation counter (returns 0 if file missing/corrupt).
+pub fn load_generation() -> u64 {
+    generation_path()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Increment the generation counter and return the new value.
+pub fn increment_generation() -> u64 {
+    let current = load_generation();
+    let next = current + 1;
+    if let Some(path) = generation_path() {
+        let _ = atomic_write(&path, &next.to_string());
+    }
+    next
+}
+
 pub(super) fn atomic_write(path: &Path, data: &str) -> Result<(), String> {
     let tmp = path.with_extension("tmp");
     let mut file = fs::File::create(&tmp).map_err(|e| e.to_string())?;
