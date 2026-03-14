@@ -2503,7 +2503,6 @@ async fn autocomplete_skill<'a>(
         ("status", "Show this channel session status"),
         ("inflight", "Show saved inflight turn state"),
         ("pwd", "Show current working directory"),
-        ("clear", "Clear session state"),
         ("stop", "Stop current AI request"),
         ("help", "Show command help"),
     ];
@@ -2553,34 +2552,7 @@ async fn cmd_cc(
     // Handle built-in commands directly instead of sending to AI
     match skill.as_str() {
         "clear" => {
-            let channel_id = ctx.channel_id();
-            let cancel_token = {
-                let data = ctx.data().shared.core.lock().await;
-                data.cancel_tokens.get(&channel_id).cloned()
-            };
-            if let Some(token) = cancel_token {
-                cancel_active_token(&token, true, "/cc clear");
-            }
-            {
-                let mut data = ctx.data().shared.core.lock().await;
-                if let Some(session) = data.sessions.get_mut(&channel_id) {
-                    if let Some(ref path) = session.current_path {
-                        cleanup_session_files(path, None);
-                    }
-                    session.session_id = None;
-                    session.history.clear();
-                    session.pending_uploads.clear();
-                    session.cleared = true;
-                }
-                cleanup_channel_uploads(channel_id);
-                if data.cancel_tokens.remove(&channel_id).is_some() {
-                    ctx.data().shared.global_active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                data.active_request_owner.remove(&channel_id);
-                data.intervention_queue.remove(&channel_id);
-            }
-            ctx.say("Session cleared.").await?;
-            println!("  [{ts}] ▶ [{user_name}] Session cleared");
+            ctx.say("Use the `/clear` slash command instead.").await?;
             return Ok(());
         }
         "stop" => {
