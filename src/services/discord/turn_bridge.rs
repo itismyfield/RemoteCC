@@ -471,7 +471,12 @@ pub(super) fn spawn_turn_bridge(
             has_pending
         };
 
-        remove_reaction_raw(&http, channel_id, user_msg_id, '⏳').await;
+        // Remove ⏳ only if NOT handing off to tmux watcher.
+        // When tmux watcher is handling the response, it will do ⏳→✅ after delivery.
+        let tmux_handoff_path = rx_disconnected && tmux_handed_off && full_response.is_empty();
+        if !tmux_handoff_path {
+            remove_reaction_raw(&http, channel_id, user_msg_id, '⏳').await;
+        }
 
         let is_prompt_too_long = full_response.contains("__prompt too long__");
 

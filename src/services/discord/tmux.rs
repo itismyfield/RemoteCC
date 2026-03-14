@@ -392,6 +392,21 @@ pub(super) async fn tmux_output_watcher(
             // No response text but placeholder exists — clean up
             let _ = channel_id.delete_message(&http, msg_id).await;
         }
+
+        // Mark user message as completed: ⏳ → ✅
+        // Read user_msg_id from inflight state (turn_bridge stores it there)
+        if let Some((provider_kind, _)) =
+            parse_provider_and_channel_from_tmux_name(&tmux_session_name)
+        {
+            if let Some(state) =
+                super::inflight::load_inflight_state(provider_kind, channel_id.get())
+            {
+                let user_msg_id = serenity::MessageId::new(state.user_msg_id);
+                super::formatting::remove_reaction_raw(&http, channel_id, user_msg_id, '⏳')
+                    .await;
+                super::formatting::add_reaction_raw(&http, channel_id, user_msg_id, '✅').await;
+            }
+        }
     }
 
     // Cleanup
