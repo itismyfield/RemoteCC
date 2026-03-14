@@ -334,17 +334,48 @@ pub fn run(
     // Wait for output thread (which blocks until Claude exits or detects fatal error)
     let _ = output_thread.join();
 
+    // Collect exit status before kill — if child already exited, this captures the real reason
+    let exit_reason = match child.try_wait() {
+        Ok(Some(status)) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                if let Some(sig) = status.signal() {
+                    format!("signal:{sig}")
+                } else {
+                    format!("exit:{}", status.code().unwrap_or(-1))
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                format!("exit:{}", status.code().unwrap_or(-1))
+            }
+        }
+        Ok(None) => "still_running".to_string(),
+        Err(e) => format!("wait_error:{e}"),
+    };
+
     // Kill Claude if still running (handles case where output thread exited early
     // due to fatal error while Claude is still waiting for stdin input)
     let _ = child.kill();
     let _ = child.wait();
 
-    // Clean up
-    let _ = std::fs::remove_file(output_file);
-    let _ = std::fs::remove_file(input_fifo);
+    // Write exit reason file for recovery diagnostics
+    let exit_reason_path = format!("{}.exit_reason", output_file);
+    let _ = std::fs::write(&exit_reason_path, &exit_reason);
+    eprintln!("\x1b[90m[exit reason: {exit_reason}]\x1b[0m");
+
+    // Only clean up output/FIFO if exit was normal (exit:0).
+    // Abnormal exits preserve files for post-mortem analysis by dcserver recovery.
+    if exit_reason == "exit:0" {
+        let _ = std::fs::remove_file(output_file);
+        let _ = std::fs::remove_file(input_fifo);
+    } else {
+        eprintln!("\x1b[33m[preserving output files for post-mortem: {output_file}]\x1b[0m");
+    }
 
     eprintln!();
-    eprintln!("\x1b[90m--- Session ended ---\x1b[0m");
+    eprintln!("\x1b[90m--- Session ended ({exit_reason}) ---\x1b[0m");
 }
 
 /// Extract a short human-readable detail from a tool_use content block.

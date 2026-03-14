@@ -1770,6 +1770,11 @@ fn execute_streaming_local_tmux(
         return Err(format!("tmux error: {}", stderr));
     }
 
+    // Keep tmux session alive after process exits for post-mortem analysis
+    let _ = Command::new("tmux")
+        .args(["set-option", "-t", tmux_session_name, "remain-on-exit", "on"])
+        .output();
+
     debug_log("tmux session created, storing in cancel token...");
 
     // Store tmux session name in cancel token

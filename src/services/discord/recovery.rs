@@ -235,6 +235,21 @@ pub(super) async fn restore_inflight_turns(
             .clone()
             .filter(|s| !s.is_empty())
             .or_else(|| (!fallback_input.is_empty()).then_some(fallback_input.clone()));
+        // Check exit reason file for post-mortem diagnostics
+        if let Some(ref op) = output_path {
+            let exit_reason_path = format!("{}.exit_reason", op);
+            if let Ok(reason) = std::fs::read_to_string(&exit_reason_path) {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!(
+                    "  [{ts}] 🔍 exit_reason for channel {}: {}",
+                    state.channel_id,
+                    reason.trim()
+                );
+                // Clean up exit reason file after reading
+                let _ = std::fs::remove_file(&exit_reason_path);
+            }
+        }
+
         let output_already_completed = output_path
             .as_deref()
             .map(|path| output_has_result_after_offset(path, state.last_offset))
