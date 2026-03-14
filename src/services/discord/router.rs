@@ -387,6 +387,7 @@ pub(super) async fn handle_text_message(
                                     last_active: tokio::time::Instant::now(),
                                     worktree: None,
                                     last_shared_memory_ts: None,
+                                    born_generation: super::runtime_store::load_generation(),
                                 });
                         session.current_path = Some(eff_path.clone());
                         session.channel_name = ch_name_resolved;
