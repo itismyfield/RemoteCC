@@ -15,7 +15,10 @@ use crate::services::discord::restart_report::{
 };
 use crate::services::provider::ProviderKind;
 use crate::services::remote::RemoteProfile;
-use crate::services::tmux_diagnostics::clear_tmux_exit_reason;
+use crate::services::tmux_diagnostics::{
+    clear_tmux_exit_reason, record_tmux_exit_reason, tmux_session_exists,
+    tmux_session_has_live_pane,
+};
 
 static CODEX_PATH: OnceLock<Option<String>> = OnceLock::new();
 const TMUX_PROMPT_B64_PREFIX: &str = "__REMOTECC_B64__:";
@@ -911,13 +914,12 @@ fn execute_streaming_local_tmux(
     let prompt_path = format!("/tmp/remotecc-{}.prompt", tmux_session_name);
     let owner_path = tmux_owner_path(tmux_session_name);
 
-    let session_exists = Command::new("tmux")
-        .args(["has-session", "-t", tmux_session_name])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let session_exists = tmux_session_exists(tmux_session_name);
+    let session_usable = tmux_session_has_live_pane(tmux_session_name)
+        && std::fs::metadata(&output_path).is_ok()
+        && std::path::Path::new(&input_fifo_path).exists();
 
-    if session_exists {
+    if session_usable {
         return send_followup_to_tmux(
             prompt,
             &output_path,
@@ -926,6 +928,16 @@ fn execute_streaming_local_tmux(
             cancel_token,
             tmux_session_name,
         );
+    }
+
+    if session_exists {
+        record_tmux_exit_reason(
+            tmux_session_name,
+            "stale local session cleanup before recreate",
+        );
+        let _ = Command::new("tmux")
+            .args(["kill-session", "-t", tmux_session_name])
+            .status();
     }
 
     let _ = std::fs::remove_file(&output_path);
@@ -1021,7 +1033,13 @@ fn execute_streaming_local_tmux(
 
     // Keep tmux session alive after process exits for post-mortem analysis
     let _ = Command::new("tmux")
-        .args(["set-option", "-t", tmux_session_name, "remain-on-exit", "on"])
+        .args([
+            "set-option",
+            "-t",
+            tmux_session_name,
+            "remain-on-exit",
+            "on",
+        ])
         .output();
 
     if let Some(ref token) = cancel_token {

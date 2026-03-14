@@ -32,6 +32,7 @@ use crate::services::claude::{
 };
 use crate::services::codex;
 use crate::services::provider::ProviderKind;
+use crate::services::tmux_diagnostics::{tmux_session_exists, tmux_session_has_live_pane};
 use crate::ui::ai_screen::{self, HistoryItem, HistoryType, SessionData};
 
 use formatting::{
@@ -42,7 +43,9 @@ use formatting::{
 use inflight::{
     clear_inflight_state, load_inflight_states, save_inflight_state, InflightTurnState,
 };
-use pcd::{build_pcd_session_key, derive_pcd_session_info, parse_dispatch_id, post_pcd_session_status};
+use pcd::{
+    build_pcd_session_key, derive_pcd_session_info, parse_dispatch_id, post_pcd_session_status,
+};
 use prompt_builder::build_system_prompt;
 use recovery::restore_inflight_turns;
 use restart_report::flush_restart_reports;
@@ -52,7 +55,9 @@ use settings::{
     channel_supports_provider, channel_upload_dir, cleanup_channel_uploads, cleanup_old_uploads,
     load_bot_settings, resolve_role_binding, save_bot_settings, RoleBinding,
 };
-use shared_memory::{append_shared_memory_turn, build_shared_memory_context, latest_shared_memory_ts};
+use shared_memory::{
+    append_shared_memory_turn, build_shared_memory_context, latest_shared_memory_ts,
+};
 use tmux::{cleanup_orphan_tmux_sessions, restore_tmux_watchers, tmux_output_watcher};
 use turn_bridge::{cancel_active_token, spawn_turn_bridge, tmux_runtime_paths, TurnBridgeContext};
 
@@ -235,7 +240,6 @@ struct Data {
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Data, Error>;
-
 
 fn prune_interventions(queue: &mut Vec<Intervention>) {
     let now = Instant::now();
@@ -720,7 +724,10 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
 
                 // Cancel all active tmux watchers (quiet exit, no "session ended" messages)
                 for entry in shared_for_signal.tmux_watchers.iter() {
-                    entry.value().cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                    entry
+                        .value()
+                        .cancel
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
                 }
 
                 // Grace period for watchers to see cancel flag and exit cleanly.
@@ -741,11 +748,16 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
                         let restart_notice = if state.full_response.trim().is_empty() {
                             "⚠️ dcserver 재시작으로 중단됨 — 곧 복원됩니다".to_string()
                         } else {
-                            let partial = formatting::format_for_discord(state.full_response.trim());
+                            let partial =
+                                formatting::format_for_discord(state.full_response.trim());
                             format!("{partial}\n\n⚠️ dcserver 재시작으로 중단됨 — 곧 복원됩니다")
                         };
                         match channel
-                            .edit_message(&http, msg_id, EditMessage::new().content(&restart_notice))
+                            .edit_message(
+                                &http,
+                                msg_id,
+                                EditMessage::new().content(&restart_notice),
+                            )
                             .await
                         {
                             Ok(_) => {
@@ -782,18 +794,25 @@ pub async fn run_bot(token: &str, provider: ProviderKind) {
                     report.channel_name = state.channel_name.clone();
                     report.user_msg_id = Some(state.user_msg_id);
                     if let Err(e) = restart_report::save_restart_report(&report) {
-                        eprintln!("  ⚠ failed to save restart report for channel {}: {e}", state.channel_id);
+                        eprintln!(
+                            "  ⚠ failed to save restart report for channel {}: {e}",
+                            state.channel_id
+                        );
                     }
                 }
                 if !inflight_states.is_empty() {
                     let ts2 = chrono::Local::now().format("%H:%M:%S");
-                    println!("  [{ts2}] 📝 saved {} restart report(s) for inflight channels", inflight_states.len());
+                    println!(
+                        "  [{ts2}] 📝 saved {} restart report(s) for inflight channels",
+                        inflight_states.len()
+                    );
                 }
 
                 // Persist pending intervention queues so they survive restart
                 {
                     let data = shared_for_signal.core.lock().await;
-                    let queue_count: usize = data.intervention_queue.values().map(|q| q.len()).sum();
+                    let queue_count: usize =
+                        data.intervention_queue.values().map(|q| q.len()).sum();
                     if queue_count > 0 {
                         save_pending_queues(provider, &data.intervention_queue);
                         let ts3 = chrono::Local::now().format("%H:%M:%S");
@@ -1600,12 +1619,12 @@ async fn build_health_report(
     let tmux_session_name =
         session_channel_name.map(|name| provider.build_tmux_session_name(&name));
     let tmux_alive = if let Some(ref session_name) = tmux_session_name {
-        match std::process::Command::new("tmux")
-            .args(["has-session", "-t", session_name])
-            .status()
-        {
-            Ok(status) if status.success() => "alive",
-            _ => "missing",
+        if tmux_session_has_live_pane(session_name) {
+            "alive"
+        } else if tmux_session_exists(session_name) {
+            "dead-pane"
+        } else {
+            "missing"
         }
     } else {
         "unknown"
@@ -1718,12 +1737,12 @@ async fn build_status_report(
     let tmux_session_name =
         session_channel_name.map(|name| provider.build_tmux_session_name(&name));
     let tmux_alive = if let Some(ref session_name) = tmux_session_name {
-        match std::process::Command::new("tmux")
-            .args(["has-session", "-t", session_name])
-            .status()
-        {
-            Ok(status) if status.success() => "alive",
-            _ => "missing",
+        if tmux_session_has_live_pane(session_name) {
+            "alive"
+        } else if tmux_session_exists(session_name) {
+            "dead-pane"
+        } else {
+            "missing"
         }
     } else {
         "unknown"
