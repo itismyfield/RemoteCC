@@ -1019,6 +1019,11 @@ fn execute_streaming_local_tmux(
         return Err(format!("tmux error: {}", stderr));
     }
 
+    // Keep tmux session alive after process exits for post-mortem analysis
+    let _ = Command::new("tmux")
+        .args(["set-option", "-t", tmux_session_name, "remain-on-exit", "on"])
+        .output();
+
     if let Some(ref token) = cancel_token {
         *token.tmux_session.lock().unwrap() = Some(tmux_session_name.to_string());
     }
