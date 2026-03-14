@@ -35,6 +35,9 @@ pub(crate) struct RestartCompletionReport {
     /// Channel name for log context.
     #[serde(default)]
     pub channel_name: Option<String>,
+    /// User message ID for reaction management (⏳ → ✅).
+    #[serde(default)]
+    pub user_msg_id: Option<u64>,
 }
 
 impl RestartCompletionReport {
@@ -53,6 +56,7 @@ impl RestartCompletionReport {
             summary: summary.into(),
             completed_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             channel_name: None,
+            user_msg_id: None,
         }
     }
 
@@ -281,10 +285,14 @@ pub(super) async fn flush_restart_reports(
                 }
 
                 if pending_parts.is_empty() {
-                    "재시작이 완료되었고 이어서 진행해야할 일은 없습니다.".to_string()
+                    format!(
+                        "재시작이 완료되었습니다. ({})",
+                        report.summary
+                    )
                 } else {
                     format!(
-                        "재시작이 완료되었습니다. {}.",
+                        "재시작이 완료되었습니다. ({}). {}.",
+                        report.summary,
                         pending_parts.join(", ")
                     )
                 }
@@ -300,6 +308,12 @@ pub(super) async fn flush_restart_reports(
                         "  [{ts}] ✓ Flushed restart follow-up report for channel {} on attempt {}",
                         report.channel_id, attempt
                     );
+                    // Mark user message as completed: ⏳ → ✅
+                    if let Some(umid) = report.user_msg_id {
+                        let user_msg_id = serenity::model::id::MessageId::new(umid);
+                        super::formatting::remove_reaction_raw(http, channel_id, user_msg_id, '⏳').await;
+                        super::formatting::add_reaction_raw(http, channel_id, user_msg_id, '✅').await;
+                    }
                     clear_restart_report(provider, report.channel_id);
                     break;
                 }
@@ -344,6 +358,7 @@ mod tests {
             summary: "ready".to_string(),
             completed_at: "2026-03-08 18:00:00".to_string(),
             channel_name: None,
+            user_msg_id: None,
         };
 
         save_restart_report_in_root(temp.path(), &report).unwrap();
@@ -368,6 +383,7 @@ mod tests {
                 summary: "codex-ready".to_string(),
                 completed_at: "2026-03-08 19:00:00".to_string(),
                 channel_name: None,
+                user_msg_id: None,
             },
         )
         .unwrap();
@@ -383,6 +399,7 @@ mod tests {
                 summary: "claude-ready".to_string(),
                 completed_at: "2026-03-08 19:00:01".to_string(),
                 channel_name: None,
+                user_msg_id: None,
             },
         )
         .unwrap();
