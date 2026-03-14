@@ -626,6 +626,9 @@ pub(super) async fn handle_text_message(
     let cancel_token = Arc::new(CancelToken::new());
     {
         let mut data = shared.core.lock().await;
+        if !data.cancel_tokens.contains_key(&channel_id) {
+            shared.global_active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         data.cancel_tokens.insert(channel_id, cancel_token.clone());
         data.active_request_owner.insert(channel_id, request_owner);
     }
