@@ -93,6 +93,19 @@ pub(super) fn status_update_interval() -> Duration {
     })
 }
 
+/// Turn watchdog timeout. Configurable via REMOTECC_TURN_TIMEOUT_SECS env var.
+/// Default: 1200 seconds (20 minutes).
+pub(super) fn turn_watchdog_timeout() -> Duration {
+    static CACHED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let secs = std::env::var("REMOTECC_TURN_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(1200);
+        Duration::from_secs(secs)
+    })
+}
+
 /// Check if a deferred restart has been requested and no active or finalizing turns remain
 /// **across all providers**.
 ///

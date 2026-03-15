@@ -677,6 +677,51 @@ pub(super) async fn handle_text_message(
         data.active_request_owner.insert(channel_id, request_owner);
     }
 
+    // Spawn turn watchdog — cancels the turn if it exceeds the timeout
+    {
+        let watchdog_token = cancel_token.clone();
+        let watchdog_shared = shared.clone();
+        let watchdog_http = ctx.http.clone();
+        let timeout = super::turn_watchdog_timeout();
+        tokio::spawn(async move {
+            tokio::time::sleep(timeout).await;
+            // If the token is still alive (not yet cancelled/completed), this turn is hung
+            if !watchdog_token.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                // Check if this channel still has this cancel token (turn not yet finalized)
+                let still_active = {
+                    let data = watchdog_shared.core.lock().await;
+                    data.cancel_tokens.contains_key(&channel_id)
+                };
+                if still_active {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    println!(
+                        "  [{ts}] ⏰ WATCHDOG: turn timeout ({:.0}s) for channel {}, cancelling",
+                        timeout.as_secs_f64(), channel_id
+                    );
+                    super::turn_bridge::cancel_active_token(&watchdog_token, true, "watchdog timeout");
+
+                    // Remove cancel token and decrement global_active
+                    {
+                        let mut data = watchdog_shared.core.lock().await;
+                        if data.cancel_tokens.remove(&channel_id).is_some() {
+                            watchdog_shared.global_active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        data.active_request_owner.remove(&channel_id);
+                    }
+
+                    // Notify Discord
+                    let timeout_mins = timeout.as_secs() / 60;
+                    let _ = channel_id
+                        .say(&watchdog_http, format!(
+                            "⚠️ 턴이 {}분 타임아웃으로 자동 중단되었습니다. 다음 메시지를 보내면 새 턴이 시작됩니다.",
+                            timeout_mins
+                        ))
+                        .await;
+                }
+            }
+        });
+    }
+
     // Resolve remote profile for this channel
     let remote_profile = {
         let data = shared.core.lock().await;
