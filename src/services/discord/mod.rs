@@ -84,25 +84,37 @@ const DEFERRED_RESTART_POLL_INTERVAL: Duration = Duration::from_secs(5);
 ///
 /// `global_active` / `global_finalizing` are process-wide counters shared by every provider.
 /// A single provider draining to zero is NOT sufficient — we must wait for every provider.
-pub(super) fn check_deferred_restart(global_active: usize, global_finalizing: usize) {
-    if global_active > 0 || global_finalizing > 0 {
+/// `shutdown_remaining` ensures all providers finish saving before any calls `exit(0)`.
+/// `shutdown_counted` (per-provider) prevents double-decrement when both deferred restart
+/// and SIGTERM paths run for the same provider.
+pub(super) fn check_deferred_restart(shared: &SharedData) {
+    let g_active = shared.global_active.load(std::sync::atomic::Ordering::Relaxed);
+    let g_finalizing = shared.global_finalizing.load(std::sync::atomic::Ordering::Relaxed);
+    if g_active > 0 || g_finalizing > 0 {
         return;
     }
-    let Some(root) = crate::remotecc_runtime_root() else {
-        return;
-    };
-    let marker = root.join("restart_pending");
-    if !marker.exists() {
+    if !shared.restart_pending.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    let version = fs::read_to_string(&marker).unwrap_or_default();
-    let version = version.trim();
-    let ts = chrono::Local::now().format("%H:%M:%S");
-    println!("  [{ts}] 🔄 Deferred restart: all turns complete, restarting for v{version}...");
-    // Remove marker before exiting
-    let _ = fs::remove_file(&marker);
-    // Exit cleanly — launchd KeepAlive will restart us
-    std::process::exit(0);
+    // CAS: ensure this provider only decrements once
+    if shared.shutdown_counted.compare_exchange(
+        false, true,
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Relaxed,
+    ).is_err() {
+        return;
+    }
+    // Only the last provider to finish calls exit(0)
+    if shared.shutdown_remaining.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+        let Some(root) = crate::remotecc_runtime_root() else { return; };
+        let marker = root.join("restart_pending");
+        let version = fs::read_to_string(&marker).unwrap_or_default();
+        let version = version.trim();
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        println!("  [{ts}] 🔄 Deferred restart: all turns complete, restarting for v{version}...");
+        let _ = fs::remove_file(&marker);
+        std::process::exit(0);
+    }
 }
 
 /// Per-channel session state
@@ -243,6 +255,16 @@ pub(super) struct SharedData {
     pub(super) global_active: Arc<std::sync::atomic::AtomicUsize>,
     /// Process-global finalizing turn counter shared across all providers.
     pub(super) global_finalizing: Arc<std::sync::atomic::AtomicUsize>,
+    /// Number of providers still needing to complete shutdown.
+    /// The last provider to decrement this to 0 calls `exit(0)`.
+    pub(super) shutdown_remaining: Arc<std::sync::atomic::AtomicUsize>,
+    /// Per-provider flag: ensures this provider decrements `shutdown_remaining` at most once,
+    /// even if both the deferred restart poll loop and SIGTERM handler run.
+    pub(super) shutdown_counted: std::sync::atomic::AtomicBool,
+    /// Intake-level dedup cache: prevents the same message from starting two turns
+    /// when duplicate bot dispatches arrive nearly simultaneously.
+    /// Key: dedup key (dispatch_id or channel+author+text hash), Value: first-seen Instant.
+    pub(super) intake_dedup: dashmap::DashMap<String, std::time::Instant>,
 }
 
 /// Poise user data type
@@ -775,6 +797,7 @@ pub async fn run_bot(
     provider: ProviderKind,
     global_active: Arc<std::sync::atomic::AtomicUsize>,
     global_finalizing: Arc<std::sync::atomic::AtomicUsize>,
+    shutdown_remaining: Arc<std::sync::atomic::AtomicUsize>,
 ) {
     // Initialize debug logging from environment variable
     claude::init_debug_from_env();
@@ -820,6 +843,9 @@ pub async fn run_bot(
         restart_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         global_active,
         global_finalizing,
+        shutdown_remaining,
+        shutdown_counted: std::sync::atomic::AtomicBool::new(false),
+        intake_dedup: dashmap::DashMap::new(),
     });
 
     {
@@ -917,7 +943,9 @@ pub async fn run_bot(
                                     println!("  [{ts}] 📋 DRAIN: saved {queue_count} pending queue item(s) before deferred restart");
                                 }
                             }
-                            check_deferred_restart(g_active, g_finalizing);
+                            check_deferred_restart(&shared_for_deferred);
+                            // This provider has saved and decremented — stop polling
+                            return;
                         }
                     }
                 });
@@ -1142,7 +1170,17 @@ pub async fn run_bot(
                     }
                 }
 
-                std::process::exit(0);
+                // Wait for all providers to finish saving before exiting.
+                // CAS guard: skip if this provider already decremented via deferred restart path.
+                if shared_for_signal.shutdown_counted.compare_exchange(
+                    false, true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Relaxed,
+                ).is_ok() {
+                    if shared_for_signal.shutdown_remaining.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+                        std::process::exit(0);
+                    }
+                }
             }
         }
     });

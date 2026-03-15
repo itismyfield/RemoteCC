@@ -1084,11 +1084,13 @@ fn handle_dcserver(token: Option<String>) {
         match token {
             Some(token) => {
                 let provider = services::discord::resolve_discord_bot_provider(&token);
+                let shutdown_remaining = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
                 services::discord::run_bot(
                     &token,
                     provider,
                     global_active,
                     global_finalizing,
+                    shutdown_remaining,
                 )
                 .await;
             }
@@ -1114,12 +1116,16 @@ fn handle_dcserver(token: Option<String>) {
                         .join(", ")
                 );
 
+                let shutdown_remaining = std::sync::Arc::new(
+                    std::sync::atomic::AtomicUsize::new(configs.len()),
+                );
                 let mut tasks = Vec::new();
                 for config in configs {
                     let ga = global_active.clone();
                     let gf = global_finalizing.clone();
+                    let sr = shutdown_remaining.clone();
                     tasks.push(tokio::spawn(async move {
-                        services::discord::run_bot(&config.token, config.provider, ga, gf).await;
+                        services::discord::run_bot(&config.token, config.provider, ga, gf, sr).await;
                     }));
                 }
 

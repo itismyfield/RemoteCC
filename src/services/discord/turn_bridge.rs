@@ -705,18 +705,16 @@ pub(super) fn spawn_turn_bridge(
         clear_inflight_state(&provider, channel_id.get());
         shared_owned.recovering_channels.remove(&channel_id);
 
-        // Finalization complete — decrement counters and check deferred restart
+        // Finalization complete — decrement counters
         shared_owned
             .finalizing_turns
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        let g_finalizing = shared_owned
+        shared_owned
             .global_finalizing
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
-            - 1;
-        {
-            let g_active = shared_owned.global_active.load(std::sync::atomic::Ordering::Relaxed);
-            super::check_deferred_restart(g_active, g_finalizing);
-        }
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        // Note: deferred restart exit is handled by the 5-second poll loop in mod.rs,
+        // which saves pending queues before calling check_deferred_restart.
+        // Calling it here would risk exiting before other providers save their queues.
 
         if has_queued_turns {
             // Drain mode: if restart is pending, don't start new turns from queue.
