@@ -104,6 +104,21 @@ pub(super) async fn restore_inflight_turns(
                 "  [{ts}] ⏭ skipping inflight recovery for channel {}: old generation (born={}, current={})",
                 state.channel_id, state.born_generation, current_gen
             );
+            // Update the Discord message so "Processing..." doesn't stay forever
+            if state.current_msg_id != 0 {
+                let channel_id = ChannelId::new(state.channel_id);
+                let current_msg_id = MessageId::new(state.current_msg_id);
+                let stale_text =
+                    super::turn_bridge::stale_inflight_message(&state.full_response);
+                let _ = super::formatting::replace_long_message_raw(
+                    http,
+                    channel_id,
+                    current_msg_id,
+                    &stale_text,
+                    shared,
+                )
+                .await;
+            }
             clear_inflight_state(provider, state.channel_id);
             continue;
         }
