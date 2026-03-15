@@ -876,6 +876,7 @@ pub async fn run_bot(
                 cmd_down(),
                 cmd_shell(),
                 cmd_cc(),
+                cmd_queue(),
                 cmd_health(),
                 cmd_allowedtools(),
                 cmd_allowed(),
@@ -2253,6 +2254,129 @@ async fn build_inflight_report(
         current_section,
         saved_channels
     )
+}
+
+/// /queue — Show pending intervention queue state
+#[poise::command(slash_command, rename = "queue")]
+async fn cmd_queue(
+    ctx: Context<'_>,
+    #[description = "Show all channels (omit for current channel only)"] all: Option<bool>,
+) -> Result<(), Error> {
+    let user_id = ctx.author().id;
+    let user_name = &ctx.author().name;
+    if !check_auth(user_id, user_name, &ctx.data().shared, &ctx.data().token).await {
+        return Ok(());
+    }
+
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    println!("  [{ts}] ◀ [{user_name}] /queue");
+
+    let show_all = all.unwrap_or(false);
+    let text = build_queue_report(&ctx.data().shared, &ctx.data().provider, ctx.channel_id(), show_all).await;
+    send_long_message_ctx(ctx, &text).await?;
+    Ok(())
+}
+
+fn build_queue_report_sync(
+    data: &CoreState,
+    provider: &ProviderKind,
+    current_channel: ChannelId,
+    show_all: bool,
+) -> String {
+    let now = Instant::now();
+    let mut lines = Vec::new();
+
+    // In-memory queues
+    let channels: Vec<_> = if show_all {
+        data.intervention_queue.iter().collect()
+    } else {
+        data.intervention_queue
+            .get(&current_channel)
+            .map(|q| vec![(&current_channel, q)])
+            .unwrap_or_default()
+    };
+
+    let total_in_memory: usize = if show_all {
+        data.intervention_queue.values().map(|q| q.len()).sum()
+    } else {
+        channels.iter().map(|(_, q)| q.len()).sum()
+    };
+
+    lines.push(format!("**📋 Pending Queue{}**", if show_all { " (all channels)" } else { "" }));
+
+    if channels.is_empty() || total_in_memory == 0 {
+        lines.push("  In-memory: (empty)".to_string());
+    } else {
+        lines.push(format!("  In-memory: {} item(s)", total_in_memory));
+        for (ch_id, queue) in &channels {
+            if queue.is_empty() {
+                continue;
+            }
+            lines.push(format!("  **#{}** — {} queued", ch_id, queue.len()));
+            for (i, item) in queue.iter().enumerate().take(5) {
+                let age = now.duration_since(item.created_at).as_secs();
+                let preview = truncate_str(&item.text, 60);
+                lines.push(format!(
+                    "    {}. `<@{}>` {}s ago: {}",
+                    i + 1,
+                    item.author_id,
+                    age,
+                    preview
+                ));
+            }
+            if queue.len() > 5 {
+                lines.push(format!("    ... +{} more", queue.len() - 5));
+            }
+        }
+    }
+
+    // Disk-persisted queues
+    if let Some(root) = runtime_store::discord_pending_queue_root() {
+        let dir = root.join(provider.as_str());
+        if dir.is_dir() {
+            let mut disk_count = 0usize;
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    if entry.path().extension().map(|e| e == "json").unwrap_or(false) {
+                        if let Ok(contents) = std::fs::read_to_string(entry.path()) {
+                            if let Ok(items) = serde_json::from_str::<Vec<PendingQueueItem>>(&contents) {
+                                if !items.is_empty() {
+                                    let ch_name = entry.path().file_stem()
+                                        .map(|s| s.to_string_lossy().to_string())
+                                        .unwrap_or_default();
+                                    lines.push(format!("  **Disk** #{} — {} item(s)", ch_name, items.len()));
+                                    for (i, item) in items.iter().enumerate().take(3) {
+                                        let preview = truncate_str(&item.text, 60);
+                                        lines.push(format!("    {}. `<@{}>`: {}", i + 1, item.author_id, preview));
+                                    }
+                                    disk_count += items.len();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if disk_count > 0 {
+                lines.push(format!("  Disk total: {} item(s)", disk_count));
+            } else {
+                lines.push("  Disk: (empty)".to_string());
+            }
+        } else {
+            lines.push("  Disk: (no directory)".to_string());
+        }
+    }
+
+    lines.join("\n")
+}
+
+async fn build_queue_report(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    current_channel: ChannelId,
+    show_all: bool,
+) -> String {
+    let data = shared.core.lock().await;
+    build_queue_report_sync(&data, provider, current_channel, show_all)
 }
 
 /// /health — Show runtime health summary
