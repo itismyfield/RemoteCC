@@ -265,7 +265,9 @@ pub(super) async fn flush_restart_reports(
                     let data = shared.core.lock().await;
                     if let Some(queue) = data.intervention_queue.get(&channel_id) {
                         let items: Vec<String> = queue.iter().take(5).map(|item| {
-                            let preview: String = item.text.lines().next().unwrap_or("").chars().take(50).collect();
+                            let raw: String = item.text.lines().next().unwrap_or("").chars().take(50).collect();
+                            // Escape mentions to prevent re-triggering @everyone/@here/role/user mentions
+                            let preview = raw.replace('@', "@\u{200B}");
                             format!("• <@{}>: {}", item.author_id, preview)
                         }).collect();
                         if items.is_empty() {
