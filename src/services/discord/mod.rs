@@ -272,6 +272,9 @@ pub(super) struct SharedData {
     pub(super) bot_connected: std::sync::atomic::AtomicBool,
     /// ISO 8601 timestamp of the last completed turn (for health reporting).
     pub(super) last_turn_at: std::sync::Mutex<Option<String>>,
+    /// Per-channel model override, independent of session lifecycle.
+    /// Takes priority over role-map model. Cleared via `/model default`.
+    pub(super) model_overrides: dashmap::DashMap<ChannelId, String>,
 }
 
 /// Poise user data type
@@ -951,6 +954,7 @@ pub async fn run_bot(
         intake_dedup: dashmap::DashMap::new(),
         bot_connected: std::sync::atomic::AtomicBool::new(false),
         last_turn_at: std::sync::Mutex::new(None),
+        model_overrides: dashmap::DashMap::new(),
     });
 
     {
@@ -2418,37 +2422,39 @@ async fn cmd_model(
     let ts = chrono::Local::now().format("%H:%M:%S");
     let channel_id = ctx.channel_id();
 
+    // Model override only applies to Claude provider
+    if !matches!(ctx.data().provider, ProviderKind::Claude) {
+        println!("  [{ts}] ◀ [{user_name}] /model (unsupported provider)");
+        ctx.say("Model override is only supported for Claude channels.").await?;
+        return Ok(());
+    }
+
     match model {
         Some(m) => {
-            let value = if m == "default" || m == "none" || m == "clear" {
-                None
+            if m == "default" || m == "none" || m == "clear" {
+                ctx.data().shared.model_overrides.remove(&channel_id);
             } else {
-                Some(m.clone())
-            };
-            let mut data = ctx.data().shared.core.lock().await;
-            if let Some(session) = data.sessions.get_mut(&channel_id) {
-                session.model_override = value.clone();
+                ctx.data().shared.model_overrides.insert(channel_id, m.clone());
             }
-            drop(data);
-            let display = value.as_deref().unwrap_or("(default)");
+            let display = ctx.data().shared.model_overrides.get(&channel_id)
+                .map(|v| v.clone())
+                .unwrap_or_else(|| "(default)".to_string());
             println!("  [{ts}] ◀ [{user_name}] /model {m}");
             ctx.say(format!("Model set to **{display}** for this channel. Takes effect on next turn.")).await?;
         }
         None => {
-            let data = ctx.data().shared.core.lock().await;
-            let session_model = data.sessions.get(&channel_id)
-                .and_then(|s| s.model_override.clone());
-            drop(data);
+            let override_model = ctx.data().shared.model_overrides.get(&channel_id)
+                .map(|v| v.clone());
             let ch_name = {
                 let d = ctx.data().shared.core.lock().await;
                 d.sessions.get(&channel_id).and_then(|s| s.channel_name.clone())
             };
             let role_model = resolve_role_binding(channel_id, ch_name.as_deref())
                 .and_then(|rb| rb.model);
-            let effective = session_model.as_deref()
+            let effective = override_model.as_deref()
                 .or(role_model.as_deref())
                 .unwrap_or("(default)");
-            let source = if session_model.is_some() {
+            let source = if override_model.is_some() {
                 "runtime override"
             } else if role_model.is_some() {
                 "role-map"

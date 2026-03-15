@@ -813,17 +813,16 @@ pub(super) async fn handle_text_message(
         }
     }
 
-    // Resolve model: session override > role-map > default
+    // Resolve model: DashMap override > role-map > default
     let model_for_turn: Option<String> = {
-        let data = shared.core.lock().await;
-        let session_model = data.sessions.get(&channel_id)
-            .and_then(|s| s.model_override.clone());
-        if session_model.is_some() {
-            session_model
+        let dashmap_model = shared.model_overrides.get(&channel_id).map(|v| v.clone());
+        if dashmap_model.is_some() {
+            dashmap_model
         } else {
-            let ch_name = data.sessions.get(&channel_id)
-                .and_then(|s| s.channel_name.clone());
-            drop(data);
+            let ch_name = {
+                let data = shared.core.lock().await;
+                data.sessions.get(&channel_id).and_then(|s| s.channel_name.clone())
+            };
             resolve_role_binding(channel_id, ch_name.as_deref())
                 .and_then(|rb| rb.model)
         }
