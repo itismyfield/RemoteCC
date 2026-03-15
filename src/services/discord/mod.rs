@@ -537,7 +537,7 @@ async fn execute_handoff_turns(
             let mut data = shared.core.lock().await;
             let queue = data.intervention_queue.entry(channel_id).or_default();
             queue.push(Intervention {
-                author_id: serenity::UserId::new(0), // system-generated
+                author_id: serenity::UserId::new(1), // system-generated sentinel
                 message_id: placeholder.id,
                 text: handoff_prompt,
                 mode: InterventionMode::Soft,
@@ -597,7 +597,7 @@ async fn kickoff_idle_queues(
     );
 
     for (channel_id, intervention, has_more) in channels_to_kick {
-        let owner_name = if intervention.author_id.get() == 0 {
+        let owner_name = if intervention.author_id.get() <= 1 {
             "system".to_string()
         } else {
             intervention
