@@ -679,6 +679,7 @@ pub(super) async fn handle_text_message(
         data.cancel_tokens.insert(channel_id, cancel_token.clone());
         data.active_request_owner.insert(channel_id, request_owner);
     }
+    shared.turn_start_times.insert(channel_id, std::time::Instant::now());
 
     // Spawn turn watchdog — cancels the turn if it exceeds the timeout
     {

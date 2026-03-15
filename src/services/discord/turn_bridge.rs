@@ -650,6 +650,27 @@ pub(super) fn spawn_turn_bridge(
             if let Ok(mut last) = shared_owned.last_turn_at.lock() {
                 *last = Some(chrono::Local::now().to_rfc3339());
             }
+
+            // Record turn metrics
+            {
+                let duration = shared_owned.turn_start_times
+                    .remove(&channel_id)
+                    .map(|(_, start)| start.elapsed().as_secs_f64())
+                    .unwrap_or(0.0);
+                let provider_name = {
+                    let settings = shared_owned.settings.read().await;
+                    settings.provider.as_str().to_string()
+                };
+                super::metrics::record_turn(&super::metrics::TurnMetric {
+                    channel_id: channel_id.get(),
+                    provider: provider_name,
+                    timestamp: chrono::Local::now().to_rfc3339(),
+                    duration_secs: duration,
+                    model: None, // model info from StatusUpdate not yet accumulated in turn_bridge
+                    input_tokens: if accumulated_tokens > 0 { Some(accumulated_tokens) } else { None },
+                    output_tokens: None, // output tokens tracked separately if needed
+                });
+            }
         }
 
         if should_resume_watcher_after_turn(

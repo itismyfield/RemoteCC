@@ -2,6 +2,7 @@ mod formatting;
 mod handoff;
 pub(crate) mod health;
 mod inflight;
+mod metrics;
 mod meeting;
 mod pcd;
 mod prompt_builder;
@@ -303,6 +304,8 @@ pub(super) struct SharedData {
     pub(super) model_overrides: dashmap::DashMap<ChannelId, String>,
     /// Per-channel last processed message ID — used for startup catch-up polling.
     pub(super) last_message_ids: dashmap::DashMap<ChannelId, u64>,
+    /// Per-channel turn start time — used for metrics duration calculation.
+    pub(super) turn_start_times: dashmap::DashMap<ChannelId, std::time::Instant>,
 }
 
 /// Poise user data type
@@ -1116,6 +1119,7 @@ pub async fn run_bot(
         last_turn_at: std::sync::Mutex::new(None),
         model_overrides: dashmap::DashMap::new(),
         last_message_ids: dashmap::DashMap::new(),
+        turn_start_times: dashmap::DashMap::new(),
     });
 
     {
@@ -1144,6 +1148,7 @@ pub async fn run_bot(
                 cmd_down(),
                 cmd_shell(),
                 cmd_cc(),
+                cmd_metrics(),
                 cmd_model(),
                 cmd_queue(),
                 cmd_health(),
@@ -2586,6 +2591,31 @@ async fn build_inflight_report(
         current_section,
         saved_channels
     )
+}
+
+/// /metrics — Show turn metrics summary
+#[poise::command(slash_command, rename = "metrics")]
+async fn cmd_metrics(
+    ctx: Context<'_>,
+    #[description = "Date (YYYY-MM-DD), default today"] date: Option<String>,
+) -> Result<(), Error> {
+    let user_id = ctx.author().id;
+    let user_name = &ctx.author().name;
+    if !check_auth(user_id, user_name, &ctx.data().shared, &ctx.data().token).await {
+        return Ok(());
+    }
+
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    println!("  [{ts}] ◀ [{user_name}] /metrics");
+
+    let data = match &date {
+        Some(d) => metrics::load_date(d),
+        None => metrics::load_today(),
+    };
+    let label_owned = date.as_deref().unwrap_or("today");
+    let text = metrics::build_metrics_report(&data, label_owned);
+    send_long_message_ctx(ctx, &text).await?;
+    Ok(())
 }
 
 /// /model — Set or view the model override for this channel
