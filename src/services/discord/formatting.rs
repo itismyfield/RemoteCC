@@ -876,9 +876,9 @@ pub(super) fn resolve_raw_tool_status<'a>(
 
 /// Convert a technical tool status line into a human-friendly label with emoji.
 pub(super) fn humanize_tool_status(tool_line: &str) -> String {
-    // Thinking: pass through as-is (already formatted with 💭 prefix)
+    // Thinking: show full text, but cap at 500 chars to leave room for message body
     if tool_line.starts_with("💭") {
-        return tool_line.to_string();
+        return truncate_for_status(tool_line, 500);
     }
     // Everything else: show the raw tool line, truncated
     truncate_for_status(tool_line, 80)

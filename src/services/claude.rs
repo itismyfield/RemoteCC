@@ -1455,12 +1455,12 @@ fn parse_stream_message(json: &Value) -> Option<StreamMessage> {
                     }
                     "thinking" => {
                         has_thinking = true;
-                        // Extract first non-empty line as topic hint
+                        // Extract full thinking text
                         thinking_summary = item
                             .get("thinking")
                             .and_then(|v| v.as_str())
-                            .and_then(|t| t.lines().find(|l| !l.trim().is_empty()))
-                            .map(|l| l.trim().to_string());
+                            .map(|t| t.trim().to_string())
+                            .filter(|t| !t.is_empty());
                     }
                     _ => {}
                 }

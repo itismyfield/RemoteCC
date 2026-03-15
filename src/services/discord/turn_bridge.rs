@@ -187,8 +187,7 @@ pub(super) fn spawn_turn_bridge(
                         }
                         StreamMessage::Thinking { summary } => {
                             let display = if let Some(ref s) = summary {
-                                let hint = truncate_str(s, 80);
-                                format!("💭 {hint}")
+                                format!("💭 {s}")
                             } else {
                                 "💭 Thinking...".to_string()
                             };

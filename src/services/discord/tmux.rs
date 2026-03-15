@@ -403,12 +403,18 @@ pub(super) async fn tmux_output_watcher(
 pub(super) struct WatcherToolState {
     /// Current tool status line (e.g. "⚙ Bash: `ls`")
     pub current_tool_line: Option<String>,
+    /// Accumulated thinking text from streaming deltas
+    pub thinking_buffer: String,
+    /// Whether we are currently inside a thinking block
+    pub in_thinking: bool,
 }
 
 impl WatcherToolState {
     pub fn new() -> Self {
         Self {
             current_tool_line: None,
+            thinking_buffer: String::new(),
+            in_thinking: false,
         }
     }
 }
@@ -480,6 +486,8 @@ pub(super) fn process_watcher_lines(
                     if let Some(cb) = val.get("content_block") {
                         let cb_type = cb.get("type").and_then(|t| t.as_str());
                         if cb_type == Some("thinking") {
+                            tool_state.in_thinking = true;
+                            tool_state.thinking_buffer.clear();
                             tool_state.current_tool_line = Some("💭 Thinking...".to_string());
                         } else if cb_type == Some("tool_use") {
                             let name = cb.get("name").and_then(|n| n.as_str()).unwrap_or("Tool");
@@ -489,15 +497,29 @@ pub(super) fn process_watcher_lines(
                 }
                 "content_block_delta" => {
                     if let Some(delta) = val.get("delta") {
-                        if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
+                        if let Some(thinking) = delta.get("thinking").and_then(|t| t.as_str()) {
+                            // Accumulate thinking text and update display
+                            tool_state.thinking_buffer.push_str(thinking);
+                            let display = tool_state.thinking_buffer.trim().to_string();
+                            if !display.is_empty() {
+                                tool_state.current_tool_line = Some(format!("💭 {display}"));
+                            }
+                        } else if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
                             full_response.push_str(text);
                             tool_state.current_tool_line = None;
                         }
                     }
                 }
                 "content_block_stop" => {
-                    // Tool completed — mark with checkmark
-                    if let Some(ref line) = tool_state.current_tool_line {
+                    if tool_state.in_thinking {
+                        // Thinking block completed — show full text
+                        tool_state.in_thinking = false;
+                        let display = tool_state.thinking_buffer.trim().to_string();
+                        if !display.is_empty() {
+                            tool_state.current_tool_line = Some(format!("💭 {display}"));
+                        }
+                    } else if let Some(ref line) = tool_state.current_tool_line {
+                        // Tool completed — mark with checkmark
                         if line.starts_with("⚙") {
                             tool_state.current_tool_line = Some(line.replacen("⚙", "✓", 1));
                         }
