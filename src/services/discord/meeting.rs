@@ -795,6 +795,7 @@ async fn execute_agent_turn(
             role_id: participant.role_id.clone(),
             prompt_file: participant.prompt_file.clone(),
             provider: None,
+            model: None,
         })
         .unwrap_or_default()
     } else {
@@ -1001,6 +1002,7 @@ async fn conclude_meeting(
             role_id: resolved_summary_agent.clone(),
             prompt_file: summary_prompt_file,
             provider: None,
+            model: None,
         })
         .unwrap_or_default()
     } else {

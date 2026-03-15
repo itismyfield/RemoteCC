@@ -40,6 +40,8 @@ pub(super) struct RoleBinding {
     pub role_id: String,
     pub prompt_file: String,
     pub provider: Option<ProviderKind>,
+    /// Optional model override (e.g. "opus", "sonnet", "haiku")
+    pub model: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

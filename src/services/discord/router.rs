@@ -466,6 +466,7 @@ pub(super) async fn handle_text_message(
                                     worktree: None,
                                     last_shared_memory_ts: None,
                                     born_generation: super::runtime_store::load_generation(),
+                                    model_override: None,
                                 });
                         session.current_path = Some(eff_path.clone());
                         session.channel_name = ch_name_resolved;
@@ -812,6 +813,22 @@ pub(super) async fn handle_text_message(
         }
     }
 
+    // Resolve model: session override > role-map > default
+    let model_for_turn: Option<String> = {
+        let data = shared.core.lock().await;
+        let session_model = data.sessions.get(&channel_id)
+            .and_then(|s| s.model_override.clone());
+        if session_model.is_some() {
+            session_model
+        } else {
+            let ch_name = data.sessions.get(&channel_id)
+                .and_then(|s| s.channel_name.clone());
+            drop(data);
+            resolve_role_binding(channel_id, ch_name.as_deref())
+                .and_then(|rb| rb.model)
+        }
+    };
+
     // Run the provider in a blocking thread
     let provider_for_blocking = provider.clone();
     tokio::task::spawn_blocking(move || {
@@ -828,6 +845,7 @@ pub(super) async fn handle_text_message(
                 tmux_session_name.as_deref(),
                 Some(channel_id.get()),
                 Some(provider_for_blocking.clone()),
+                model_for_turn.as_deref(),
             ),
             ProviderKind::Codex => codex::execute_command_streaming(
                 &context_prompt,

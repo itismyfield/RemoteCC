@@ -584,6 +584,7 @@ pub fn execute_command_streaming(
     tmux_session_name: Option<&str>,
     report_channel_id: Option<u64>,
     report_provider: Option<ProviderKind>,
+    model_override: Option<&str>,
 ) -> Result<(), String> {
     debug_log("========================================");
     debug_log("=== execute_command_streaming START ===");
@@ -636,6 +637,12 @@ IMPORTANT: Format your responses using Markdown for better readability:
         "--output-format".to_string(),
         "stream-json".to_string(),
     ];
+
+    // Apply model override if specified (e.g. "opus", "sonnet", "haiku")
+    if let Some(model) = model_override {
+        args.push("--model".to_string());
+        args.push(model.to_string());
+    }
 
     // Append system prompt based on parameter
     let effective_prompt = match system_prompt {

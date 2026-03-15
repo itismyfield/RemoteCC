@@ -138,6 +138,8 @@ pub(super) struct DiscordSession {
     pub(super) last_shared_memory_ts: Option<String>,
     /// Restart generation at which this session was created/restored.
     pub(super) born_generation: u64,
+    /// Runtime model override (e.g. "opus", "sonnet"). None = use default.
+    pub(super) model_override: Option<String>,
 }
 
 /// Worktree info for sessions that were auto-redirected to avoid conflicts
@@ -977,6 +979,7 @@ pub async fn run_bot(
                 cmd_down(),
                 cmd_shell(),
                 cmd_cc(),
+                cmd_model(),
                 cmd_queue(),
                 cmd_health(),
                 cmd_allowedtools(),
@@ -1865,6 +1868,7 @@ async fn cmd_start(
                 worktree: None,
                 last_shared_memory_ts: None,
                 born_generation: runtime_store::load_generation(),
+                model_override: None,
             });
         session.channel_id = Some(channel_id.get());
         session.channel_name = ch_name;
@@ -2397,6 +2401,65 @@ async fn build_inflight_report(
         current_section,
         saved_channels
     )
+}
+
+/// /model — Set or view the model override for this channel
+#[poise::command(slash_command, rename = "model")]
+async fn cmd_model(
+    ctx: Context<'_>,
+    #[description = "Model name (opus/sonnet/haiku) or 'default' to clear"] model: Option<String>,
+) -> Result<(), Error> {
+    let user_id = ctx.author().id;
+    let user_name = &ctx.author().name;
+    if !check_auth(user_id, user_name, &ctx.data().shared, &ctx.data().token).await {
+        return Ok(());
+    }
+
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    let channel_id = ctx.channel_id();
+
+    match model {
+        Some(m) => {
+            let value = if m == "default" || m == "none" || m == "clear" {
+                None
+            } else {
+                Some(m.clone())
+            };
+            let mut data = ctx.data().shared.core.lock().await;
+            if let Some(session) = data.sessions.get_mut(&channel_id) {
+                session.model_override = value.clone();
+            }
+            drop(data);
+            let display = value.as_deref().unwrap_or("(default)");
+            println!("  [{ts}] ◀ [{user_name}] /model {m}");
+            ctx.say(format!("Model set to **{display}** for this channel. Takes effect on next turn.")).await?;
+        }
+        None => {
+            let data = ctx.data().shared.core.lock().await;
+            let session_model = data.sessions.get(&channel_id)
+                .and_then(|s| s.model_override.clone());
+            drop(data);
+            let ch_name = {
+                let d = ctx.data().shared.core.lock().await;
+                d.sessions.get(&channel_id).and_then(|s| s.channel_name.clone())
+            };
+            let role_model = resolve_role_binding(channel_id, ch_name.as_deref())
+                .and_then(|rb| rb.model);
+            let effective = session_model.as_deref()
+                .or(role_model.as_deref())
+                .unwrap_or("(default)");
+            let source = if session_model.is_some() {
+                "runtime override"
+            } else if role_model.is_some() {
+                "role-map"
+            } else {
+                "system default"
+            };
+            println!("  [{ts}] ◀ [{user_name}] /model");
+            ctx.say(format!("Model: **{effective}** (source: {source})")).await?;
+        }
+    }
+    Ok(())
 }
 
 /// /queue — Show pending intervention queue state
@@ -3698,6 +3761,7 @@ async fn auto_restore_session(
                     worktree: None,
                     last_shared_memory_ts: None,
                     born_generation: runtime_store::load_generation(),
+                    model_override: None,
                 });
             session.channel_id = Some(channel_id.get());
             session.last_active = tokio::time::Instant::now();
@@ -3763,6 +3827,7 @@ async fn bootstrap_thread_session(
             worktree: None,
             last_shared_memory_ts: None,
             born_generation: runtime_store::load_generation(),
+            model_override: None,
         });
     session.current_path = Some(parent_path.to_string());
     if let Some((session_data, _)) = existing {

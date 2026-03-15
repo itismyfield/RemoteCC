@@ -1008,6 +1008,7 @@ Keep responses concise and terminal-friendly.",
                 None, // no tmux for TUI (user is already at terminal)
                 None,
                 None,
+                None, // no model override for TUI
             );
 
             let elapsed = start_time.elapsed();
