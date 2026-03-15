@@ -1,5 +1,6 @@
 mod formatting;
 mod handoff;
+pub(crate) mod health;
 mod inflight;
 mod meeting;
 mod pcd;
@@ -219,7 +220,7 @@ pub(super) struct CoreState {
     pub(super) active_request_owner: HashMap<ChannelId, UserId>,
     /// Per-channel message queue: messages arriving during an active turn are queued here
     /// and executed as subsequent turns after the current one finishes.
-    intervention_queue: HashMap<ChannelId, Vec<Intervention>>,
+    pub(super) intervention_queue: HashMap<ChannelId, Vec<Intervention>>,
     /// Per-channel active meeting (one meeting per channel)
     active_meetings: HashMap<ChannelId, meeting::Meeting>,
 }
@@ -798,6 +799,7 @@ pub async fn run_bot(
     global_active: Arc<std::sync::atomic::AtomicUsize>,
     global_finalizing: Arc<std::sync::atomic::AtomicUsize>,
     shutdown_remaining: Arc<std::sync::atomic::AtomicUsize>,
+    health_registry: Arc<health::HealthRegistry>,
 ) {
     // Initialize debug logging from environment variable
     claude::init_debug_from_env();
@@ -855,6 +857,9 @@ pub async fn run_bot(
             shared.current_generation
         );
     }
+
+    // Register this provider with the health check registry
+    health_registry.register(provider.as_str().to_string(), shared.clone()).await;
 
     let token_owned = token.to_string();
     let shared_clone = shared.clone();

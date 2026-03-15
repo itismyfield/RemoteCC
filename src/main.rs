@@ -1081,6 +1081,15 @@ fn handle_dcserver(token: Option<String>) {
         // Process-global counters shared across all providers for deferred restart barrier
         let global_active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let global_finalizing = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        // Health check HTTP server (shared across all providers)
+        let health_registry = std::sync::Arc::new(services::discord::health::HealthRegistry::new());
+        let health_port = services::discord::health::resolve_port();
+        let health_reg_clone = health_registry.clone();
+        tokio::spawn(async move {
+            services::discord::health::serve(health_reg_clone, health_port).await;
+        });
+
         match token {
             Some(token) => {
                 let provider = services::discord::resolve_discord_bot_provider(&token);
@@ -1091,6 +1100,7 @@ fn handle_dcserver(token: Option<String>) {
                     global_active,
                     global_finalizing,
                     shutdown_remaining,
+                    health_registry,
                 )
                 .await;
             }
@@ -1124,8 +1134,9 @@ fn handle_dcserver(token: Option<String>) {
                     let ga = global_active.clone();
                     let gf = global_finalizing.clone();
                     let sr = shutdown_remaining.clone();
+                    let hr = health_registry.clone();
                     tasks.push(tokio::spawn(async move {
-                        services::discord::run_bot(&config.token, config.provider, ga, gf, sr).await;
+                        services::discord::run_bot(&config.token, config.provider, ga, gf, sr, hr).await;
                     }));
                 }
 
