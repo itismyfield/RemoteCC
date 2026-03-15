@@ -1421,12 +1421,73 @@ pub async fn run_bot(
                 // Active turns may also finish during this window.
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
+                // ── Critical state persistence (MUST run before any I/O) ──
+                // Save pending queues and last_message_ids FIRST, before any
+                // network calls that might block/timeout and prevent saving.
+
+                // Persist pending intervention queues so they survive restart
+                {
+                    let data = shared_for_signal.core.lock().await;
+                    let queue_count: usize =
+                        data.intervention_queue.values().map(|q| q.len()).sum();
+                    if queue_count > 0 {
+                        save_pending_queues(&provider_for_shutdown, &data.intervention_queue);
+                        let ts3 = chrono::Local::now().format("%H:%M:%S");
+                        println!("  [{ts3}] 📋 saved {queue_count} pending queue item(s) to disk");
+                    }
+                }
+
+                // Persist last_message_ids for catch-up polling after restart
+                {
+                    let ids: std::collections::HashMap<u64, u64> = shared_for_signal
+                        .last_message_ids.iter()
+                        .map(|entry| (entry.key().get(), *entry.value()))
+                        .collect();
+                    if !ids.is_empty() {
+                        runtime_store::save_all_last_message_ids(provider_for_shutdown.as_str(), &ids);
+                    }
+                }
+
+                // ── Inflight state & restart reports ──
                 // Create restart reports AFTER grace period so that turns that
                 // completed (and cleared their inflight state) during the window
                 // are not given a spurious recovery follow-up.
                 let inflight_states = inflight::load_inflight_states(&provider_for_shutdown);
 
-                // Update in-flight placeholder messages to indicate restart
+                for state in &inflight_states {
+                    // Skip only if a "pending" report exists (from --restart-dcserver).
+                    // Overwrite any other stale/failed report so the latest SIGTERM wins.
+                    let existing = restart_report::load_restart_report(&provider_for_shutdown, state.channel_id);
+                    if existing.as_ref().map(|r| r.status.as_str()) == Some("pending") {
+                        continue;
+                    }
+                    let mut report = restart_report::RestartCompletionReport::new(
+                        provider_for_shutdown.clone(),
+                        state.channel_id,
+                        "sigterm",
+                        "dcserver가 SIGTERM으로 종료되었습니다. 재시작 후 작업을 이어받습니다.",
+                    );
+                    report.current_msg_id = Some(state.current_msg_id);
+                    report.channel_name = state.channel_name.clone();
+                    report.user_msg_id = Some(state.user_msg_id);
+                    if let Err(e) = restart_report::save_restart_report(&report) {
+                        eprintln!(
+                            "  ⚠ failed to save restart report for channel {}: {e}",
+                            state.channel_id
+                        );
+                    }
+                }
+                if !inflight_states.is_empty() {
+                    let ts2 = chrono::Local::now().format("%H:%M:%S");
+                    println!(
+                        "  [{ts2}] 📝 saved {} restart report(s) for inflight channels",
+                        inflight_states.len()
+                    );
+                }
+
+                // ── Best-effort Discord UI updates (may block on network) ──
+                // Update in-flight placeholder messages to indicate restart.
+                // This runs AFTER critical state is already persisted to disk.
                 if !inflight_states.is_empty() {
                     let http = serenity::Http::new(&token_for_signal);
                     for state in &inflight_states {
@@ -1461,60 +1522,6 @@ pub async fn run_bot(
                                 );
                             }
                         }
-                    }
-                }
-
-                for state in &inflight_states {
-                    // Skip only if a "pending" report exists (from --restart-dcserver).
-                    // Overwrite any other stale/failed report so the latest SIGTERM wins.
-                    let existing = restart_report::load_restart_report(&provider_for_shutdown, state.channel_id);
-                    if existing.as_ref().map(|r| r.status.as_str()) == Some("pending") {
-                        continue;
-                    }
-                    let mut report = restart_report::RestartCompletionReport::new(
-                        provider_for_shutdown.clone(),
-                        state.channel_id,
-                        "sigterm",
-                        "dcserver가 SIGTERM으로 종료되었습니다. 재시작 후 작업을 이어받습니다.",
-                    );
-                    report.current_msg_id = Some(state.current_msg_id);
-                    report.channel_name = state.channel_name.clone();
-                    report.user_msg_id = Some(state.user_msg_id);
-                    if let Err(e) = restart_report::save_restart_report(&report) {
-                        eprintln!(
-                            "  ⚠ failed to save restart report for channel {}: {e}",
-                            state.channel_id
-                        );
-                    }
-                }
-                if !inflight_states.is_empty() {
-                    let ts2 = chrono::Local::now().format("%H:%M:%S");
-                    println!(
-                        "  [{ts2}] 📝 saved {} restart report(s) for inflight channels",
-                        inflight_states.len()
-                    );
-                }
-
-                // Persist pending intervention queues so they survive restart
-                {
-                    let data = shared_for_signal.core.lock().await;
-                    let queue_count: usize =
-                        data.intervention_queue.values().map(|q| q.len()).sum();
-                    if queue_count > 0 {
-                        save_pending_queues(&provider_for_shutdown, &data.intervention_queue);
-                        let ts3 = chrono::Local::now().format("%H:%M:%S");
-                        println!("  [{ts3}] 📋 saved {queue_count} pending queue item(s) to disk");
-                    }
-                }
-
-                // Persist last_message_ids for catch-up polling after restart
-                {
-                    let ids: std::collections::HashMap<u64, u64> = shared_for_signal
-                        .last_message_ids.iter()
-                        .map(|entry| (entry.key().get(), *entry.value()))
-                        .collect();
-                    if !ids.is_empty() {
-                        runtime_store::save_all_last_message_ids(provider_for_shutdown.as_str(), &ids);
                     }
                 }
 
