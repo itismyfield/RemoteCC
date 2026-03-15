@@ -354,7 +354,7 @@ pub(super) fn spawn_turn_bridge(
                                 shared_owned.tmux_watchers.contains_key(&channel_id);
                             if !already_watching {
                                 let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                                let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                let paused = Arc::new(std::sync::atomic::AtomicBool::new(true));
                                 let resume_offset = Arc::new(std::sync::Mutex::new(None::<u64>));
                                 let handle = TmuxWatcherHandle {
                                     paused: paused.clone(),
