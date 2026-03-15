@@ -2330,28 +2330,46 @@ fn build_queue_report_sync(
         }
     }
 
-    // Disk-persisted queues
+    // Disk-persisted queues (scoped to current_channel unless show_all)
     if let Some(root) = runtime_store::discord_pending_queue_root() {
         let dir = root.join(provider.as_str());
         if dir.is_dir() {
             let mut disk_count = 0usize;
-            if let Ok(entries) = std::fs::read_dir(&dir) {
-                for entry in entries.flatten() {
-                    if entry.path().extension().map(|e| e == "json").unwrap_or(false) {
-                        if let Ok(contents) = std::fs::read_to_string(entry.path()) {
-                            if let Ok(items) = serde_json::from_str::<Vec<PendingQueueItem>>(&contents) {
-                                if !items.is_empty() {
-                                    let ch_name = entry.path().file_stem()
-                                        .map(|s| s.to_string_lossy().to_string())
-                                        .unwrap_or_default();
-                                    lines.push(format!("  **Disk** #{} — {} item(s)", ch_name, items.len()));
-                                    for (i, item) in items.iter().enumerate().take(3) {
-                                        let preview = truncate_str(&item.text, 60);
-                                        lines.push(format!("    {}. `<@{}>`: {}", i + 1, item.author_id, preview));
-                                    }
-                                    disk_count += items.len();
-                                }
+            let target_file = if show_all {
+                None
+            } else {
+                Some(dir.join(format!("{}.json", current_channel)))
+            };
+            let paths: Vec<std::path::PathBuf> = if let Some(ref tf) = target_file {
+                if tf.is_file() { vec![tf.clone()] } else { vec![] }
+            } else if let Ok(entries) = std::fs::read_dir(&dir) {
+                entries.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().map(|e| e == "json").unwrap_or(false))
+                    .collect()
+            } else {
+                vec![]
+            };
+            for path in &paths {
+                if let Ok(contents) = std::fs::read_to_string(path) {
+                    if let Ok(items) = serde_json::from_str::<Vec<PendingQueueItem>>(&contents) {
+                        if !items.is_empty() {
+                            let ch_name = path.file_stem()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            // Use file mtime as approximate queue age
+                            let age_str = std::fs::metadata(path)
+                                .and_then(|m| m.modified())
+                                .ok()
+                                .and_then(|mt| std::time::SystemTime::now().duration_since(mt).ok())
+                                .map(|d| format!(" (saved ~{}s ago)", d.as_secs()))
+                                .unwrap_or_default();
+                            lines.push(format!("  **Disk** #{} — {} item(s){}", ch_name, items.len(), age_str));
+                            for (i, item) in items.iter().enumerate().take(3) {
+                                let preview = truncate_str(&item.text, 60);
+                                lines.push(format!("    {}. `<@{}>`: {}", i + 1, item.author_id, preview));
                             }
+                            disk_count += items.len();
                         }
                     }
                 }
