@@ -266,6 +266,10 @@ pub(super) struct SharedData {
     /// when duplicate bot dispatches arrive nearly simultaneously.
     /// Key: dedup key (dispatch_id or channel+author+text hash), Value: first-seen Instant.
     pub(super) intake_dedup: dashmap::DashMap<String, std::time::Instant>,
+    /// Set to true after Discord gateway ready event fires.
+    pub(super) bot_connected: std::sync::atomic::AtomicBool,
+    /// ISO 8601 timestamp of the last completed turn (for health reporting).
+    pub(super) last_turn_at: std::sync::Mutex<Option<String>>,
 }
 
 /// Poise user data type
@@ -902,6 +906,8 @@ pub async fn run_bot(
         shutdown_remaining,
         shutdown_counted: std::sync::atomic::AtomicBool::new(false),
         intake_dedup: dashmap::DashMap::new(),
+        bot_connected: std::sync::atomic::AtomicBool::new(false),
+        last_turn_at: std::sync::Mutex::new(None),
     });
 
     {
@@ -964,6 +970,7 @@ pub async fn run_bot(
                     "  ✓ Bot connected — Registered commands in {} guild(s)",
                     _ready.guilds.len()
                 );
+                shared_for_migrate.bot_connected.store(true, std::sync::atomic::Ordering::SeqCst);
 
                 // Background: resolve category names for all known channels
                 let shared_for_tmux = shared_for_migrate.clone();

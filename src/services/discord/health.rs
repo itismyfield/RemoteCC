@@ -100,10 +100,16 @@ async fn build_health_json(registry: &HealthRegistry) -> String {
         drop(data);
 
         let restart_pending = entry.shared.restart_pending.load(std::sync::atomic::Ordering::Relaxed);
+        let connected = entry.shared.bot_connected.load(std::sync::atomic::Ordering::Relaxed);
+        let last_turn_at = entry.shared.last_turn_at.lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .map(|t| format!(r#""{}""#, t))
+            .unwrap_or_else(|| "null".to_string());
 
         provider_entries.push(format!(
-            r#"{{"name":"{}","active_turns":{},"queue_depth":{},"sessions":{},"restart_pending":{}}}"#,
-            entry.name, active_turns, queue_depth, session_count, restart_pending
+            r#"{{"name":"{}","connected":{},"active_turns":{},"queue_depth":{},"sessions":{},"restart_pending":{},"last_turn_at":{}}}"#,
+            entry.name, connected, active_turns, queue_depth, session_count, restart_pending, last_turn_at
         ));
     }
 
@@ -139,8 +145,12 @@ fn is_healthy_inner(providers: &[ProviderEntry]) -> bool {
     if providers.is_empty() {
         return false;
     }
-    // Unhealthy if restart is pending (draining)
     for p in providers {
+        // Unhealthy if any provider hasn't connected to Discord gateway yet
+        if !p.shared.bot_connected.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        // Unhealthy if restart is pending (draining)
         if p.shared.restart_pending.load(std::sync::atomic::Ordering::Relaxed) {
             return false;
         }

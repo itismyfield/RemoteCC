@@ -634,6 +634,9 @@ pub(super) fn spawn_turn_bridge(
 
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!("  [{ts}] ▶ Response sent");
+            if let Ok(mut last) = shared_owned.last_turn_at.lock() {
+                *last = Some(chrono::Local::now().to_rfc3339());
+            }
         }
 
         if should_resume_watcher_after_turn(
