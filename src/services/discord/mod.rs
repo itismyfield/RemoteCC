@@ -840,6 +840,47 @@ fn skill_dir_fingerprint(provider: &ProviderKind) -> (usize, u64) {
     (count, max_mtime)
 }
 
+/// Like `skill_dir_fingerprint` but also includes project-level skill directories.
+fn skill_dir_fingerprint_with_projects(provider: &ProviderKind, project_paths: &[String]) -> (usize, u64) {
+    let (mut count, mut max_mtime) = skill_dir_fingerprint(provider);
+
+    fn walk_mtime(dir: &Path, count: &mut usize, max_mtime: &mut u64) {
+        let Ok(entries) = fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk_mtime(&path, count, max_mtime);
+            } else if path.extension().map(|e| e == "md").unwrap_or(false) {
+                *count += 1;
+                if let Ok(meta) = fs::metadata(&path) {
+                    if let Ok(mt) = meta.modified() {
+                        let epoch = mt
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        if epoch > *max_mtime {
+                            *max_mtime = epoch;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for path in project_paths {
+        let proj_dir = match provider {
+            ProviderKind::Claude => Path::new(path).join(".claude").join("commands"),
+            ProviderKind::Codex => Path::new(path).join(".codex").join("skills"),
+            _ => continue,
+        };
+        if proj_dir.is_dir() {
+            walk_mtime(&proj_dir, &mut count, &mut max_mtime);
+        }
+    }
+
+    (count, max_mtime)
+}
+
 fn resolve_codex_skill_file(path: &Path) -> Option<std::path::PathBuf> {
     if path.is_dir() {
         let skill_path = path.join("SKILL.md");
@@ -1018,17 +1059,39 @@ pub async fn run_bot(
                 });
 
                 // Background: hot-reload skills on file changes (10s polling)
+                // Scans home-level AND all active project-level skill directories.
                 let shared_for_skills = shared_for_tmux.clone();
                 let provider_for_skills = provider.clone();
                 tokio::spawn(async move {
                     let mut last_fingerprint: (usize, u64) = (0, 0); // (file_count, max_mtime_epoch)
                     loop {
                         tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-                        let fp = skill_dir_fingerprint(&provider_for_skills);
+                        // Collect unique project paths from active sessions
+                        let project_paths: Vec<String> = {
+                            let data = shared_for_skills.core.lock().await;
+                            let mut paths: Vec<String> = data.sessions.values()
+                                .filter_map(|s| s.current_path.clone())
+                                .collect();
+                            paths.sort();
+                            paths.dedup();
+                            paths
+                        };
+                        let fp = skill_dir_fingerprint_with_projects(&provider_for_skills, &project_paths);
                         if fp != last_fingerprint && last_fingerprint != (0, 0) {
-                            let new_skills = scan_skills(&provider_for_skills, None);
-                            let count = new_skills.len();
-                            *shared_for_skills.skills_cache.write().await = new_skills;
+                            // Merge home + all project skills (scan_skills deduplicates by name)
+                            let mut merged = scan_skills(&provider_for_skills, None);
+                            let mut seen: std::collections::HashSet<String> =
+                                merged.iter().map(|(n, _)| n.clone()).collect();
+                            for path in &project_paths {
+                                for skill in scan_skills(&provider_for_skills, Some(path)) {
+                                    if seen.insert(skill.0.clone()) {
+                                        merged.push(skill);
+                                    }
+                                }
+                            }
+                            merged.sort_by(|a, b| a.0.cmp(&b.0));
+                            let count = merged.len();
+                            *shared_for_skills.skills_cache.write().await = merged;
                             let ts = chrono::Local::now().format("%H:%M:%S");
                             println!("  [{ts}] 🔄 Skills hot-reloaded: {count} skill(s) ({} files, mtime Δ)", fp.0);
                         }
