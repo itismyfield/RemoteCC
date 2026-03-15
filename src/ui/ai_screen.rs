@@ -1150,7 +1150,7 @@ Keep responses concise and terminal-friendly.",
                 StreamMessage::OutputOffset { .. } => {
                     // Ignored in TUI (only used for Discord restart recovery)
                 }
-                StreamMessage::Thinking => {
+                StreamMessage::Thinking { .. } => {
                     // Ignored in TUI (CoT indicator only used for Discord)
                 }
             }

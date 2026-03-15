@@ -184,8 +184,8 @@ pub enum StreamMessage {
     ToolUse { name: String, input: String },
     /// Tool execution result
     ToolResult { content: String, is_error: bool },
-    /// Chain-of-thought thinking block (signal only, no content forwarded)
-    Thinking,
+    /// Chain-of-thought thinking block with optional topic summary
+    Thinking { summary: Option<String> },
     /// Background task notification
     TaskNotification {
         task_id: String,
@@ -991,7 +991,7 @@ IMPORTANT: Format your responses using Markdown for better readability:
                     StreamMessage::OutputOffset { offset } => {
                         debug_log(&format!("  >>> OutputOffset: {offset}"));
                     }
-                    StreamMessage::Thinking => {
+                    StreamMessage::Thinking { .. } => {
                         debug_log("  >>> Thinking block received");
                     }
                 }
@@ -1494,6 +1494,7 @@ fn parse_stream_message(json: &Value) -> Option<StreamMessage> {
             let content = json.get("message")?.get("content")?.as_array()?;
 
             let mut has_thinking = false;
+            let mut thinking_summary: Option<String> = None;
             for item in content {
                 let item_type = match item.get("type").and_then(|v| v.as_str()) {
                     Some(t) => t,
@@ -1523,14 +1524,21 @@ fn parse_stream_message(json: &Value) -> Option<StreamMessage> {
                     }
                     "thinking" => {
                         has_thinking = true;
+                        // Extract first non-empty line as topic hint
+                        thinking_summary = item
+                            .get("thinking")
+                            .and_then(|v| v.as_str())
+                            .and_then(|t| t.lines().find(|l| !l.trim().is_empty()))
+                            .map(|l| l.trim().to_string());
                     }
                     _ => {}
                 }
             }
             // Only emit Thinking if no text/tool_use was found in the same message.
-            // Use a fixed summary to avoid leaking raw reasoning content.
             if has_thinking {
-                return Some(StreamMessage::Thinking);
+                return Some(StreamMessage::Thinking {
+                    summary: thinking_summary,
+                });
             }
             None
         }
@@ -2808,7 +2816,12 @@ mod tests {
             r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"Let me analyze this"}]}}"#
         ).unwrap();
         let msg = parse_stream_message(&json).unwrap();
-        assert!(matches!(msg, StreamMessage::Thinking));
+        match msg {
+            StreamMessage::Thinking { summary } => {
+                assert_eq!(summary.as_deref(), Some("Let me analyze this"));
+            }
+            _ => panic!("Expected Thinking"),
+        }
     }
 
     #[test]

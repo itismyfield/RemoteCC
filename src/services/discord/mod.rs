@@ -1409,6 +1409,12 @@ pub async fn run_bot(
                     .shutting_down
                     .store(true, std::sync::atomic::Ordering::SeqCst);
 
+                // Block dequeue and put router into drain mode so no new
+                // queue/checkpoint mutations occur during shutdown.
+                shared_for_signal
+                    .restart_pending
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+
                 // Cancel all active tmux watchers (quiet exit, no "session ended" messages)
                 for entry in shared_for_signal.tmux_watchers.iter() {
                     entry
@@ -1448,15 +1454,12 @@ pub async fn run_bot(
                     }
                 }
 
-                // ── Inflight state & restart reports ──
-                // Create restart reports AFTER grace period so that turns that
-                // completed (and cleared their inflight state) during the window
-                // are not given a spurious recovery follow-up.
+                // ── Inflight state, restart reports & placeholder updates ──
                 let inflight_states = inflight::load_inflight_states(&provider_for_shutdown);
 
+                // Save restart reports FIRST (disk-only, guaranteed to complete)
+                // before any HTTP calls that might hang/timeout.
                 for state in &inflight_states {
-                    // Skip only if a "pending" report exists (from --restart-dcserver).
-                    // Overwrite any other stale/failed report so the latest SIGTERM wins.
                     let existing = restart_report::load_restart_report(&provider_for_shutdown, state.channel_id);
                     if existing.as_ref().map(|r| r.status.as_str()) == Some("pending") {
                         continue;
@@ -1485,9 +1488,8 @@ pub async fn run_bot(
                     );
                 }
 
-                // ── Best-effort Discord UI updates (may block on network) ──
-                // Update in-flight placeholder messages to indicate restart.
-                // This runs AFTER critical state is already persisted to disk.
+                // Best-effort: update placeholder messages with restart notice.
+                // Each edit gets a 3-second timeout to avoid blocking shutdown.
                 if !inflight_states.is_empty() {
                     let http = serenity::Http::new(&token_for_signal);
                     for state in &inflight_states {
@@ -1500,28 +1502,61 @@ pub async fn run_bot(
                                 formatting::format_for_discord(state.full_response.trim());
                             format!("{partial}\n\n⚠️ dcserver 재시작으로 중단됨 — 곧 복원됩니다")
                         };
-                        match channel
-                            .edit_message(
-                                &http,
-                                msg_id,
-                                EditMessage::new().content(&restart_notice),
-                            )
-                            .await
+                        let edit_fut = channel.edit_message(
+                            &http,
+                            msg_id,
+                            EditMessage::new().content(&restart_notice),
+                        );
+                        match tokio::time::timeout(
+                            tokio::time::Duration::from_secs(3),
+                            edit_fut,
+                        )
+                        .await
                         {
-                            Ok(_) => {
+                            Ok(Ok(_)) => {
                                 let ts_ok = chrono::Local::now().format("%H:%M:%S");
                                 println!(
-                                    "  [{ts_ok}] ✓ Updated placeholder msg {} in channel {} with restart notice",
+                                    "  [{ts_ok}] ✓ Updated placeholder msg {} in channel {}",
                                     state.current_msg_id, state.channel_id
                                 );
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 eprintln!(
                                     "  ⚠ Failed to update placeholder msg {} in channel {}: {e}",
                                     state.current_msg_id, state.channel_id
                                 );
                             }
+                            Err(_) => {
+                                eprintln!(
+                                    "  ⚠ Timeout updating placeholder msg {} in channel {}",
+                                    state.current_msg_id, state.channel_id
+                                );
+                            }
                         }
+                    }
+                }
+
+                // ── Final state snapshot (belt-and-suspenders) ──
+                // During the HTTP placeholder edits above, active turns may have
+                // finished and mutated queues/last_message_ids. Re-save to capture
+                // any changes that occurred after the initial save.
+                {
+                    let data = shared_for_signal.core.lock().await;
+                    let queue_count: usize =
+                        data.intervention_queue.values().map(|q| q.len()).sum();
+                    if queue_count > 0 {
+                        save_pending_queues(&provider_for_shutdown, &data.intervention_queue);
+                        let ts4 = chrono::Local::now().format("%H:%M:%S");
+                        println!("  [{ts4}] 📋 final save: {queue_count} pending queue item(s)");
+                    }
+                }
+                {
+                    let ids: std::collections::HashMap<u64, u64> = shared_for_signal
+                        .last_message_ids.iter()
+                        .map(|entry| (entry.key().get(), *entry.value()))
+                        .collect();
+                    if !ids.is_empty() {
+                        runtime_store::save_all_last_message_ids(provider_for_shutdown.as_str(), &ids);
                     }
                 }
 

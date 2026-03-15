@@ -181,6 +181,16 @@ pub(super) async fn handle_event(
                         )
                     };
 
+                    // During shutdown, persist immediately so messages arriving
+                    // after the SIGTERM final save are not lost.
+                    let is_shutting_down = data
+                        .shared
+                        .shutting_down
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if is_shutting_down && inserted {
+                        save_pending_queues(&data.provider, &d.intervention_queue);
+                    }
+
                     drop(d);
 
                     if !inserted {
@@ -193,6 +203,15 @@ pub(super) async fn handle_event(
 
                     // Checkpoint: message successfully queued
                     data.shared.last_message_ids.insert(channel_id, new_message.id.get());
+                    if is_shutting_down {
+                        let ids: std::collections::HashMap<u64, u64> = data
+                            .shared
+                            .last_message_ids
+                            .iter()
+                            .map(|entry| (entry.key().get(), *entry.value()))
+                            .collect();
+                        runtime_store::save_all_last_message_ids(data.provider.as_str(), &ids);
+                    }
                     return Ok(());
                 }
             }
@@ -204,6 +223,11 @@ pub(super) async fn handle_event(
                 .restart_pending
                 .load(std::sync::atomic::Ordering::Relaxed)
             {
+                let is_shutting_down = data
+                    .shared
+                    .shutting_down
+                    .load(std::sync::atomic::Ordering::Relaxed);
+
                 let mut d = data.shared.core.lock().await;
                 let queue = d.intervention_queue.entry(channel_id).or_default();
                 enqueue_intervention(
@@ -216,6 +240,12 @@ pub(super) async fn handle_event(
                         created_at: Instant::now(),
                     },
                 );
+
+                // During shutdown, persist queue + checkpoint to disk immediately
+                // so messages arriving after the SIGTERM final save are not lost.
+                if is_shutting_down {
+                    save_pending_queues(&data.provider, &d.intervention_queue);
+                }
                 drop(d);
 
                 let ts = chrono::Local::now().format("%H:%M:%S");
@@ -223,15 +253,28 @@ pub(super) async fn handle_event(
                     "  [{ts}] ⏸ DRAIN: queued message from [{user_name}] in channel {} (restart pending)",
                     channel_id
                 );
-                rate_limit_wait(&data.shared, channel_id).await;
-                let _ = channel_id
-                    .say(
-                        &ctx.http,
-                        "⏸ 재시작 대기 중 — 메시지가 큐에 저장되었고, 재시작 후 처리됩니다.",
-                    )
-                    .await;
+
                 // Checkpoint: message successfully queued in drain mode
                 data.shared.last_message_ids.insert(channel_id, new_message.id.get());
+
+                if is_shutting_down {
+                    // Persist checkpoint to disk immediately during shutdown
+                    let ids: std::collections::HashMap<u64, u64> = data
+                        .shared
+                        .last_message_ids
+                        .iter()
+                        .map(|entry| (entry.key().get(), *entry.value()))
+                        .collect();
+                    runtime_store::save_all_last_message_ids(data.provider.as_str(), &ids);
+                } else {
+                    rate_limit_wait(&data.shared, channel_id).await;
+                    let _ = channel_id
+                        .say(
+                            &ctx.http,
+                            "⏸ 재시작 대기 중 — 메시지가 큐에 저장되었고, 재시작 후 처리됩니다.",
+                        )
+                        .await;
+                }
                 return Ok(());
             }
 

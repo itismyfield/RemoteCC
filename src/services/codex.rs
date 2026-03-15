@@ -1187,7 +1187,16 @@ fn handle_codex_json_line(
                         });
                     }
                     "reasoning" => {
-                        let _ = sender.send(StreamMessage::Thinking);
+                        // Codex reasoning: extract summary text if available
+                        let summary = item
+                            .get("summary")
+                            .and_then(|v| v.as_array())
+                            .and_then(|arr| arr.first())
+                            .and_then(|s| s.get("text"))
+                            .and_then(|v| v.as_str())
+                            .and_then(|t| t.lines().find(|l| !l.trim().is_empty()))
+                            .map(|l| l.trim().to_string());
+                        let _ = sender.send(StreamMessage::Thinking { summary });
                     }
                     _ => {}
                 }
@@ -1222,7 +1231,15 @@ fn handle_codex_json_line(
                         let _ = sender.send(StreamMessage::ToolResult { content, is_error });
                     }
                     "reasoning" => {
-                        let _ = sender.send(StreamMessage::Thinking);
+                        let summary = item
+                            .get("summary")
+                            .and_then(|v| v.as_array())
+                            .and_then(|arr| arr.first())
+                            .and_then(|s| s.get("text"))
+                            .and_then(|v| v.as_str())
+                            .and_then(|t| t.lines().find(|l| !l.trim().is_empty()))
+                            .map(|l| l.trim().to_string());
+                        let _ = sender.send(StreamMessage::Thinking { summary });
                     }
                     _ => {}
                 }
@@ -1355,7 +1372,7 @@ mod tests {
 
         let items: Vec<StreamMessage> = rx.try_iter().collect();
         assert_eq!(items.len(), 1);
-        assert!(matches!(items[0], StreamMessage::Thinking));
+        assert!(matches!(items[0], StreamMessage::Thinking { summary: None }));
     }
 
     #[test]
@@ -1376,7 +1393,12 @@ mod tests {
 
         let items: Vec<StreamMessage> = rx.try_iter().collect();
         assert_eq!(items.len(), 1);
-        assert!(matches!(items[0], StreamMessage::Thinking));
+        match &items[0] {
+            StreamMessage::Thinking { summary } => {
+                assert_eq!(summary.as_deref(), Some("Analyzing the code structure"));
+            }
+            _ => panic!("Expected Thinking with summary"),
+        }
     }
 
     #[test]

@@ -205,8 +205,14 @@ pub(super) fn spawn_turn_bridge(
                             inflight_state.full_response = full_response.clone();
                             state_dirty = true;
                         }
-                        StreamMessage::Thinking => {
-                            current_tool_line = Some("💭 Thinking...".to_string());
+                        StreamMessage::Thinking { summary } => {
+                            let display = if let Some(ref s) = summary {
+                                let hint = truncate_str(s, 80);
+                                format!("💭 {hint}")
+                            } else {
+                                "💭 Thinking...".to_string()
+                            };
+                            current_tool_line = Some(display);
                             last_tool_name = None;
                             last_tool_summary = None;
                         }
