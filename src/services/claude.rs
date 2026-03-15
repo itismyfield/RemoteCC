@@ -12,7 +12,7 @@ use crate::services::discord::restart_report::{
 use crate::services::provider::ProviderKind;
 use crate::services::remote::RemoteProfile;
 use crate::services::tmux_diagnostics::{
-    clear_tmux_exit_reason, record_tmux_exit_reason, tmux_session_exists,
+    record_tmux_exit_reason, tmux_session_exists,
     tmux_session_has_live_pane,
 };
 use crate::utils::format::safe_prefix;
@@ -69,25 +69,8 @@ fn get_claude_path() -> Option<&'static str> {
     CLAUDE_PATH.get_or_init(|| resolve_claude_path()).as_deref()
 }
 
-fn current_tmux_owner_marker() -> String {
-    std::env::var("REMOTECC_ROOT_DIR")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .or_else(|| dirs::home_dir().map(|home| home.join(".remotecc").display().to_string()))
-        .unwrap_or_else(|| ".remotecc".to_string())
-}
-
-fn tmux_owner_path(tmux_session_name: &str) -> String {
-    format!("/tmp/remotecc-{}.owner", tmux_session_name)
-}
-
-fn write_tmux_owner_marker(tmux_session_name: &str) -> Result<(), String> {
-    clear_tmux_exit_reason(tmux_session_name);
-    let owner_path = tmux_owner_path(tmux_session_name);
-    std::fs::write(&owner_path, current_tmux_owner_marker())
-        .map_err(|e| format!("Failed to write tmux owner marker: {}", e))
-}
+use crate::services::tmux_common::{tmux_owner_path, write_tmux_owner_marker};
+use crate::utils::format::expand_tilde_path;
 
 /// Global runtime debug flag — togglable via `/debug` command or COKACDIR_DEBUG=1 env var.
 static DEBUG_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1287,15 +1270,7 @@ fn execute_streaming_remote(
                     .map_err(|e| format!("Password auth failed: {}", e))?
             }
             RemoteAuth::KeyFile { path, passphrase } => {
-                let key_path = if path.starts_with('~') {
-                    if let Some(home) = dirs::home_dir() {
-                        home.join(path.trim_start_matches('~').trim_start_matches('/'))
-                    } else {
-                        std::path::PathBuf::from(path)
-                    }
-                } else {
-                    std::path::PathBuf::from(path)
-                };
+                let key_path = expand_tilde_path(path);
 
                 let key_pair = if let Some(pass) = passphrase {
                     russh_keys::load_secret_key(&key_path, Some(pass))
@@ -2236,15 +2211,7 @@ fn execute_streaming_remote_tmux(
                     .map_err(|e| format!("Password auth failed: {}", e))?
             }
             RemoteAuth::KeyFile { path, passphrase } => {
-                let key_path = if path.starts_with('~') {
-                    if let Some(home) = dirs::home_dir() {
-                        home.join(path.trim_start_matches('~').trim_start_matches('/'))
-                    } else {
-                        std::path::PathBuf::from(path)
-                    }
-                } else {
-                    std::path::PathBuf::from(path)
-                };
+                let key_path = expand_tilde_path(path);
 
                 let key_pair = if let Some(pass) = passphrase {
                     russh_keys::load_secret_key(&key_path, Some(pass))
@@ -2316,6 +2283,7 @@ fn execute_streaming_remote_tmux(
         loop {
             // === PHASE 1: Setup channel — create/resume tmux session ===
             let is_followup;
+            let mut followup_byte_offset: Option<u64> = None;
             {
                 let mut setup_channel = ssh.channel_open_session()
                     .await
@@ -2397,6 +2365,11 @@ fn execute_streaming_remote_tmux(
                 eprintln!("  [remote-tmux] Setup result: {:?}", setup_lines);
 
                 is_followup = setup_lines.first().map_or(false, |l| *l == "FOLLOWUP");
+                if is_followup {
+                    // Phase 1 echoed OFFSET as the second line
+                    followup_byte_offset = setup_lines.get(1)
+                        .and_then(|s| s.trim().parse::<u64>().ok());
+                }
                 if setup_lines.first().map_or(true, |l| *l == "FAILED") && !is_followup {
                     return Err("Failed to create tmux session on remote".to_string());
                 }
@@ -2408,8 +2381,13 @@ fn execute_streaming_remote_tmux(
                 .await
                 .map_err(|e| format!("Failed to open stream channel: {}", e))?;
 
-            // Use a simple script: source profile for PATH, then exec tail -f
-            // The 'exec' replaces the shell with tail, so tail's stdout goes directly to SSH channel.
+            // For FOLLOWUP: tail from byte offset+1 so we skip already-processed JSONL.
+            // For NEW: wait for file then tail from beginning.
+            let tail_part = if let Some(offset) = followup_byte_offset {
+                format!("exec tail -c +{} -f {output}", offset + 1, output = shell_escape(&output_path))
+            } else {
+                format!("exec tail -f {output}", output = shell_escape(&output_path))
+            };
             let stream_cmd = format!(
                 r#"{{ [ -f ~/.zshrc ] && source ~/.zshrc; [ -f ~/.bashrc ] && source ~/.bashrc; }} 2>/dev/null; \
                 _WAIT_OK=0; \
@@ -2424,8 +2402,9 @@ fn execute_streaming_remote_tmux(
                     echo "tail: {output}: No such file or directory" >&2; \
                     exit 1; \
                 fi; \
-                exec tail -f {output}"#,
+                {tail}"#,
                 output = shell_escape(&output_path),
+                tail = tail_part,
             );
 
             eprintln!("  [remote-tmux] Phase 2: waiting for output then tail -f ...");

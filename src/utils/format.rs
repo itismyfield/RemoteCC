@@ -166,6 +166,42 @@ pub fn truncate_with_ellipsis(s: &str, max_width: usize) -> String {
     format!("{}...", trimmed)
 }
 
+/// 문자열 뒤에서 max_chars 글자 이내로 자르고, 앞에 "…"을 붙인다.
+/// Discord 메시지 상태 표시용.
+pub fn tail_with_ellipsis(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+
+    let keep = max_chars.saturating_sub(1);
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(keep)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("…{}", tail)
+}
+
+/// `~`로 시작하는 경로를 홈 디렉토리로 확장한다.
+pub fn expand_tilde_path(path: &str) -> std::path::PathBuf {
+    if path.starts_with('~') {
+        if let Some(home) = dirs::home_dir() {
+            home.join(path.trim_start_matches('~').trim_start_matches('/'))
+        } else {
+            std::path::PathBuf::from(path)
+        }
+    } else {
+        std::path::PathBuf::from(path)
+    }
+}
+
 /// 표시 너비 기준으로 뒤에서부터 max_width 칸 이내의 접미사를 반환한다.
 /// "..." 접두사 없이 순수 접미사만 반환. 호출자가 "..." 등을 붙인다.
 pub fn display_width_suffix(s: &str, max_width: usize) -> String {

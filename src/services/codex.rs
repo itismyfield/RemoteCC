@@ -16,7 +16,7 @@ use crate::services::discord::restart_report::{
 use crate::services::provider::ProviderKind;
 use crate::services::remote::RemoteProfile;
 use crate::services::tmux_diagnostics::{
-    clear_tmux_exit_reason, record_tmux_exit_reason, tmux_session_exists,
+    record_tmux_exit_reason, tmux_session_exists,
     tmux_session_has_live_pane,
 };
 
@@ -49,25 +49,7 @@ fn get_codex_path() -> Option<&'static str> {
     CODEX_PATH.get_or_init(resolve_codex_path).as_deref()
 }
 
-fn current_tmux_owner_marker() -> String {
-    std::env::var("REMOTECC_ROOT_DIR")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .or_else(|| dirs::home_dir().map(|home| home.join(".remotecc").display().to_string()))
-        .unwrap_or_else(|| ".remotecc".to_string())
-}
-
-fn tmux_owner_path(tmux_session_name: &str) -> String {
-    format!("/tmp/remotecc-{}.owner", tmux_session_name)
-}
-
-fn write_tmux_owner_marker(tmux_session_name: &str) -> Result<(), String> {
-    clear_tmux_exit_reason(tmux_session_name);
-    let owner_path = tmux_owner_path(tmux_session_name);
-    std::fs::write(&owner_path, current_tmux_owner_marker())
-        .map_err(|e| format!("Failed to write tmux owner marker: {}", e))
-}
+use crate::services::tmux_common::{tmux_owner_path, write_tmux_owner_marker};
 
 pub fn execute_command_simple(prompt: &str) -> Result<String, String> {
     let codex_bin = get_codex_path().ok_or_else(|| "Codex CLI not found".to_string())?;
@@ -390,15 +372,7 @@ fn execute_streaming_remote_direct(
                     .map_err(|e| format!("Password auth failed: {}", e))?
             }
             RemoteAuth::KeyFile { path, passphrase } => {
-                let key_path = if path.starts_with('~') {
-                    if let Some(home) = dirs::home_dir() {
-                        home.join(path.trim_start_matches('~').trim_start_matches('/'))
-                    } else {
-                        std::path::PathBuf::from(path)
-                    }
-                } else {
-                    std::path::PathBuf::from(path)
-                };
+                let key_path = crate::utils::format::expand_tilde_path(path);
 
                 let key_pair = if let Some(pass) = passphrase {
                     russh_keys::load_secret_key(&key_path, Some(pass))
@@ -591,15 +565,7 @@ fn execute_streaming_remote_tmux(
                     .map_err(|e| format!("Password auth failed: {}", e))?
             }
             RemoteAuth::KeyFile { path, passphrase } => {
-                let key_path = if path.starts_with('~') {
-                    if let Some(home) = dirs::home_dir() {
-                        home.join(path.trim_start_matches('~').trim_start_matches('/'))
-                    } else {
-                        std::path::PathBuf::from(path)
-                    }
-                } else {
-                    std::path::PathBuf::from(path)
-                };
+                let key_path = crate::utils::format::expand_tilde_path(path);
 
                 let key_pair = if let Some(pass) = passphrase {
                     russh_keys::load_secret_key(&key_path, Some(pass))

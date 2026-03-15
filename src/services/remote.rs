@@ -315,15 +315,7 @@ impl SftpSession {
                 .await
                 .map_err(|e| AppError::Ssh(format!("Password auth failed: {}", e)))?,
             RemoteAuth::KeyFile { path, passphrase } => {
-                let key_path = if path.starts_with('~') {
-                    if let Some(home) = dirs::home_dir() {
-                        home.join(path.trim_start_matches('~').trim_start_matches('/'))
-                    } else {
-                        std::path::PathBuf::from(path)
-                    }
-                } else {
-                    std::path::PathBuf::from(path)
-                };
+                let key_path = crate::utils::format::expand_tilde_path(path);
 
                 let key_pair = if let Some(pass) = passphrase {
                     russh_keys::load_secret_key(&key_path, Some(pass))

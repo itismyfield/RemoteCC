@@ -78,15 +78,7 @@ impl SshExec {
                     .await
                     .map_err(|e| format!("Password auth failed: {}", e))?,
                 RemoteAuth::KeyFile { path, passphrase } => {
-                    let key_path = if path.starts_with('~') {
-                        if let Some(home) = dirs::home_dir() {
-                            home.join(path.trim_start_matches('~').trim_start_matches('/'))
-                        } else {
-                            PathBuf::from(path)
-                        }
-                    } else {
-                        PathBuf::from(path)
-                    };
+                    let key_path = crate::utils::format::expand_tilde_path(path);
 
                     let key_pair = if let Some(pass) = passphrase {
                         russh_keys::load_secret_key(&key_path, Some(pass))
@@ -185,18 +177,8 @@ fn build_ssh_option(profile: &RemoteProfile) -> String {
 
     // Key file
     if let RemoteAuth::KeyFile { ref path, .. } = profile.auth {
-        let expanded = if path.starts_with('~') {
-            if let Some(home) = dirs::home_dir() {
-                home.join(path.trim_start_matches('~').trim_start_matches('/'))
-                    .display()
-                    .to_string()
-            } else {
-                path.clone()
-            }
-        } else {
-            path.clone()
-        };
-        ssh_cmd.push_str(&format!(" -i '{}'", expanded));
+        let expanded = crate::utils::format::expand_tilde_path(path);
+        ssh_cmd.push_str(&format!(" -i '{}'", expanded.display()));
     }
 
     // Disable strict host key checking for convenience

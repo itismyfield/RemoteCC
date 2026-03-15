@@ -2,27 +2,7 @@ use super::handoff::{save_handoff, HandoffRecord};
 use super::restart_report::{clear_restart_report, save_restart_report, RestartCompletionReport};
 use super::*;
 use crate::services::tmux_diagnostics::record_tmux_exit_reason;
-
-fn tail_with_ellipsis(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-
-    if max_chars <= 1 {
-        return "…".to_string();
-    }
-
-    let keep = max_chars.saturating_sub(1);
-    let tail: String = text
-        .chars()
-        .rev()
-        .take(keep)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("…{}", tail)
-}
+use crate::utils::format::tail_with_ellipsis;
 
 pub(super) fn cancel_active_token(token: &Arc<CancelToken>, cleanup_tmux: bool, reason: &str) {
     token.cancelled.store(true, Ordering::Relaxed);
