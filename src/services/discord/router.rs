@@ -702,16 +702,11 @@ pub(super) async fn handle_text_message(
                         "  [{ts}] ⏰ WATCHDOG: turn timeout ({:.0}s) for channel {}, cancelling",
                         timeout.as_secs_f64(), channel_id
                     );
+                    // Only send cancel signal — do NOT remove cancel_tokens here.
+                    // turn_bridge finalization handles cleanup (cancel_tokens removal,
+                    // global_active decrement, queued turn kickoff) to preserve
+                    // the single-active-turn invariant.
                     super::turn_bridge::cancel_active_token(&watchdog_token, true, "watchdog timeout");
-
-                    // Remove cancel token and decrement global_active
-                    {
-                        let mut data = watchdog_shared.core.lock().await;
-                        if data.cancel_tokens.remove(&channel_id).is_some() {
-                            watchdog_shared.global_active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        data.active_request_owner.remove(&channel_id);
-                    }
 
                     // Notify Discord
                     let timeout_mins = timeout.as_secs() / 60;
