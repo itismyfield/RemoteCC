@@ -51,6 +51,10 @@ pub(super) fn discord_pending_queue_root() -> Option<PathBuf> {
     runtime_root().map(|root| root.join("discord_pending_queue"))
 }
 
+pub(super) fn discord_handoff_root() -> Option<PathBuf> {
+    runtime_root().map(|root| root.join("discord_handoff"))
+}
+
 pub(super) fn shared_agent_memory_root() -> Option<PathBuf> {
     remotecc_root().map(|root| root.join("shared_agent_memory"))
 }
