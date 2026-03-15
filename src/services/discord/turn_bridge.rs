@@ -134,7 +134,7 @@ pub(super) fn spawn_turn_bridge(
     tokio::spawn(async move {
         const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let channel_id = bridge.channel_id;
-        let provider = bridge.provider;
+        let provider = bridge.provider.clone();
         let user_msg_id = bridge.user_msg_id;
         let user_text_owned = bridge.user_text_owned.clone();
         let request_owner_name = bridge.request_owner_name.clone();
@@ -220,7 +220,7 @@ pub(super) fn spawn_turn_bridge(
                             last_tool_summary = Some(display_summary);
                             if !restart_followup_pending && is_dcserver_restart_command(&input) {
                                 let mut report = RestartCompletionReport::new(
-                                    provider,
+                                    provider.clone(),
                                     channel_id.get(),
                                     "pending",
                                     format!(
@@ -431,7 +431,7 @@ pub(super) fn spawn_turn_bridge(
                     pcd_session_name.as_deref(),
                     Some(provider.as_str()),
                     "working",
-                    provider,
+                    &provider,
                     pcd_session_info.as_deref(),
                     None,
                     pcd_cwd.as_deref(),
@@ -447,7 +447,7 @@ pub(super) fn spawn_turn_bridge(
             pcd_session_name.as_deref(),
             Some(provider.as_str()),
             "idle",
-            provider,
+            &provider,
             pcd_session_info.as_deref(),
             (accumulated_tokens > 0).then_some(accumulated_tokens),
             pcd_cwd.as_deref(),
@@ -651,7 +651,7 @@ pub(super) fn spawn_turn_bridge(
                         if let Some(binding) = role_binding.as_ref() {
                             if let Err(e) = append_shared_memory_turn(
                                 &binding.role_id,
-                                provider,
+                                &provider,
                                 channel_id,
                                 channel_name.as_deref(),
                                 path,
@@ -673,7 +673,7 @@ pub(super) fn spawn_turn_bridge(
         // the cancel token) to prevent the flush loop from processing the
         // report in the gap between cancel token removal and report deletion.
         if restart_followup_pending {
-            clear_restart_report(provider, channel_id.get());
+            clear_restart_report(&provider, channel_id.get());
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!(
                 "  [{ts}] ✓ Cleared restart report for channel {} (turn completed normally)",
@@ -681,7 +681,7 @@ pub(super) fn spawn_turn_bridge(
             );
         }
 
-        clear_inflight_state(provider, channel_id.get());
+        clear_inflight_state(&provider, channel_id.get());
         shared_owned.recovering_channels.remove(&channel_id);
 
         // Finalization complete — decrement counters and check deferred restart

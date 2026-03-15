@@ -319,7 +319,7 @@ struct PendingQueueItem {
 }
 
 /// Save all non-empty intervention queues to `discord_pending_queue/{provider}/`.
-fn save_pending_queues(provider: ProviderKind, queues: &HashMap<ChannelId, Vec<Intervention>>) {
+fn save_pending_queues(provider: &ProviderKind, queues: &HashMap<ChannelId, Vec<Intervention>>) {
     let Some(root) = runtime_store::discord_pending_queue_root() else {
         return;
     };
@@ -351,7 +351,7 @@ fn save_pending_queues(provider: ProviderKind, queues: &HashMap<ChannelId, Vec<I
 }
 
 /// Load persisted pending queues and delete the files.
-fn load_pending_queues(provider: ProviderKind) -> HashMap<ChannelId, Vec<Intervention>> {
+fn load_pending_queues(provider: &ProviderKind) -> HashMap<ChannelId, Vec<Intervention>> {
     let Some(root) = runtime_store::discord_pending_queue_root() else {
         return HashMap::new();
     };
@@ -400,7 +400,7 @@ fn load_pending_queues(provider: ProviderKind) -> HashMap<ChannelId, Vec<Interve
 }
 
 /// Scan for provider-specific skills available to this bot.
-fn scan_skills(provider: ProviderKind, project_path: Option<&str>) -> Vec<(String, String)> {
+fn scan_skills(provider: &ProviderKind, project_path: Option<&str>) -> Vec<(String, String)> {
     let mut skills: Vec<(String, String)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
@@ -508,6 +508,7 @@ fn scan_skills(provider: ProviderKind, project_path: Option<&str>) -> Vec<(Strin
                 }
             }
         }
+        ProviderKind::Unsupported(_) => {}
     }
 
     skills.sort_by(|a, b| a.0.cmp(&b.0));
@@ -535,14 +536,14 @@ pub async fn run_bot(
     claude::init_debug_from_env();
 
     let mut bot_settings = load_bot_settings(token);
-    bot_settings.provider = provider;
+    bot_settings.provider = provider.clone();
 
     match bot_settings.owner_user_id {
         Some(owner_id) => println!("  ✓ Owner: {owner_id}"),
         None => println!("  ⚠ No owner registered — first user will be registered as owner"),
     }
 
-    let initial_skills = scan_skills(provider, None);
+    let initial_skills = scan_skills(&provider, None);
     let skill_count = initial_skills.len();
     println!(
         "  ✓ {} bot ready — Skills loaded: {}",
@@ -552,6 +553,9 @@ pub async fn run_bot(
 
     // Cleanup stale Discord uploads on process start
     cleanup_old_uploads(UPLOAD_MAX_AGE);
+
+    let provider_for_shutdown = provider.clone();
+    let provider_for_error = provider.clone();
 
     let shared = Arc::new(SharedData {
         core: Mutex::new(CoreState {
@@ -639,6 +643,7 @@ pub async fn run_bot(
 
                 // Background: poll for deferred restart marker when idle
                 let shared_for_deferred = shared_for_tmux.clone();
+                let provider_for_deferred = provider.clone();
                 tokio::spawn(async move {
                     loop {
                         tokio::time::sleep(DEFERRED_RESTART_POLL_INTERVAL).await;
@@ -663,7 +668,7 @@ pub async fn run_bot(
                                 let queue_count: usize =
                                     data.intervention_queue.values().map(|q| q.len()).sum();
                                 if queue_count > 0 {
-                                    save_pending_queues(provider, &data.intervention_queue);
+                                    save_pending_queues(&provider_for_deferred, &data.intervention_queue);
                                     let ts = chrono::Local::now().format("%H:%M:%S");
                                     println!("  [{ts}] 📋 DRAIN: saved {queue_count} pending queue item(s) before deferred restart");
                                 }
@@ -681,11 +686,12 @@ pub async fn run_bot(
                 let shared_for_tmux2 = shared_for_tmux.clone();
                 let http_for_restart_reports = ctx.http.clone();
                 let shared_for_restart_reports = shared_for_tmux.clone();
+                let provider_for_restore = provider.clone();
                 tokio::spawn(async move {
-                    restore_inflight_turns(&http_for_tmux, &shared_for_tmux2, provider).await;
+                    restore_inflight_turns(&http_for_tmux, &shared_for_tmux2, &provider_for_restore).await;
 
                     // Restore pending intervention queues saved during previous SIGTERM
-                    let restored_queues = load_pending_queues(provider);
+                    let restored_queues = load_pending_queues(&provider_for_restore);
                     if !restored_queues.is_empty() {
                         let mut added = 0usize;
                         let mut skipped = 0usize;
@@ -715,7 +721,7 @@ pub async fn run_bot(
                     flush_restart_reports(
                         &http_for_restart_reports,
                         &shared_for_restart_reports,
-                        provider,
+                        &provider_for_restore,
                     )
                     .await;
                     // Continue flushing in a loop for any reports created later
@@ -724,7 +730,7 @@ pub async fn run_bot(
                         flush_restart_reports(
                             &http_for_restart_reports,
                             &shared_for_restart_reports,
-                            provider,
+                            &provider_for_restore,
                         )
                         .await;
                     }
@@ -789,7 +795,7 @@ pub async fn run_bot(
                 // Create restart reports AFTER grace period so that turns that
                 // completed (and cleared their inflight state) during the window
                 // are not given a spurious recovery follow-up.
-                let inflight_states = inflight::load_inflight_states(provider);
+                let inflight_states = inflight::load_inflight_states(&provider_for_shutdown);
 
                 // Update in-flight placeholder messages to indicate restart
                 if !inflight_states.is_empty() {
@@ -832,12 +838,12 @@ pub async fn run_bot(
                 for state in &inflight_states {
                     // Skip only if a "pending" report exists (from --restart-dcserver).
                     // Overwrite any other stale/failed report so the latest SIGTERM wins.
-                    let existing = restart_report::load_restart_report(provider, state.channel_id);
+                    let existing = restart_report::load_restart_report(&provider_for_shutdown, state.channel_id);
                     if existing.as_ref().map(|r| r.status.as_str()) == Some("pending") {
                         continue;
                     }
                     let mut report = restart_report::RestartCompletionReport::new(
-                        provider,
+                        provider_for_shutdown.clone(),
                         state.channel_id,
                         "sigterm",
                         "dcserver가 SIGTERM으로 종료되었습니다. 재시작 후 작업을 이어받습니다.",
@@ -866,7 +872,7 @@ pub async fn run_bot(
                     let queue_count: usize =
                         data.intervention_queue.values().map(|q| q.len()).sum();
                     if queue_count > 0 {
-                        save_pending_queues(provider, &data.intervention_queue);
+                        save_pending_queues(&provider_for_shutdown, &data.intervention_queue);
                         let ts3 = chrono::Local::now().format("%H:%M:%S");
                         println!("  [{ts3}] 📋 saved {queue_count} pending queue item(s) to disk");
                     }
@@ -878,7 +884,7 @@ pub async fn run_bot(
     });
 
     if let Err(e) = client.start().await {
-        eprintln!("  ✗ {} bot error: {e}", provider.display_name());
+        eprintln!("  ✗ {} bot error: {e}", provider_for_error.display_name());
     }
 }
 
@@ -1033,9 +1039,9 @@ async fn try_handle_family_profile_probe_reply(
     ctx: &serenity::Context,
     msg: &serenity::Message,
     shared: &Arc<SharedData>,
-    provider: ProviderKind,
+    provider: &ProviderKind,
 ) -> Result<bool, Error> {
-    if provider != ProviderKind::Claude || msg.author.bot || msg.guild_id.is_some() {
+    if *provider != ProviderKind::Claude || msg.author.bot || msg.guild_id.is_some() {
         return Ok(false);
     }
 
@@ -1540,7 +1546,7 @@ async fn cmd_start(
         drop(settings);
 
         // Rescan skills with project path to pick up project-level commands
-        let new_skills = scan_skills(ctx.data().provider, Some(&effective_path));
+        let new_skills = scan_skills(&ctx.data().provider, Some(&effective_path));
         *ctx.data().shared.skills_cache.write().await = new_skills;
     }
 
@@ -1591,7 +1597,7 @@ async fn cmd_pwd(ctx: Context<'_>) -> Result<(), Error> {
 
 async fn build_health_report(
     shared: &Arc<SharedData>,
-    provider: ProviderKind,
+    provider: &ProviderKind,
     channel_id: ChannelId,
 ) -> String {
     let (
@@ -1654,7 +1660,7 @@ async fn build_health_report(
             value
         }
     };
-    let inflight_states = load_inflight_states(provider);
+    let inflight_states = load_inflight_states(&provider);
     let inflight_count = inflight_states.len();
     let channel_inflight = inflight_states
         .iter()
@@ -1739,7 +1745,7 @@ async fn build_health_report(
 
 async fn build_status_report(
     shared: &Arc<SharedData>,
-    provider: ProviderKind,
+    provider: &ProviderKind,
     channel_id: ChannelId,
 ) -> String {
     let (
@@ -1848,7 +1854,7 @@ async fn build_status_report(
 
 async fn build_inflight_report(
     shared: &Arc<SharedData>,
-    provider: ProviderKind,
+    provider: &ProviderKind,
     channel_id: ChannelId,
 ) -> String {
     let mut inflight_states = load_inflight_states(provider);
@@ -1954,7 +1960,7 @@ async fn cmd_health(ctx: Context<'_>) -> Result<(), Error> {
     let ts = chrono::Local::now().format("%H:%M:%S");
     println!("  [{ts}] ◀ [{user_name}] /health");
 
-    let text = build_health_report(&ctx.data().shared, ctx.data().provider, ctx.channel_id()).await;
+    let text = build_health_report(&ctx.data().shared, &ctx.data().provider, ctx.channel_id()).await;
     send_long_message_ctx(ctx, &text).await?;
     Ok(())
 }
@@ -1971,7 +1977,7 @@ async fn cmd_status(ctx: Context<'_>) -> Result<(), Error> {
     let ts = chrono::Local::now().format("%H:%M:%S");
     println!("  [{ts}] ◀ [{user_name}] /status");
 
-    let text = build_status_report(&ctx.data().shared, ctx.data().provider, ctx.channel_id()).await;
+    let text = build_status_report(&ctx.data().shared, &ctx.data().provider, ctx.channel_id()).await;
     send_long_message_ctx(ctx, &text).await?;
     Ok(())
 }
@@ -1989,7 +1995,7 @@ async fn cmd_inflight(ctx: Context<'_>) -> Result<(), Error> {
     println!("  [{ts}] ◀ [{user_name}] /inflight");
 
     let text =
-        build_inflight_report(&ctx.data().shared, ctx.data().provider, ctx.channel_id()).await;
+        build_inflight_report(&ctx.data().shared, &ctx.data().provider, ctx.channel_id()).await;
     send_long_message_ctx(ctx, &text).await?;
     Ok(())
 }
@@ -2602,21 +2608,21 @@ async fn cmd_cc(
         }
         "health" => {
             let text =
-                build_health_report(&ctx.data().shared, ctx.data().provider, ctx.channel_id())
+                build_health_report(&ctx.data().shared, &ctx.data().provider, ctx.channel_id())
                     .await;
             send_long_message_ctx(ctx, &text).await?;
             return Ok(());
         }
         "status" => {
             let text =
-                build_status_report(&ctx.data().shared, ctx.data().provider, ctx.channel_id())
+                build_status_report(&ctx.data().shared, &ctx.data().provider, ctx.channel_id())
                     .await;
             send_long_message_ctx(ctx, &text).await?;
             return Ok(());
         }
         "inflight" => {
             let text =
-                build_inflight_report(&ctx.data().shared, ctx.data().provider, ctx.channel_id())
+                build_inflight_report(&ctx.data().shared, &ctx.data().provider, ctx.channel_id())
                     .await;
             send_long_message_ctx(ctx, &text).await?;
             return Ok(());
@@ -2674,7 +2680,7 @@ async fn cmd_cc(
     }
 
     // Build the prompt that tells the active provider to invoke the skill
-    let skill_prompt = match ctx.data().provider {
+    let skill_prompt = match &ctx.data().provider {
         ProviderKind::Claude => {
             if args_str.is_empty() {
                 format!(
@@ -2700,6 +2706,10 @@ async fn cmd_cc(
                      Follow its SKILL.md instructions exactly and adapt them to the request."
                 )
             }
+        }
+        ProviderKind::Unsupported(name) => {
+            ctx.say(format!("Provider '{}' is not installed. This skill cannot run.", name)).await?;
+            return Ok(());
         }
     };
 
@@ -2773,16 +2783,17 @@ async fn cmd_meeting(
                         .await?;
                     return Ok(());
                 }
-                None => ctx.data().provider,
+                None => ctx.data().provider.clone(),
             };
             let agenda_owned = agenda_text.to_string();
             // Spawn as background task
+            let spawn_provider = selected_provider.clone();
             tokio::spawn(async move {
                 match meeting::start_meeting(
                     &*http,
                     channel_id,
                     &agenda_owned,
-                    selected_provider,
+                    spawn_provider,
                     &shared,
                 )
                 .await
@@ -3066,7 +3077,7 @@ async fn auto_restore_session(
         let last_path = settings.last_sessions.get(&channel_key).cloned();
         let is_remote = settings.last_remotes.contains_key(&channel_key);
         let saved_remote = settings.last_remotes.get(&channel_key).cloned();
-        (last_path, is_remote, saved_remote, settings.provider)
+        (last_path, is_remote, saved_remote, settings.provider.clone())
     };
 
     let mut data = shared.core.lock().await;
@@ -3116,7 +3127,7 @@ async fn auto_restore_session(
             }
             drop(data);
             // Rescan skills with project path
-            let new_skills = scan_skills(provider, Some(&last_path));
+            let new_skills = scan_skills(&provider, Some(&last_path));
             *shared.skills_cache.write().await = new_skills;
             let ts = chrono::Local::now().format("%H:%M:%S");
             let remote_info = saved_remote

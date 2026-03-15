@@ -27,7 +27,7 @@ pub(super) fn parse_dispatch_id(text: &str) -> Option<String> {
 pub(super) async fn build_pcd_session_key(
     shared: &Arc<SharedData>,
     channel_id: serenity::ChannelId,
-    provider: ProviderKind,
+    provider: &ProviderKind,
 ) -> Option<String> {
     let tmux_name = {
         let data = shared.core.lock().await;
@@ -90,7 +90,7 @@ pub(super) async fn post_pcd_session_status(
     name: Option<&str>,
     model: Option<&str>,
     status: &str,
-    provider: ProviderKind,
+    provider: &ProviderKind,
     session_info: Option<&str>,
     tokens: Option<u64>,
     cwd: Option<&str>,

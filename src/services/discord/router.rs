@@ -54,7 +54,7 @@ pub(super) async fn handle_event(
             let role_binding =
                 resolve_role_binding(effective_channel_id, effective_channel_name.as_deref());
             if !channel_supports_provider(
-                data.provider,
+                &data.provider,
                 effective_channel_name.as_deref(),
                 is_dm,
                 role_binding.as_ref(),
@@ -68,7 +68,7 @@ pub(super) async fn handle_event(
                     ctx,
                     new_message,
                     &data.shared,
-                    data.provider,
+                    &data.provider,
                 )
                 .await?
             {
@@ -198,7 +198,7 @@ pub(super) async fn handle_event(
                     http,
                     channel_id,
                     text,
-                    data.provider,
+                    data.provider.clone(),
                     &data.shared,
                 )
                 .await?
@@ -346,7 +346,7 @@ pub(super) async fn handle_text_message(
         let settings = shared.settings.read().await;
         (
             info,
-            settings.provider,
+            settings.provider.clone(),
             settings.allowed_tools.clone(),
             uploads,
             shared_ts,
@@ -503,7 +503,7 @@ pub(super) async fn handle_text_message(
     if let Some(shared_memory) = role_binding.as_ref().and_then(|binding| {
         build_shared_memory_context(
             &binding.role_id,
-            provider,
+            &provider,
             channel_id,
             session_id.is_some(),
             last_shared_mem_ts.as_deref(),
@@ -570,7 +570,7 @@ pub(super) async fn handle_text_message(
                 .iter()
                 .map(|(name, desc)| format!("  - /{}: {}", name, desc))
                 .collect();
-            match provider {
+            match &provider {
                 ProviderKind::Claude => format!(
                     "\n\nAvailable skills (invoke via the Skill tool):\n{}",
                     list.join("\n")
@@ -579,6 +579,7 @@ pub(super) async fn handle_text_message(
                     "\n\nAvailable local Codex skills (use them by name when relevant):\n{}",
                     list.join("\n")
                 ),
+                ProviderKind::Unsupported(_) => String::new(),
             }
         }
     };
@@ -661,7 +662,7 @@ pub(super) async fn handle_text_message(
             .map(|name| provider.build_tmux_session_name(name));
         (channel_name, tmux_session_name)
     };
-    let pcd_session_key = build_pcd_session_key(shared, channel_id, provider).await;
+    let pcd_session_key = build_pcd_session_key(shared, channel_id, &provider).await;
     let pcd_session_name = channel_name.clone();
     let pcd_session_info = derive_pcd_session_info(
         Some(user_text),
@@ -674,7 +675,7 @@ pub(super) async fn handle_text_message(
         pcd_session_name.as_deref(),
         Some(provider.as_str()),
         "working",
-        provider,
+        &provider,
         Some(&pcd_session_info),
         None,
         Some(&current_path),
@@ -705,7 +706,7 @@ pub(super) async fn handle_text_message(
         };
 
     let inflight_state = InflightTurnState::new(
-        provider,
+        provider.clone(),
         channel_id.get(),
         channel_name.clone(),
         request_owner.get(),
@@ -770,8 +771,9 @@ pub(super) async fn handle_text_message(
     }
 
     // Run the provider in a blocking thread
+    let provider_for_blocking = provider.clone();
     tokio::task::spawn_blocking(move || {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match provider {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &provider_for_blocking {
             ProviderKind::Claude => claude::execute_command_streaming(
                 &context_prompt,
                 session_id_clone.as_deref(),
@@ -783,7 +785,7 @@ pub(super) async fn handle_text_message(
                 remote_profile.as_ref(),
                 tmux_session_name.as_deref(),
                 Some(channel_id.get()),
-                Some(provider),
+                Some(provider_for_blocking.clone()),
             ),
             ProviderKind::Codex => codex::execute_command_streaming(
                 &context_prompt,
@@ -796,8 +798,17 @@ pub(super) async fn handle_text_message(
                 remote_profile.as_ref(),
                 tmux_session_name.as_deref(),
                 Some(channel_id.get()),
-                Some(provider),
+                Some(provider_for_blocking.clone()),
             ),
+            ProviderKind::Unsupported(name) => {
+                let _ = tx.send(StreamMessage::Error {
+                    message: format!("Provider '{}' is not installed", name),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: None,
+                });
+                Ok(())
+            }
         }));
 
         match result {

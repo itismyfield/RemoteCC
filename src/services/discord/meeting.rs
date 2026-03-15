@@ -183,7 +183,7 @@ pub(super) fn parse_meeting_start_text(
         return Err("사용법: `/meeting start [--primary claude|codex] <안건>`".to_string());
     }
 
-    let mut primary_provider = default_provider;
+    let mut primary_provider = default_provider.clone();
     let mut agenda = rest;
 
     if let Some(after_flag) = rest.strip_prefix("--primary=") {
@@ -193,7 +193,7 @@ pub(super) fn parse_meeting_start_text(
             .unwrap_or(after_flag.len());
         let provider_raw = after_flag[..split_at].trim();
         let remainder = after_flag[split_at..].trim();
-        primary_provider = parse_primary_provider_arg(Some(provider_raw), default_provider)?;
+        primary_provider = parse_primary_provider_arg(Some(provider_raw), default_provider.clone())?;
         agenda = remainder;
     } else if let Some(after_flag) = rest.strip_prefix("--primary ") {
         let after_flag = after_flag.trim_start();
@@ -307,8 +307,8 @@ pub(super) async fn start_meeting(
             Meeting {
                 id: meeting_id.clone(),
                 agenda: agenda.to_string(),
-                primary_provider,
-                reviewer_provider,
+                primary_provider: primary_provider.clone(),
+                reviewer_provider: reviewer_provider.clone(),
                 participants: Vec::new(),
                 transcript: Vec::new(),
                 current_round: 0,
@@ -504,8 +504,8 @@ pub(super) async fn meeting_status(
                 m.participants.len(),
                 m.transcript.len(),
                 m.status.clone(),
-                m.primary_provider,
-                m.reviewer_provider,
+                m.primary_provider.clone(),
+                m.reviewer_provider.clone(),
             )
         })
     };
@@ -586,7 +586,7 @@ async fn select_participants(
     );
 
     let initial_response =
-        provider_exec::execute_simple(primary_provider, selection_prompt).await?;
+        provider_exec::execute_simple(primary_provider.clone(), selection_prompt).await?;
     let initial_selected = parse_json_array_fragment(&initial_response)?;
 
     let review_prompt = format!(
@@ -610,7 +610,7 @@ async fn select_participants(
         current = serde_json::to_string(&initial_selected).unwrap_or_else(|_| "[]".to_string()),
     );
 
-    let review_notes = provider_exec::execute_simple(reviewer_provider, review_prompt).await?;
+    let review_notes = provider_exec::execute_simple(reviewer_provider.clone(), review_prompt).await?;
 
     let finalize_prompt = format!(
         r#"다음 안건에 대한 회의 참가자 선정을 최종 확정해줘.
@@ -637,7 +637,7 @@ async fn select_participants(
         review = review_notes.trim(),
     );
 
-    let final_response = provider_exec::execute_simple(primary_provider, finalize_prompt).await?;
+    let final_response = provider_exec::execute_simple(primary_provider.clone(), finalize_prompt).await?;
     let selected = parse_json_array_fragment(&final_response)?;
 
     let participants: Vec<MeetingParticipant> = selected
@@ -686,8 +686,8 @@ async fn run_meeting_round(
         (
             m.participants.clone(),
             m.agenda.clone(),
-            m.primary_provider,
-            m.reviewer_provider,
+            m.primary_provider.clone(),
+            m.reviewer_provider.clone(),
         )
     };
 
@@ -715,8 +715,8 @@ async fn run_meeting_round(
             &agenda,
             round,
             &transcript_text,
-            primary_provider,
-            reviewer_provider,
+            primary_provider.clone(),
+            reviewer_provider.clone(),
         )
         .await
         {
@@ -836,7 +836,7 @@ async fn execute_agent_turn(
         },
     );
 
-    let draft = provider_exec::execute_simple(primary_provider, draft_prompt).await?;
+    let draft = provider_exec::execute_simple(primary_provider.clone(), draft_prompt).await?;
 
     let critique_prompt = format!(
         r#"당신은 회의 발언 초안을 비판적으로 검토하는 리뷰어다.
@@ -980,8 +980,8 @@ async fn conclude_meeting(
             m.agenda.clone(),
             t,
             p.join(", "),
-            m.primary_provider,
-            m.reviewer_provider,
+            m.primary_provider.clone(),
+            m.reviewer_provider.clone(),
         )
     };
 
@@ -1060,7 +1060,7 @@ async fn conclude_meeting(
         )
         .await;
 
-    let draft = provider_exec::execute_simple(primary_provider, draft_prompt).await;
+    let draft = provider_exec::execute_simple(primary_provider.clone(), draft_prompt).await;
 
     let summary_text = match draft {
         Ok(draft_text) => {

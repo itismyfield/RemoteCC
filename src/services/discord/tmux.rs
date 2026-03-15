@@ -414,7 +414,7 @@ pub(super) async fn tmux_output_watcher(
             parse_provider_and_channel_from_tmux_name(&tmux_session_name)
         {
             if let Some(state) =
-                super::inflight::load_inflight_state(provider_kind, channel_id.get())
+                super::inflight::load_inflight_state(&provider_kind, channel_id.get())
             {
                 let user_msg_id = serenity::MessageId::new(state.user_msg_id);
                 super::formatting::remove_reaction_raw(&http, channel_id, user_msg_id, '⏳').await;
@@ -583,7 +583,7 @@ pub(super) fn process_watcher_lines(
 /// On startup, scan for surviving tmux sessions (remoteCC-*) and restore watchers.
 /// This handles the case where RemoteCC was restarted but tmux sessions are still alive.
 pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &Arc<SharedData>) {
-    let provider = shared.settings.read().await.provider;
+    let provider = shared.settings.read().await.provider.clone();
 
     // List tmux sessions matching our naming convention
     let output = match tokio::task::spawn_blocking(|| {
@@ -640,7 +640,7 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
                     for (ch_id, channel) in &channels {
                         let role_binding = resolve_role_binding(*ch_id, Some(&channel.name));
                         if !channel_supports_provider(
-                            provider,
+                            &provider,
                             Some(&channel.name),
                             false,
                             role_binding.as_ref(),
@@ -839,7 +839,7 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
 /// Kill orphan tmux sessions (remoteCC-*) that don't map to any known channel.
 /// Called after restore_tmux_watchers to clean up sessions from renamed/deleted channels.
 pub(super) async fn cleanup_orphan_tmux_sessions(shared: &Arc<SharedData>) {
-    let provider = shared.settings.read().await.provider;
+    let provider = shared.settings.read().await.provider.clone();
     let current_owner_marker = current_tmux_owner_marker();
 
     let output = match tokio::task::spawn_blocking(|| {
