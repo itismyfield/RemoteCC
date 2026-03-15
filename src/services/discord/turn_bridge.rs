@@ -507,7 +507,10 @@ pub(super) fn spawn_turn_bridge(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let has_queued_turns = {
             let mut data = shared_owned.core.lock().await;
-            if data.cancel_tokens.remove(&channel_id).is_some() {
+            if let Some(removed_token) = data.cancel_tokens.remove(&channel_id) {
+                // Mark the token as cancelled so any lingering watchdog timer exits cleanly
+                // instead of mistakenly firing on a newer turn's token.
+                removed_token.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
                 shared_owned.global_active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }
             data.active_request_owner.remove(&channel_id);

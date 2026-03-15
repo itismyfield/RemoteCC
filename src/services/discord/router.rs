@@ -738,12 +738,16 @@ pub(super) async fn handle_text_message(
             tokio::time::sleep(timeout).await;
             // If the token is still alive (not yet cancelled/completed), this turn is hung
             if !watchdog_token.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-                // Check if this channel still has this cancel token (turn not yet finalized)
-                let still_active = {
+                // Verify this watchdog's token is still the CURRENT active token for this channel.
+                // A previous turn's watchdog must not cancel a newer turn that replaced the token.
+                // Using Arc::ptr_eq ensures we only fire if our token is still the active one.
+                let is_current_token = {
                     let data = watchdog_shared.core.lock().await;
-                    data.cancel_tokens.contains_key(&channel_id)
+                    data.cancel_tokens
+                        .get(&channel_id)
+                        .map_or(false, |current| std::sync::Arc::ptr_eq(&watchdog_token, current))
                 };
-                if still_active {
+                if is_current_token {
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     println!(
                         "  [{ts}] ⏰ WATCHDOG: turn timeout ({:.0}s) for channel {}, cancelling",
