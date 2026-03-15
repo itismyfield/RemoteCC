@@ -877,7 +877,8 @@ pub(super) async fn handle_text_message(
 
     // Pause tmux watcher if one exists (so it doesn't read our turn's output)
     if let Some(watcher) = shared.tmux_watchers.get(&channel_id) {
-        watcher.paused.store(true, Ordering::Relaxed);
+        watcher.pause_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        watcher.paused.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     // Auto-sync worktree before sending message to session

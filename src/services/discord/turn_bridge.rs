@@ -355,10 +355,12 @@ pub(super) fn spawn_turn_bridge(
                                 let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
                                 let paused = Arc::new(std::sync::atomic::AtomicBool::new(true));
                                 let resume_offset = Arc::new(std::sync::Mutex::new(None::<u64>));
+                                let pause_epoch = Arc::new(std::sync::atomic::AtomicU64::new(1));
                                 let handle = TmuxWatcherHandle {
                                     paused: paused.clone(),
                                     resume_offset: resume_offset.clone(),
                                     cancel: cancel.clone(),
+                                    pause_epoch: pause_epoch.clone(),
                                 };
                                 shared_owned.tmux_watchers.insert(channel_id, handle);
                                 let http_bg = http.clone();
@@ -373,6 +375,7 @@ pub(super) fn spawn_turn_bridge(
                                     cancel,
                                     paused,
                                     resume_offset,
+                                    pause_epoch,
                                 ));
                             }
                             state_dirty = true;

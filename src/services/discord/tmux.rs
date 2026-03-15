@@ -41,6 +41,7 @@ pub(super) async fn tmux_output_watcher(
     cancel: Arc<std::sync::atomic::AtomicBool>,
     paused: Arc<std::sync::atomic::AtomicBool>,
     resume_offset: Arc<std::sync::Mutex<Option<u64>>>,
+    pause_epoch: Arc<std::sync::atomic::AtomicU64>,
 ) {
     use claude::StreamLineState;
     use std::io::{Read, Seek, SeekFrom};
@@ -69,6 +70,9 @@ pub(super) async fn tmux_output_watcher(
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
             continue;
         }
+
+        // Snapshot pause epoch — if this changes later, a Discord turn claimed this data
+        let epoch_snapshot = pause_epoch.load(Ordering::Relaxed);
 
         // Check if tmux session is still alive
         let alive = tokio::task::spawn_blocking({
@@ -167,7 +171,13 @@ pub(super) async fn tmux_output_watcher(
         );
 
         // Keep reading until result or timeout
-        let mut was_paused = false;
+        // Check if a Discord turn claimed this data since our epoch snapshot
+        let epoch_changed = pause_epoch.load(Ordering::Relaxed) != epoch_snapshot;
+        let mut was_paused = paused.load(Ordering::Relaxed) || epoch_changed;
+        if was_paused {
+            // A Discord turn took over — discard what we read
+            continue;
+        }
         if !found_result {
             let turn_start = tokio::time::Instant::now();
             let turn_timeout = super::turn_watchdog_timeout();
@@ -262,8 +272,11 @@ pub(super) async fn tmux_output_watcher(
             }
         }
 
-        // If paused was set while we were reading (even if already unpaused), discard partial data
-        if was_paused || paused.load(Ordering::Relaxed) {
+        // If paused was set while we were reading (even if already unpaused), discard partial data.
+        // Also check epoch: if it changed, a Discord turn claimed this data even if paused is now false.
+        if was_paused || paused.load(Ordering::Relaxed)
+            || pause_epoch.load(Ordering::Relaxed) != epoch_snapshot
+        {
             // Clean up placeholder if we created one
             if let Some(msg_id) = placeholder_msg_id {
                 let _ = channel_id.delete_message(&http, msg_id).await;
@@ -805,6 +818,7 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let resume_offset = Arc::new(std::sync::Mutex::new(None::<u64>));
+        let pause_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         shared.tmux_watchers.insert(
             pw.channel_id,
@@ -812,6 +826,7 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
                 paused: paused.clone(),
                 resume_offset: resume_offset.clone(),
                 cancel: cancel.clone(),
+                pause_epoch: pause_epoch.clone(),
             },
         );
 
@@ -825,6 +840,7 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
             cancel,
             paused,
             resume_offset,
+            pause_epoch,
         ));
     }
 }

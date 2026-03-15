@@ -237,6 +237,9 @@ pub(super) struct TmuxWatcherHandle {
     pub(super) resume_offset: Arc<std::sync::Mutex<Option<u64>>>,
     /// Signal to cancel the watcher (quiet exit, no "session ended" message)
     pub(super) cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Epoch counter: incremented each time paused is set to true.
+    /// Watcher snapshots this before reading; if it changed, the read is stale.
+    pub(super) pause_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Core state that requires atomic multi-field access (always locked together)
