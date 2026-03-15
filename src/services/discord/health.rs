@@ -1,6 +1,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use poise::serenity_prelude as serenity;
+use serenity::ChannelId;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -14,9 +16,12 @@ struct ProviderEntry {
 }
 
 /// Registry that providers register with so the health server can query all of them.
+/// Also holds Discord HTTP clients for agent-to-agent message routing.
 pub struct HealthRegistry {
     providers: tokio::sync::Mutex<Vec<ProviderEntry>>,
     started_at: Instant,
+    /// Discord HTTP clients registered by each provider (for sending messages)
+    discord_http: tokio::sync::Mutex<Vec<Arc<serenity::Http>>>,
 }
 
 impl HealthRegistry {
@@ -24,11 +29,16 @@ impl HealthRegistry {
         Self {
             providers: tokio::sync::Mutex::new(Vec::new()),
             started_at: Instant::now(),
+            discord_http: tokio::sync::Mutex::new(Vec::new()),
         }
     }
 
     pub(super) async fn register(&self, name: String, shared: Arc<SharedData>) {
         self.providers.lock().await.push(ProviderEntry { name, shared });
+    }
+
+    pub(super) async fn register_http(&self, http: Arc<serenity::Http>) {
+        self.discord_http.lock().await.push(http);
     }
 }
 
@@ -56,7 +66,7 @@ pub async fn serve(registry: Arc<HealthRegistry>, port: u16) {
 
         let registry = registry.clone();
         tokio::spawn(async move {
-            let mut buf = [0u8; 1024];
+            let mut buf = [0u8; 8192]; // Larger buffer for POST bodies
             let n = match stream.read(&mut buf).await {
                 Ok(n) => n,
                 Err(_) => return,
@@ -65,15 +75,22 @@ pub async fn serve(registry: Arc<HealthRegistry>, port: u16) {
 
             // Parse first line: "GET /api/health HTTP/1.1"
             let first_line = request.lines().next().unwrap_or("");
+            let method = first_line.split_whitespace().next().unwrap_or("");
             let path = first_line.split_whitespace().nth(1).unwrap_or("");
 
-            let (status, body) = if path == "/api/health" {
-                let json = build_health_json(&registry).await;
-                let healthy = is_healthy(&registry).await;
-                let code = if healthy { "200 OK" } else { "503 Service Unavailable" };
-                (code, json)
-            } else {
-                ("404 Not Found", r#"{"error":"not found"}"#.to_string())
+            let (status, body) = match (method, path) {
+                ("GET", "/api/health") => {
+                    let json = build_health_json(&registry).await;
+                    let healthy = is_healthy(&registry).await;
+                    let code = if healthy { "200 OK" } else { "503 Service Unavailable" };
+                    (code, json)
+                }
+                ("POST", "/api/send") => {
+                    // Extract JSON body (after \r\n\r\n)
+                    let body_str = request.split("\r\n\r\n").nth(1).unwrap_or("");
+                    handle_send(&registry, body_str).await
+                }
+                _ => ("404 Not Found", r#"{"error":"not found"}"#.to_string()),
             };
 
             let response = format!(
@@ -156,6 +173,63 @@ fn is_healthy_inner(providers: &[ProviderEntry]) -> bool {
         }
     }
     true
+}
+
+/// Handle POST /api/send — agent-to-agent native routing.
+/// Accepts JSON: {"target":"channel:<id>", "content":"...", "source":"role-id"}
+async fn handle_send<'a>(registry: &HealthRegistry, body: &str) -> (&'a str, String) {
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(body) else {
+        return ("400 Bad Request", r#"{"ok":false,"error":"invalid JSON"}"#.to_string());
+    };
+
+    let target = json.get("target").and_then(|v| v.as_str()).unwrap_or("");
+    let content = json.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    let source = json.get("source").and_then(|v| v.as_str()).unwrap_or("unknown");
+
+    if content.is_empty() {
+        return ("400 Bad Request", r#"{"ok":false,"error":"content is required"}"#.to_string());
+    }
+
+    // Parse "channel:<id>" format
+    let channel_id_raw = if let Some(id_str) = target.strip_prefix("channel:") {
+        id_str.trim().parse::<u64>().ok()
+    } else {
+        target.trim().parse::<u64>().ok()
+    };
+
+    let Some(channel_id_raw) = channel_id_raw else {
+        return ("400 Bad Request", r#"{"ok":false,"error":"invalid target format (use channel:<id>)"}"#.to_string());
+    };
+
+    let channel_id = ChannelId::new(channel_id_raw);
+
+    // Verify channel exists in role-map (access control)
+    let role_binding = super::settings::resolve_role_binding(channel_id, None);
+    if role_binding.is_none() {
+        return ("403 Forbidden", r#"{"ok":false,"error":"channel not in role-map"}"#.to_string());
+    }
+
+    // Get a Discord HTTP client to send the message
+    let http_clients = registry.discord_http.lock().await;
+    let Some(http) = http_clients.first() else {
+        return ("503 Service Unavailable", r#"{"ok":false,"error":"no Discord connection"}"#.to_string());
+    };
+
+    match channel_id
+        .say(http, content)
+        .await
+    {
+        Ok(_) => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!("  [{ts}] 📨 ROUTE: [{source}] → channel {channel_id}");
+            ("200 OK", format!(r#"{{"ok":true,"target":"channel:{}","source":"{}"}}"#, channel_id, source))
+        }
+        Err(e) => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            eprintln!("  [{ts}] ⚠ ROUTE: failed to send to channel {channel_id}: {e}");
+            ("500 Internal Server Error", format!(r#"{{"ok":false,"error":"Discord send failed: {}"}}"#, e))
+        }
+    }
 }
 
 /// Resolve the health check port from env or default.

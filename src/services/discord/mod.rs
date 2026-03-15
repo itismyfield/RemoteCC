@@ -1161,6 +1161,7 @@ pub async fn run_bot(
         .setup(move |ctx, _ready, framework| {
             let ctx_clone = ctx.clone();
             let shared_for_migrate = shared_clone.clone();
+            let health_registry_for_setup = health_registry.clone();
             Box::pin(async move {
                 // Register in each guild for instant slash command propagation
                 // (register_globally can take up to 1 hour)
@@ -1180,6 +1181,7 @@ pub async fn run_bot(
                     _ready.guilds.len()
                 );
                 shared_for_migrate.bot_connected.store(true, std::sync::atomic::Ordering::SeqCst);
+                health_registry_for_setup.register_http(ctx.http.clone()).await;
 
                 // Background: resolve category names for all known channels
                 let shared_for_tmux = shared_for_migrate.clone();
