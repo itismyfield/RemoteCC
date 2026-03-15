@@ -260,6 +260,54 @@ impl client::Handler for SshHandler {
     }
 }
 
+/// Shared SSH connect + authenticate helper.
+/// Returns a connected and authenticated SSH handle.
+/// All provider/transfer modules should use this instead of duplicating auth logic.
+pub(crate) async fn ssh_connect_and_auth(
+    profile: &RemoteProfile,
+) -> Result<client::Handle<SshHandler>, String> {
+    let config = client::Config {
+        inactivity_timeout: Some(std::time::Duration::from_secs(3600)),
+        keepalive_interval: Some(std::time::Duration::from_secs(30)),
+        keepalive_max: 10,
+        ..Default::default()
+    };
+
+    let mut ssh = client::connect(
+        Arc::new(config),
+        (profile.host.as_str(), profile.port),
+        SshHandler,
+    )
+    .await
+    .map_err(|e| format!("SSH connection failed: {}", e))?;
+
+    let auth_result = match &profile.auth {
+        RemoteAuth::Password { password } => ssh
+            .authenticate_password(&profile.user, password)
+            .await
+            .map_err(|e| format!("Password auth failed: {}", e))?,
+        RemoteAuth::KeyFile { path, passphrase } => {
+            let key_path = crate::utils::format::expand_tilde_path(path);
+            let key_pair = if let Some(pass) = passphrase {
+                russh_keys::load_secret_key(&key_path, Some(pass))
+                    .map_err(|e| format!("Failed to load key: {}", e))?
+            } else {
+                russh_keys::load_secret_key(&key_path, None)
+                    .map_err(|e| format!("Failed to load key: {}", e))?
+            };
+            ssh.authenticate_publickey(&profile.user, Arc::new(key_pair))
+                .await
+                .map_err(|e| format!("Key auth failed: {}", e))?
+        }
+    };
+
+    if !auth_result {
+        return Err("Authentication rejected by server".to_string());
+    }
+
+    Ok(ssh)
+}
+
 /// SFTP session wrapper around russh
 pub struct SftpSession {
     runtime: Runtime,

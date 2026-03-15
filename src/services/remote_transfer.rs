@@ -58,47 +58,7 @@ impl SshExec {
 
         let profile = profile.clone();
         let handle = runtime.block_on(async {
-            let config = client::Config {
-                inactivity_timeout: Some(std::time::Duration::from_secs(60)),
-                ..Default::default()
-            };
-
-            let mut ssh = client::connect(
-                Arc::new(config),
-                (profile.host.as_str(), profile.port),
-                SshHandler,
-            )
-            .await
-            .map_err(|e| format!("SSH connection failed: {}", e))?;
-
-            // Authenticate
-            let auth_result = match &profile.auth {
-                RemoteAuth::Password { password } => ssh
-                    .authenticate_password(&profile.user, password)
-                    .await
-                    .map_err(|e| format!("Password auth failed: {}", e))?,
-                RemoteAuth::KeyFile { path, passphrase } => {
-                    let key_path = crate::utils::format::expand_tilde_path(path);
-
-                    let key_pair = if let Some(pass) = passphrase {
-                        russh_keys::load_secret_key(&key_path, Some(pass))
-                            .map_err(|e| format!("Failed to load key: {}", e))?
-                    } else {
-                        russh_keys::load_secret_key(&key_path, None)
-                            .map_err(|e| format!("Failed to load key: {}", e))?
-                    };
-
-                    ssh.authenticate_publickey(&profile.user, Arc::new(key_pair))
-                        .await
-                        .map_err(|e| format!("Key auth failed: {}", e))?
-                }
-            };
-
-            if !auth_result {
-                return Err("Authentication rejected by server".to_string());
-            }
-
-            Ok(ssh)
+            crate::services::remote::ssh_connect_and_auth(&profile).await
         })?;
 
         Ok(Self { runtime, handle })
