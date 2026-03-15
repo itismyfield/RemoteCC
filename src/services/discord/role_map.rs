@@ -21,10 +21,15 @@ fn parse_role_binding(value: &serde_json::Value) -> Option<RoleBinding> {
         .get("provider")
         .and_then(|v| v.as_str())
         .and_then(ProviderKind::from_str);
+    let model = obj
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     Some(RoleBinding {
         role_id,
         prompt_file,
         provider,
+        model,
     })
 }
 

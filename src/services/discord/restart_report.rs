@@ -256,53 +256,50 @@ pub(super) async fn flush_restart_reports(
             }
         }
 
-        // Notify via Discord.
+        // Notify via Discord — human-friendly message (no internal details)
         let text = match report.status.as_str() {
-            "rolled_back" => format!("⚠️ dcserver 롤백됨: {}", report.summary),
+            "rolled_back" => "⚠️ 재시작 중 롤백이 발생했습니다.".to_string(),
             s if s == "ok" || s == "pending" || s == "sigterm" => {
-                // Check for other pending work before declaring "nothing to do"
-                let mut pending_parts: Vec<String> = Vec::new();
-
-                {
+                // Build queue preview (skip "진행 중인 턴" — silently handled)
+                let queue_preview = {
                     let data = shared.core.lock().await;
-                    if data.cancel_tokens.contains_key(&channel_id) {
-                        pending_parts.push("진행 중인 턴이 있습니다".to_string());
-                    }
                     if let Some(queue) = data.intervention_queue.get(&channel_id) {
-                        let count = queue.len();
-                        if count > 0 {
-                            pending_parts
-                                .push(format!("대기 중인 메시지 {}건이 있습니다", count));
+                        let items: Vec<String> = queue.iter().take(5).map(|item| {
+                            let raw: String = item.text.lines().next().unwrap_or("").chars().take(50).collect();
+                            // Escape mentions to prevent re-triggering @everyone/@here/role/user mentions
+                            let preview = raw.replace('@', "@\u{200B}");
+                            format!("• <@{}>: {}", item.author_id, preview)
+                        }).collect();
+                        if items.is_empty() {
+                            None
+                        } else {
+                            let overflow = if queue.len() > 5 {
+                                format!("\n... +{}건", queue.len() - 5)
+                            } else {
+                                String::new()
+                            };
+                            Some(format!("대기 메시지 {}건:\n{}{}", queue.len(), items.join("\n"), overflow))
                         }
+                    } else {
+                        None
                     }
-                }
+                };
 
-                // Check for other restart reports for this channel
-                let other_reports = load_restart_reports(provider);
-                let other_pending = other_reports
-                    .iter()
-                    .filter(|r| r.channel_id == report.channel_id && r.status == "pending")
-                    .count();
-                if other_pending > 1 {
-                    pending_parts
-                        .push(format!("대기 중인 restart report {}건", other_pending - 1));
-                }
-
-                if pending_parts.is_empty() {
-                    format!(
-                        "재시작이 완료되었습니다. ({})",
-                        report.summary
-                    )
-                } else {
-                    format!(
-                        "재시작이 완료되었습니다. ({}). {}.",
-                        report.summary,
-                        pending_parts.join(", ")
-                    )
+                match queue_preview {
+                    Some(preview) => format!("✅ 재시작 완료. {preview}"),
+                    None => "✅ 재시작 완료. 이어서 진행합니다.".to_string(),
                 }
             }
-            _ => format!("❌ dcserver restart failed: {}", report.summary),
+            _ => "❌ 재시작 실패. 관리자에게 문의하세요.".to_string(),
         };
+        // Log internal details (summary, status) for debugging
+        {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] 📝 restart report detail: status={}, summary={}",
+                report.status, report.summary
+            );
+        }
 
         for attempt in 1..=5 {
             match send_long_message_raw(http, channel_id, &text, shared).await {

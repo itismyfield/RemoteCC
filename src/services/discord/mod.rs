@@ -1,6 +1,8 @@
 mod formatting;
 mod handoff;
+pub(crate) mod health;
 mod inflight;
+mod metrics;
 mod meeting;
 mod pcd;
 mod prompt_builder;
@@ -79,30 +81,68 @@ const SESSION_MAX_IDLE: Duration = Duration::from_secs(24 * 60 * 60); // 1 day
 const RESTART_REPORT_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const DEFERRED_RESTART_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Minimum interval between Discord placeholder edits for progress status.
+/// Configurable via REMOTECC_STATUS_INTERVAL_SECS env var. Default: 5 seconds.
+pub(super) fn status_update_interval() -> Duration {
+    static CACHED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let secs = std::env::var("REMOTECC_STATUS_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(5);
+        Duration::from_secs(secs)
+    })
+}
+
+/// Turn watchdog timeout. Configurable via REMOTECC_TURN_TIMEOUT_SECS env var.
+/// Default: 1200 seconds (20 minutes).
+pub(super) fn turn_watchdog_timeout() -> Duration {
+    static CACHED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let secs = std::env::var("REMOTECC_TURN_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(1200);
+        Duration::from_secs(secs)
+    })
+}
+
 /// Check if a deferred restart has been requested and no active or finalizing turns remain
 /// **across all providers**.
 ///
 /// `global_active` / `global_finalizing` are process-wide counters shared by every provider.
 /// A single provider draining to zero is NOT sufficient — we must wait for every provider.
-pub(super) fn check_deferred_restart(global_active: usize, global_finalizing: usize) {
-    if global_active > 0 || global_finalizing > 0 {
+/// `shutdown_remaining` ensures all providers finish saving before any calls `exit(0)`.
+/// `shutdown_counted` (per-provider) prevents double-decrement when both deferred restart
+/// and SIGTERM paths run for the same provider.
+pub(super) fn check_deferred_restart(shared: &SharedData) {
+    let g_active = shared.global_active.load(std::sync::atomic::Ordering::Relaxed);
+    let g_finalizing = shared.global_finalizing.load(std::sync::atomic::Ordering::Relaxed);
+    if g_active > 0 || g_finalizing > 0 {
         return;
     }
-    let Some(root) = crate::remotecc_runtime_root() else {
-        return;
-    };
-    let marker = root.join("restart_pending");
-    if !marker.exists() {
+    if !shared.restart_pending.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    let version = fs::read_to_string(&marker).unwrap_or_default();
-    let version = version.trim();
-    let ts = chrono::Local::now().format("%H:%M:%S");
-    println!("  [{ts}] 🔄 Deferred restart: all turns complete, restarting for v{version}...");
-    // Remove marker before exiting
-    let _ = fs::remove_file(&marker);
-    // Exit cleanly — launchd KeepAlive will restart us
-    std::process::exit(0);
+    // CAS: ensure this provider only decrements once
+    if shared.shutdown_counted.compare_exchange(
+        false, true,
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Relaxed,
+    ).is_err() {
+        return;
+    }
+    // Only the last provider to finish calls exit(0)
+    if shared.shutdown_remaining.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+        let Some(root) = crate::remotecc_runtime_root() else { return; };
+        let marker = root.join("restart_pending");
+        let version = fs::read_to_string(&marker).unwrap_or_default();
+        let version = version.trim();
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        println!("  [{ts}] 🔄 Deferred restart: all turns complete, restarting for v{version}...");
+        let _ = fs::remove_file(&marker);
+        std::process::exit(0);
+    }
 }
 
 /// Per-channel session state
@@ -125,6 +165,8 @@ pub(super) struct DiscordSession {
     pub(super) last_shared_memory_ts: Option<String>,
     /// Restart generation at which this session was created/restored.
     pub(super) born_generation: u64,
+    /// Runtime model override (e.g. "opus", "sonnet"). None = use default.
+    pub(super) model_override: Option<String>,
 }
 
 /// Worktree info for sessions that were auto-redirected to avoid conflicts
@@ -207,7 +249,7 @@ pub(super) struct CoreState {
     pub(super) active_request_owner: HashMap<ChannelId, UserId>,
     /// Per-channel message queue: messages arriving during an active turn are queued here
     /// and executed as subsequent turns after the current one finishes.
-    intervention_queue: HashMap<ChannelId, Vec<Intervention>>,
+    pub(super) intervention_queue: HashMap<ChannelId, Vec<Intervention>>,
     /// Per-channel active meeting (one meeting per channel)
     active_meetings: HashMap<ChannelId, meeting::Meeting>,
 }
@@ -243,6 +285,27 @@ pub(super) struct SharedData {
     pub(super) global_active: Arc<std::sync::atomic::AtomicUsize>,
     /// Process-global finalizing turn counter shared across all providers.
     pub(super) global_finalizing: Arc<std::sync::atomic::AtomicUsize>,
+    /// Number of providers still needing to complete shutdown.
+    /// The last provider to decrement this to 0 calls `exit(0)`.
+    pub(super) shutdown_remaining: Arc<std::sync::atomic::AtomicUsize>,
+    /// Per-provider flag: ensures this provider decrements `shutdown_remaining` at most once,
+    /// even if both the deferred restart poll loop and SIGTERM handler run.
+    pub(super) shutdown_counted: std::sync::atomic::AtomicBool,
+    /// Intake-level dedup cache: prevents the same message from starting two turns
+    /// when duplicate bot dispatches arrive nearly simultaneously.
+    /// Key: dedup key (dispatch_id or channel+author+text hash), Value: first-seen Instant.
+    pub(super) intake_dedup: dashmap::DashMap<String, std::time::Instant>,
+    /// Set to true after Discord gateway ready event fires.
+    pub(super) bot_connected: std::sync::atomic::AtomicBool,
+    /// ISO 8601 timestamp of the last completed turn (for health reporting).
+    pub(super) last_turn_at: std::sync::Mutex<Option<String>>,
+    /// Per-channel model override, independent of session lifecycle.
+    /// Takes priority over role-map model. Cleared via `/model default`.
+    pub(super) model_overrides: dashmap::DashMap<ChannelId, String>,
+    /// Per-channel last processed message ID — used for startup catch-up polling.
+    pub(super) last_message_ids: dashmap::DashMap<ChannelId, u64>,
+    /// Per-channel turn start time — used for metrics duration calculation.
+    pub(super) turn_start_times: dashmap::DashMap<ChannelId, std::time::Instant>,
 }
 
 /// Poise user data type
@@ -399,6 +462,144 @@ fn load_pending_queues(provider: &ProviderKind) -> HashMap<ChannelId, Vec<Interv
         let _ = fs::remove_file(&path);
     }
     result
+}
+
+/// Startup catch-up polling: fetch messages that arrived during the restart gap.
+/// Uses saved last_message_ids to query Discord REST API for missed messages,
+/// filters out bot messages and duplicates, and inserts into intervention queue.
+async fn catch_up_missed_messages(
+    http: &Arc<serenity::Http>,
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+) {
+    let Some(root) = runtime_store::last_message_root() else { return };
+    let dir = root.join(provider.as_str());
+    if !dir.is_dir() {
+        return;
+    }
+
+    let Ok(entries) = fs::read_dir(&dir) else { return };
+    let mut total_recovered = 0usize;
+    let now = Instant::now();
+    let max_age = std::time::Duration::from_secs(300); // Only catch up messages within 5 minutes
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        let Ok(channel_id_raw) = stem.parse::<u64>() else { continue };
+        let Ok(last_id_str) = fs::read_to_string(&path) else { continue };
+        let Ok(last_id) = last_id_str.trim().parse::<u64>() else { continue };
+
+        let channel_id = ChannelId::new(channel_id_raw);
+        let after_msg = MessageId::new(last_id);
+
+        // Fetch messages after last_id (Discord returns oldest first with after=)
+        let messages = match channel_id
+            .messages(
+                http,
+                serenity::builder::GetMessages::new()
+                    .after(after_msg)
+                    .limit(10),
+            )
+            .await
+        {
+            Ok(msgs) => msgs,
+            Err(e) => {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                eprintln!("  [{ts}] ⚠ catch-up: failed to fetch messages for channel {channel_id}: {e}");
+                continue;
+            }
+        };
+
+        if messages.is_empty() {
+            continue;
+        }
+
+        // Get bot's own user ID to filter out self-messages
+        let bot_user_id = {
+            let settings = shared.settings.read().await;
+            settings.owner_user_id
+        };
+
+        // Collect existing message IDs in queue for dedup
+        let existing_ids: std::collections::HashSet<u64> = {
+            let data = shared.core.lock().await;
+            data.intervention_queue
+                .get(&channel_id)
+                .map(|q| q.iter().map(|i| i.message_id.get()).collect())
+                .unwrap_or_default()
+        };
+
+        let allowed_bot_ids: Vec<u64> = {
+            let settings = shared.settings.read().await;
+            settings.allowed_bot_ids.clone()
+        };
+
+        let mut channel_recovered = 0usize;
+        let mut max_recovered_id: Option<u64> = None;
+        let mut data = shared.core.lock().await;
+        let queue = data.intervention_queue.entry(channel_id).or_default();
+
+        for msg in &messages {
+            // Skip own messages
+            if Some(msg.author.id.get()) == bot_user_id {
+                continue;
+            }
+            // Skip if already in queue
+            if existing_ids.contains(&msg.id.get()) {
+                continue;
+            }
+            // Skip messages older than max_age (use message snowflake timestamp)
+            let msg_ts = msg.id.created_at();
+            let msg_age = chrono::Utc::now().signed_duration_since(*msg_ts);
+            if msg_age.num_seconds() > max_age.as_secs() as i64 {
+                continue;
+            }
+            let text = msg.content.trim();
+            if text.is_empty() {
+                continue;
+            }
+            // Only process messages from allowed bots or authorized users
+            let is_allowed = !msg.author.bot || allowed_bot_ids.contains(&msg.author.id.get());
+            if !is_allowed {
+                continue;
+            }
+
+            queue.push(Intervention {
+                author_id: msg.author.id,
+                message_id: msg.id,
+                text: text.to_string(),
+                mode: InterventionMode::Soft,
+                created_at: now,
+            });
+            channel_recovered += 1;
+            // Track the newest actually-recovered message for checkpoint
+            let mid = msg.id.get();
+            if max_recovered_id.map(|m| mid > m).unwrap_or(true) {
+                max_recovered_id = Some(mid);
+            }
+        }
+        drop(data);
+
+        if channel_recovered > 0 {
+            total_recovered += channel_recovered;
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] 🔍 CATCH-UP: recovered {} message(s) for channel {}",
+                channel_recovered, channel_id
+            );
+        }
+
+        // Only advance checkpoint if we actually recovered messages
+        if let Some(newest) = max_recovered_id {
+            shared.last_message_ids.insert(channel_id, newest);
+        }
+    }
+
+    if total_recovered > 0 {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        println!("  [{ts}] 🔍 CATCH-UP: total {total_recovered} message(s) recovered across channels");
+    }
 }
 
 /// Execute durable handoff turns saved before a restart.
@@ -759,6 +960,101 @@ fn scan_skills(provider: &ProviderKind, project_path: Option<&str>) -> Vec<(Stri
     skills
 }
 
+/// Compute a lightweight fingerprint of skill directories: (file_count, max_mtime_epoch).
+/// Used by the hot-reload poll to detect additions, modifications, and deletions.
+fn skill_dir_fingerprint(provider: &ProviderKind) -> (usize, u64) {
+    let mut count = 0usize;
+    let mut max_mtime = 0u64;
+
+    let dirs: Vec<std::path::PathBuf> = match provider {
+        ProviderKind::Claude => {
+            let mut v = Vec::new();
+            if let Some(home) = dirs::home_dir() {
+                v.push(home.join(".claude").join("commands"));
+            }
+            v
+        }
+        ProviderKind::Codex => {
+            let mut v = Vec::new();
+            if let Some(home) = dirs::home_dir() {
+                v.push(home.join(".codex").join("skills"));
+            }
+            v
+        }
+        _ => vec![],
+    };
+
+    fn walk_mtime(dir: &Path, count: &mut usize, max_mtime: &mut u64) {
+        let Ok(entries) = fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk_mtime(&path, count, max_mtime);
+            } else if path.extension().map(|e| e == "md").unwrap_or(false) {
+                *count += 1;
+                if let Ok(meta) = fs::metadata(&path) {
+                    if let Ok(mt) = meta.modified() {
+                        let epoch = mt
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        if epoch > *max_mtime {
+                            *max_mtime = epoch;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for dir in &dirs {
+        walk_mtime(dir, &mut count, &mut max_mtime);
+    }
+
+    (count, max_mtime)
+}
+
+/// Like `skill_dir_fingerprint` but also includes project-level skill directories.
+fn skill_dir_fingerprint_with_projects(provider: &ProviderKind, project_paths: &[String]) -> (usize, u64) {
+    let (mut count, mut max_mtime) = skill_dir_fingerprint(provider);
+
+    fn walk_mtime(dir: &Path, count: &mut usize, max_mtime: &mut u64) {
+        let Ok(entries) = fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk_mtime(&path, count, max_mtime);
+            } else if path.extension().map(|e| e == "md").unwrap_or(false) {
+                *count += 1;
+                if let Ok(meta) = fs::metadata(&path) {
+                    if let Ok(mt) = meta.modified() {
+                        let epoch = mt
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        if epoch > *max_mtime {
+                            *max_mtime = epoch;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for path in project_paths {
+        let proj_dir = match provider {
+            ProviderKind::Claude => Path::new(path).join(".claude").join("commands"),
+            ProviderKind::Codex => Path::new(path).join(".codex").join("skills"),
+            _ => continue,
+        };
+        if proj_dir.is_dir() {
+            walk_mtime(&proj_dir, &mut count, &mut max_mtime);
+        }
+    }
+
+    (count, max_mtime)
+}
+
 fn resolve_codex_skill_file(path: &Path) -> Option<std::path::PathBuf> {
     if path.is_dir() {
         let skill_path = path.join("SKILL.md");
@@ -775,6 +1071,8 @@ pub async fn run_bot(
     provider: ProviderKind,
     global_active: Arc<std::sync::atomic::AtomicUsize>,
     global_finalizing: Arc<std::sync::atomic::AtomicUsize>,
+    shutdown_remaining: Arc<std::sync::atomic::AtomicUsize>,
+    health_registry: Arc<health::HealthRegistry>,
 ) {
     // Initialize debug logging from environment variable
     claude::init_debug_from_env();
@@ -820,6 +1118,14 @@ pub async fn run_bot(
         restart_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         global_active,
         global_finalizing,
+        shutdown_remaining,
+        shutdown_counted: std::sync::atomic::AtomicBool::new(false),
+        intake_dedup: dashmap::DashMap::new(),
+        bot_connected: std::sync::atomic::AtomicBool::new(false),
+        last_turn_at: std::sync::Mutex::new(None),
+        model_overrides: dashmap::DashMap::new(),
+        last_message_ids: dashmap::DashMap::new(),
+        turn_start_times: dashmap::DashMap::new(),
     });
 
     {
@@ -829,6 +1135,9 @@ pub async fn run_bot(
             shared.current_generation
         );
     }
+
+    // Register this provider with the health check registry
+    health_registry.register(provider.as_str().to_string(), shared.clone()).await;
 
     let token_owned = token.to_string();
     let shared_clone = shared.clone();
@@ -845,6 +1154,9 @@ pub async fn run_bot(
                 cmd_down(),
                 cmd_shell(),
                 cmd_cc(),
+                cmd_metrics(),
+                cmd_model(),
+                cmd_queue(),
                 cmd_health(),
                 cmd_allowedtools(),
                 cmd_allowed(),
@@ -860,6 +1172,7 @@ pub async fn run_bot(
         .setup(move |ctx, _ready, framework| {
             let ctx_clone = ctx.clone();
             let shared_for_migrate = shared_clone.clone();
+            let health_registry_for_setup = health_registry.clone();
             Box::pin(async move {
                 // Register in each guild for instant slash command propagation
                 // (register_globally can take up to 1 hour)
@@ -878,6 +1191,8 @@ pub async fn run_bot(
                     "  ✓ Bot connected — Registered commands in {} guild(s)",
                     _ready.guilds.len()
                 );
+                shared_for_migrate.bot_connected.store(true, std::sync::atomic::Ordering::SeqCst);
+                health_registry_for_setup.register_http(ctx.http.clone()).await;
 
                 // Background: resolve category names for all known channels
                 let shared_for_tmux = shared_for_migrate.clone();
@@ -917,8 +1232,51 @@ pub async fn run_bot(
                                     println!("  [{ts}] 📋 DRAIN: saved {queue_count} pending queue item(s) before deferred restart");
                                 }
                             }
-                            check_deferred_restart(g_active, g_finalizing);
+                            check_deferred_restart(&shared_for_deferred);
+                            // This provider has saved and decremented — stop polling
+                            return;
                         }
+                    }
+                });
+
+                // Background: hot-reload skills on file changes (10s polling)
+                // Scans home-level AND all active project-level skill directories.
+                let shared_for_skills = shared_for_tmux.clone();
+                let provider_for_skills = provider.clone();
+                tokio::spawn(async move {
+                    let mut last_fingerprint: (usize, u64) = (0, 0); // (file_count, max_mtime_epoch)
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                        // Collect unique project paths from active sessions
+                        let project_paths: Vec<String> = {
+                            let data = shared_for_skills.core.lock().await;
+                            let mut paths: Vec<String> = data.sessions.values()
+                                .filter_map(|s| s.current_path.clone())
+                                .collect();
+                            paths.sort();
+                            paths.dedup();
+                            paths
+                        };
+                        let fp = skill_dir_fingerprint_with_projects(&provider_for_skills, &project_paths);
+                        if fp != last_fingerprint && last_fingerprint != (0, 0) {
+                            // Merge home + all project skills (scan_skills deduplicates by name)
+                            let mut merged = scan_skills(&provider_for_skills, None);
+                            let mut seen: std::collections::HashSet<String> =
+                                merged.iter().map(|(n, _)| n.clone()).collect();
+                            for path in &project_paths {
+                                for skill in scan_skills(&provider_for_skills, Some(path)) {
+                                    if seen.insert(skill.0.clone()) {
+                                        merged.push(skill);
+                                    }
+                                }
+                            }
+                            merged.sort_by(|a, b| a.0.cmp(&b.0));
+                            let count = merged.len();
+                            *shared_for_skills.skills_cache.write().await = merged;
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            println!("  [{ts}] 🔄 Skills hot-reloaded: {count} skill(s) ({} files, mtime Δ)", fp.0);
+                        }
+                        last_fingerprint = fp;
                     }
                 });
 
@@ -959,6 +1317,13 @@ pub async fn run_bot(
                         let ts = chrono::Local::now().format("%H:%M:%S");
                         println!("  [{ts}] 📋 FLUSH: restored {added} pending queue item(s) from disk (skipped {skipped} duplicates)");
                     }
+
+                    // Startup catch-up polling: recover messages lost during restart gap
+                    catch_up_missed_messages(
+                        &http_for_tmux,
+                        &shared_for_tmux2,
+                        &provider_for_restore,
+                    ).await;
 
                     restore_tmux_watchers(&http_for_tmux, &shared_for_tmux2).await;
                     cleanup_orphan_tmux_sessions(&shared_for_tmux2).await;
@@ -1142,7 +1507,28 @@ pub async fn run_bot(
                     }
                 }
 
-                std::process::exit(0);
+                // Persist last_message_ids for catch-up polling after restart
+                {
+                    let ids: std::collections::HashMap<u64, u64> = shared_for_signal
+                        .last_message_ids.iter()
+                        .map(|entry| (entry.key().get(), *entry.value()))
+                        .collect();
+                    if !ids.is_empty() {
+                        runtime_store::save_all_last_message_ids(provider_for_shutdown.as_str(), &ids);
+                    }
+                }
+
+                // Wait for all providers to finish saving before exiting.
+                // CAS guard: skip if this provider already decremented via deferred restart path.
+                if shared_for_signal.shutdown_counted.compare_exchange(
+                    false, true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Relaxed,
+                ).is_ok() {
+                    if shared_for_signal.shutdown_remaining.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+                        std::process::exit(0);
+                    }
+                }
             }
         }
     });
@@ -1678,6 +2064,7 @@ async fn cmd_start(
                 worktree: None,
                 last_shared_memory_ts: None,
                 born_generation: runtime_store::load_generation(),
+                model_override: None,
             });
         session.channel_id = Some(channel_id.get());
         session.channel_name = ch_name;
@@ -2210,6 +2597,233 @@ async fn build_inflight_report(
         current_section,
         saved_channels
     )
+}
+
+/// /metrics — Show turn metrics summary
+#[poise::command(slash_command, rename = "metrics")]
+async fn cmd_metrics(
+    ctx: Context<'_>,
+    #[description = "Date (YYYY-MM-DD), default today"] date: Option<String>,
+) -> Result<(), Error> {
+    let user_id = ctx.author().id;
+    let user_name = &ctx.author().name;
+    if !check_auth(user_id, user_name, &ctx.data().shared, &ctx.data().token).await {
+        return Ok(());
+    }
+
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    println!("  [{ts}] ◀ [{user_name}] /metrics");
+
+    let data = match &date {
+        Some(d) => metrics::load_date(d),
+        None => metrics::load_today(),
+    };
+    let label_owned = date.as_deref().unwrap_or("today");
+    let text = metrics::build_metrics_report(&data, label_owned);
+    send_long_message_ctx(ctx, &text).await?;
+    Ok(())
+}
+
+/// /model — Set or view the model override for this channel
+#[poise::command(slash_command, rename = "model")]
+async fn cmd_model(
+    ctx: Context<'_>,
+    #[description = "Model name (opus/sonnet/haiku) or 'default' to clear"] model: Option<String>,
+) -> Result<(), Error> {
+    let user_id = ctx.author().id;
+    let user_name = &ctx.author().name;
+    if !check_auth(user_id, user_name, &ctx.data().shared, &ctx.data().token).await {
+        return Ok(());
+    }
+
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    let channel_id = ctx.channel_id();
+
+    // Model override only applies to Claude provider
+    if !matches!(ctx.data().provider, ProviderKind::Claude) {
+        println!("  [{ts}] ◀ [{user_name}] /model (unsupported provider)");
+        ctx.say("Model override is only supported for Claude channels.").await?;
+        return Ok(());
+    }
+
+    match model {
+        Some(m) => {
+            if m == "default" || m == "none" || m == "clear" {
+                ctx.data().shared.model_overrides.remove(&channel_id);
+            } else {
+                ctx.data().shared.model_overrides.insert(channel_id, m.clone());
+            }
+            let display = ctx.data().shared.model_overrides.get(&channel_id)
+                .map(|v| v.clone())
+                .unwrap_or_else(|| "(default)".to_string());
+            println!("  [{ts}] ◀ [{user_name}] /model {m}");
+            ctx.say(format!("Model set to **{display}** for this channel. Takes effect on next turn.")).await?;
+        }
+        None => {
+            let override_model = ctx.data().shared.model_overrides.get(&channel_id)
+                .map(|v| v.clone());
+            let ch_name = {
+                let d = ctx.data().shared.core.lock().await;
+                d.sessions.get(&channel_id).and_then(|s| s.channel_name.clone())
+            };
+            let role_model = resolve_role_binding(channel_id, ch_name.as_deref())
+                .and_then(|rb| rb.model);
+            let effective = override_model.as_deref()
+                .or(role_model.as_deref())
+                .unwrap_or("(default)");
+            let source = if override_model.is_some() {
+                "runtime override"
+            } else if role_model.is_some() {
+                "role-map"
+            } else {
+                "system default"
+            };
+            println!("  [{ts}] ◀ [{user_name}] /model");
+            ctx.say(format!("Model: **{effective}** (source: {source})")).await?;
+        }
+    }
+    Ok(())
+}
+
+/// /queue — Show pending intervention queue state
+#[poise::command(slash_command, rename = "queue")]
+async fn cmd_queue(
+    ctx: Context<'_>,
+    #[description = "Show all channels (omit for current channel only)"] all: Option<bool>,
+) -> Result<(), Error> {
+    let user_id = ctx.author().id;
+    let user_name = &ctx.author().name;
+    if !check_auth(user_id, user_name, &ctx.data().shared, &ctx.data().token).await {
+        return Ok(());
+    }
+
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    println!("  [{ts}] ◀ [{user_name}] /queue");
+
+    let show_all = all.unwrap_or(false);
+    let text = build_queue_report(&ctx.data().shared, &ctx.data().provider, ctx.channel_id(), show_all).await;
+    send_long_message_ctx(ctx, &text).await?;
+    Ok(())
+}
+
+fn build_queue_report_sync(
+    data: &CoreState,
+    provider: &ProviderKind,
+    current_channel: ChannelId,
+    show_all: bool,
+) -> String {
+    let now = Instant::now();
+    let mut lines = Vec::new();
+
+    // In-memory queues
+    let channels: Vec<_> = if show_all {
+        data.intervention_queue.iter().collect()
+    } else {
+        data.intervention_queue
+            .get(&current_channel)
+            .map(|q| vec![(&current_channel, q)])
+            .unwrap_or_default()
+    };
+
+    let total_in_memory: usize = if show_all {
+        data.intervention_queue.values().map(|q| q.len()).sum()
+    } else {
+        channels.iter().map(|(_, q)| q.len()).sum()
+    };
+
+    lines.push(format!("**📋 Pending Queue{}**", if show_all { " (all channels)" } else { "" }));
+
+    if channels.is_empty() || total_in_memory == 0 {
+        lines.push("  In-memory: (empty)".to_string());
+    } else {
+        lines.push(format!("  In-memory: {} item(s)", total_in_memory));
+        for (ch_id, queue) in &channels {
+            if queue.is_empty() {
+                continue;
+            }
+            lines.push(format!("  **#{}** — {} queued", ch_id, queue.len()));
+            for (i, item) in queue.iter().enumerate().take(5) {
+                let age = now.duration_since(item.created_at).as_secs();
+                let preview = truncate_str(&item.text, 60);
+                lines.push(format!(
+                    "    {}. `<@{}>` {}s ago: {}",
+                    i + 1,
+                    item.author_id,
+                    age,
+                    preview
+                ));
+            }
+            if queue.len() > 5 {
+                lines.push(format!("    ... +{} more", queue.len() - 5));
+            }
+        }
+    }
+
+    // Disk-persisted queues (scoped to current_channel unless show_all)
+    if let Some(root) = runtime_store::discord_pending_queue_root() {
+        let dir = root.join(provider.as_str());
+        if dir.is_dir() {
+            let mut disk_count = 0usize;
+            let target_file = if show_all {
+                None
+            } else {
+                Some(dir.join(format!("{}.json", current_channel)))
+            };
+            let paths: Vec<std::path::PathBuf> = if let Some(ref tf) = target_file {
+                if tf.is_file() { vec![tf.clone()] } else { vec![] }
+            } else if let Ok(entries) = std::fs::read_dir(&dir) {
+                entries.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().map(|e| e == "json").unwrap_or(false))
+                    .collect()
+            } else {
+                vec![]
+            };
+            for path in &paths {
+                if let Ok(contents) = std::fs::read_to_string(path) {
+                    if let Ok(items) = serde_json::from_str::<Vec<PendingQueueItem>>(&contents) {
+                        if !items.is_empty() {
+                            let ch_name = path.file_stem()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            // Use file mtime as approximate queue age
+                            let age_str = std::fs::metadata(path)
+                                .and_then(|m| m.modified())
+                                .ok()
+                                .and_then(|mt| std::time::SystemTime::now().duration_since(mt).ok())
+                                .map(|d| format!(" (saved ~{}s ago)", d.as_secs()))
+                                .unwrap_or_default();
+                            lines.push(format!("  **Disk** #{} — {} item(s){}", ch_name, items.len(), age_str));
+                            for (i, item) in items.iter().enumerate().take(3) {
+                                let preview = truncate_str(&item.text, 60);
+                                lines.push(format!("    {}. `<@{}>`: {}", i + 1, item.author_id, preview));
+                            }
+                            disk_count += items.len();
+                        }
+                    }
+                }
+            }
+            if disk_count > 0 {
+                lines.push(format!("  Disk total: {} item(s)", disk_count));
+            } else {
+                lines.push("  Disk: (empty)".to_string());
+            }
+        } else {
+            lines.push("  Disk: (no directory)".to_string());
+        }
+    }
+
+    lines.join("\n")
+}
+
+async fn build_queue_report(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    current_channel: ChannelId,
+    show_all: bool,
+) -> String {
+    let data = shared.core.lock().await;
+    build_queue_report_sync(&data, provider, current_channel, show_all)
 }
 
 /// /health — Show runtime health summary
@@ -3370,6 +3984,7 @@ async fn auto_restore_session(
                     worktree: None,
                     last_shared_memory_ts: None,
                     born_generation: runtime_store::load_generation(),
+                    model_override: None,
                 });
             session.channel_id = Some(channel_id.get());
             session.last_active = tokio::time::Instant::now();
@@ -3435,6 +4050,7 @@ async fn bootstrap_thread_session(
             worktree: None,
             last_shared_memory_ts: None,
             born_generation: runtime_store::load_generation(),
+            model_override: None,
         });
     session.current_path = Some(parent_path.to_string());
     if let Some((session_data, _)) = existing {

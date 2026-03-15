@@ -121,6 +121,48 @@ pub(super) async fn handle_event(
                 }
             }
 
+            // ── Intake-level dedup guard ──────────────────────────────────
+            // Prevents the same bot dispatch from starting two parallel turns
+            // when Discord delivers the message twice in rapid succession.
+            if new_message.author.bot {
+                let dedup_key = if let Some(dispatch_id) = super::pcd::parse_dispatch_id(text) {
+                    format!("dispatch:{}", dispatch_id)
+                } else {
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    channel_id.get().hash(&mut hasher);
+                    user_id.get().hash(&mut hasher);
+                    text.hash(&mut hasher);
+                    format!("bot:{}:{:x}", channel_id, hasher.finish())
+                };
+
+                const INTAKE_DEDUP_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+                let now = std::time::Instant::now();
+
+                // Lazy cleanup: remove expired entries (cheap — runs only on bot messages)
+                data.shared.intake_dedup.retain(|_, v| now.duration_since(*v) < INTAKE_DEDUP_TTL);
+
+                // Atomic check+insert via entry() — holds shard lock so two
+                // simultaneous arrivals cannot both see a miss.
+                let is_duplicate = match data.shared.intake_dedup.entry(dedup_key.clone()) {
+                    dashmap::mapref::entry::Entry::Occupied(e) => {
+                        now.duration_since(*e.get()) < INTAKE_DEDUP_TTL
+                    }
+                    dashmap::mapref::entry::Entry::Vacant(e) => {
+                        e.insert(now);
+                        false
+                    }
+                };
+                if is_duplicate {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    println!(
+                        "  [{ts}] ⏭ DEDUP: skipping duplicate intake in channel {} (key={})",
+                        channel_id, dedup_key
+                    );
+                    return Ok(());
+                }
+            }
+
             // Queue messages while AI is in progress (executed as next turn after current finishes)
             {
                 let mut d = data.shared.core.lock().await;
@@ -149,6 +191,8 @@ pub(super) async fn handle_event(
                         return Ok(());
                     }
 
+                    // Checkpoint: message successfully queued
+                    data.shared.last_message_ids.insert(channel_id, new_message.id.get());
                     return Ok(());
                 }
             }
@@ -186,6 +230,8 @@ pub(super) async fn handle_event(
                         "⏸ 재시작 대기 중 — 메시지가 큐에 저장되었고, 재시작 후 처리됩니다.",
                     )
                     .await;
+                // Checkpoint: message successfully queued in drain mode
+                data.shared.last_message_ids.insert(channel_id, new_message.id.get());
                 return Ok(());
             }
 
@@ -284,6 +330,9 @@ pub(super) async fn handle_event(
             } else {
                 None
             };
+
+            // Checkpoint: message about to be processed as a turn
+            data.shared.last_message_ids.insert(channel_id, new_message.id.get());
 
             handle_text_message(
                 ctx,
@@ -424,6 +473,7 @@ pub(super) async fn handle_text_message(
                                     worktree: None,
                                     last_shared_memory_ts: None,
                                     born_generation: super::runtime_store::load_generation(),
+                                    model_override: None,
                                 });
                         session.current_path = Some(eff_path.clone());
                         session.channel_name = ch_name_resolved;
@@ -633,6 +683,47 @@ pub(super) async fn handle_text_message(
         data.cancel_tokens.insert(channel_id, cancel_token.clone());
         data.active_request_owner.insert(channel_id, request_owner);
     }
+    shared.turn_start_times.insert(channel_id, std::time::Instant::now());
+
+    // Spawn turn watchdog — cancels the turn if it exceeds the timeout
+    {
+        let watchdog_token = cancel_token.clone();
+        let watchdog_shared = shared.clone();
+        let watchdog_http = ctx.http.clone();
+        let timeout = super::turn_watchdog_timeout();
+        tokio::spawn(async move {
+            tokio::time::sleep(timeout).await;
+            // If the token is still alive (not yet cancelled/completed), this turn is hung
+            if !watchdog_token.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                // Check if this channel still has this cancel token (turn not yet finalized)
+                let still_active = {
+                    let data = watchdog_shared.core.lock().await;
+                    data.cancel_tokens.contains_key(&channel_id)
+                };
+                if still_active {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    println!(
+                        "  [{ts}] ⏰ WATCHDOG: turn timeout ({:.0}s) for channel {}, cancelling",
+                        timeout.as_secs_f64(), channel_id
+                    );
+                    // Only send cancel signal — do NOT remove cancel_tokens here.
+                    // turn_bridge finalization handles cleanup (cancel_tokens removal,
+                    // global_active decrement, queued turn kickoff) to preserve
+                    // the single-active-turn invariant.
+                    super::turn_bridge::cancel_active_token(&watchdog_token, true, "watchdog timeout");
+
+                    // Notify Discord
+                    let timeout_mins = timeout.as_secs() / 60;
+                    let _ = channel_id
+                        .say(&watchdog_http, format!(
+                            "⚠️ 턴이 {}분 타임아웃으로 자동 중단되었습니다. 다음 메시지를 보내면 새 턴이 시작됩니다.",
+                            timeout_mins
+                        ))
+                        .await;
+                }
+            }
+        });
+    }
 
     // Resolve remote profile for this channel
     let remote_profile = {
@@ -770,6 +861,21 @@ pub(super) async fn handle_text_message(
         }
     }
 
+    // Resolve model: DashMap override > role-map > default
+    let model_for_turn: Option<String> = {
+        let dashmap_model = shared.model_overrides.get(&channel_id).map(|v| v.clone());
+        if dashmap_model.is_some() {
+            dashmap_model
+        } else {
+            let ch_name = {
+                let data = shared.core.lock().await;
+                data.sessions.get(&channel_id).and_then(|s| s.channel_name.clone())
+            };
+            resolve_role_binding(channel_id, ch_name.as_deref())
+                .and_then(|rb| rb.model)
+        }
+    };
+
     // Run the provider in a blocking thread
     let provider_for_blocking = provider.clone();
     tokio::task::spawn_blocking(move || {
@@ -786,6 +892,7 @@ pub(super) async fn handle_text_message(
                 tmux_session_name.as_deref(),
                 Some(channel_id.get()),
                 Some(provider_for_blocking.clone()),
+                model_for_turn.as_deref(),
             ),
             ProviderKind::Codex => codex::execute_command_streaming(
                 &context_prompt,

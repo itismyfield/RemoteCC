@@ -82,6 +82,33 @@ pub fn increment_generation() -> u64 {
     next
 }
 
+pub(super) fn last_message_root() -> Option<PathBuf> {
+    runtime_root().map(|root| root.join("last_message"))
+}
+
+/// Save the last processed message ID for a channel.
+pub(super) fn save_last_message_id(provider: &str, channel_id: u64, message_id: u64) {
+    let Some(root) = last_message_root() else { return };
+    let dir = root.join(provider);
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join(format!("{}.txt", channel_id));
+    let _ = atomic_write(&path, &message_id.to_string());
+}
+
+/// Load the last processed message ID for a channel.
+pub(super) fn load_last_message_id(provider: &str, channel_id: u64) -> Option<u64> {
+    let root = last_message_root()?;
+    let path = root.join(provider).join(format!("{}.txt", channel_id));
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Save all last_message_ids from a map (used during SIGTERM).
+pub(super) fn save_all_last_message_ids(provider: &str, ids: &std::collections::HashMap<u64, u64>) {
+    for (channel_id, message_id) in ids {
+        save_last_message_id(provider, *channel_id, *message_id);
+    }
+}
+
 pub(super) fn atomic_write(path: &Path, data: &str) -> Result<(), String> {
     let tmp = path.with_extension("tmp");
     let mut file = fs::File::create(&tmp).map_err(|e| e.to_string())?;

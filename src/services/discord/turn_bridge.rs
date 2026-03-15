@@ -169,6 +169,8 @@ pub(super) fn spawn_turn_bridge(
         let defer_watcher_resume = bridge.defer_watcher_resume;
         let completion_tx = bridge.completion_tx;
         let mut inflight_state = bridge.inflight_state.clone();
+        let mut last_status_edit = tokio::time::Instant::now();
+        let status_interval = super::status_update_interval();
 
         let _ = save_inflight_state(&inflight_state);
 
@@ -408,7 +410,15 @@ pub(super) fn spawn_turn_bridge(
             let indicator = SPINNER[spin_idx % SPINNER.len()];
             spin_idx += 1;
 
-            let tool_status = current_tool_line.as_deref().unwrap_or("Processing...");
+            let raw_tool_status = current_tool_line.as_deref()
+                .or_else(|| {
+                    // Fallback: last non-empty line from response as status hint
+                    full_response.lines().rev()
+                        .find(|l| !l.trim().is_empty() && l.trim().len() > 3)
+                        .map(|l| l.trim())
+                })
+                .unwrap_or("Processing...");
+            let tool_status = super::formatting::humanize_tool_status(raw_tool_status);
             let current_portion = if response_sent_offset < full_response.len() {
                 &full_response[response_sent_offset..]
             } else {
@@ -424,7 +434,9 @@ pub(super) fn spawn_turn_bridge(
                 format!("{}{}", body, footer)
             };
 
-            if stable_display_text != last_edit_text && !done {
+            if stable_display_text != last_edit_text && !done
+                && last_status_edit.elapsed() >= status_interval
+            {
                 rate_limit_wait(&shared_owned, channel_id).await;
                 let _ = channel_id
                     .edit_message(
@@ -434,6 +446,7 @@ pub(super) fn spawn_turn_bridge(
                     )
                     .await;
                 last_edit_text = stable_display_text;
+                last_status_edit = tokio::time::Instant::now();
                 inflight_state.current_msg_id = current_msg_id.get();
                 inflight_state.current_msg_len = last_edit_text.len();
                 inflight_state.response_sent_offset = response_sent_offset;
@@ -634,6 +647,30 @@ pub(super) fn spawn_turn_bridge(
 
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!("  [{ts}] ▶ Response sent");
+            if let Ok(mut last) = shared_owned.last_turn_at.lock() {
+                *last = Some(chrono::Local::now().to_rfc3339());
+            }
+
+            // Record turn metrics
+            {
+                let duration = shared_owned.turn_start_times
+                    .remove(&channel_id)
+                    .map(|(_, start)| start.elapsed().as_secs_f64())
+                    .unwrap_or(0.0);
+                let provider_name = {
+                    let settings = shared_owned.settings.read().await;
+                    settings.provider.as_str().to_string()
+                };
+                super::metrics::record_turn(&super::metrics::TurnMetric {
+                    channel_id: channel_id.get(),
+                    provider: provider_name,
+                    timestamp: chrono::Local::now().to_rfc3339(),
+                    duration_secs: duration,
+                    model: None, // model info from StatusUpdate not yet accumulated in turn_bridge
+                    input_tokens: if accumulated_tokens > 0 { Some(accumulated_tokens) } else { None },
+                    output_tokens: None, // output tokens tracked separately if needed
+                });
+            }
         }
 
         if should_resume_watcher_after_turn(
@@ -705,18 +742,16 @@ pub(super) fn spawn_turn_bridge(
         clear_inflight_state(&provider, channel_id.get());
         shared_owned.recovering_channels.remove(&channel_id);
 
-        // Finalization complete — decrement counters and check deferred restart
+        // Finalization complete — decrement counters
         shared_owned
             .finalizing_turns
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        let g_finalizing = shared_owned
+        shared_owned
             .global_finalizing
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
-            - 1;
-        {
-            let g_active = shared_owned.global_active.load(std::sync::atomic::Ordering::Relaxed);
-            super::check_deferred_restart(g_active, g_finalizing);
-        }
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        // Note: deferred restart exit is handled by the 5-second poll loop in mod.rs,
+        // which saves pending queues before calling check_deferred_restart.
+        // Calling it here would risk exiting before other providers save their queues.
 
         if has_queued_turns {
             // Drain mode: if restart is pending, don't start new turns from queue.
