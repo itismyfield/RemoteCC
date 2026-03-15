@@ -782,6 +782,60 @@ fn scan_skills(provider: &ProviderKind, project_path: Option<&str>) -> Vec<(Stri
     skills
 }
 
+/// Compute a lightweight fingerprint of skill directories: (file_count, max_mtime_epoch).
+/// Used by the hot-reload poll to detect additions, modifications, and deletions.
+fn skill_dir_fingerprint(provider: &ProviderKind) -> (usize, u64) {
+    let mut count = 0usize;
+    let mut max_mtime = 0u64;
+
+    let dirs: Vec<std::path::PathBuf> = match provider {
+        ProviderKind::Claude => {
+            let mut v = Vec::new();
+            if let Some(home) = dirs::home_dir() {
+                v.push(home.join(".claude").join("commands"));
+            }
+            v
+        }
+        ProviderKind::Codex => {
+            let mut v = Vec::new();
+            if let Some(home) = dirs::home_dir() {
+                v.push(home.join(".codex").join("skills"));
+            }
+            v
+        }
+        _ => vec![],
+    };
+
+    fn walk_mtime(dir: &Path, count: &mut usize, max_mtime: &mut u64) {
+        let Ok(entries) = fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk_mtime(&path, count, max_mtime);
+            } else if path.extension().map(|e| e == "md").unwrap_or(false) {
+                *count += 1;
+                if let Ok(meta) = fs::metadata(&path) {
+                    if let Ok(mt) = meta.modified() {
+                        let epoch = mt
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        if epoch > *max_mtime {
+                            *max_mtime = epoch;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for dir in &dirs {
+        walk_mtime(dir, &mut count, &mut max_mtime);
+    }
+
+    (count, max_mtime)
+}
+
 fn resolve_codex_skill_file(path: &Path) -> Option<std::path::PathBuf> {
     if path.is_dir() {
         let skill_path = path.join("SKILL.md");
@@ -953,6 +1007,25 @@ pub async fn run_bot(
                             // This provider has saved and decremented — stop polling
                             return;
                         }
+                    }
+                });
+
+                // Background: hot-reload skills on file changes (10s polling)
+                let shared_for_skills = shared_for_tmux.clone();
+                let provider_for_skills = provider.clone();
+                tokio::spawn(async move {
+                    let mut last_fingerprint: (usize, u64) = (0, 0); // (file_count, max_mtime_epoch)
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                        let fp = skill_dir_fingerprint(&provider_for_skills);
+                        if fp != last_fingerprint && last_fingerprint != (0, 0) {
+                            let new_skills = scan_skills(&provider_for_skills, None);
+                            let count = new_skills.len();
+                            *shared_for_skills.skills_cache.write().await = new_skills;
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            println!("  [{ts}] 🔄 Skills hot-reloaded: {count} skill(s) ({} files, mtime Δ)", fp.0);
+                        }
+                        last_fingerprint = fp;
                     }
                 });
 
