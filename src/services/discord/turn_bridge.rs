@@ -2,27 +2,7 @@ use super::handoff::{save_handoff, HandoffRecord};
 use super::restart_report::{clear_restart_report, save_restart_report, RestartCompletionReport};
 use super::*;
 use crate::services::tmux_diagnostics::record_tmux_exit_reason;
-
-fn tail_with_ellipsis(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-
-    if max_chars <= 1 {
-        return "…".to_string();
-    }
-
-    let keep = max_chars.saturating_sub(1);
-    let tail: String = text
-        .chars()
-        .rev()
-        .take(keep)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("…{}", tail)
-}
+use crate::utils::format::tail_with_ellipsis;
 
 pub(super) fn cancel_active_token(token: &Arc<CancelToken>, cleanup_tmux: bool, reason: &str) {
     token.cancelled.store(true, Ordering::Relaxed);
@@ -416,14 +396,8 @@ pub(super) fn spawn_turn_bridge(
             let indicator = SPINNER[spin_idx % SPINNER.len()];
             spin_idx += 1;
 
-            let raw_tool_status = current_tool_line.as_deref()
-                .or_else(|| {
-                    // Fallback: last non-empty line from response as status hint
-                    full_response.lines().rev()
-                        .find(|l| !l.trim().is_empty() && l.trim().len() > 3)
-                        .map(|l| l.trim())
-                })
-                .unwrap_or("Processing...");
+            let raw_tool_status = super::formatting::resolve_raw_tool_status(
+                current_tool_line.as_deref(), &full_response);
             let tool_status = super::formatting::humanize_tool_status(raw_tool_status);
             let current_portion = if response_sent_offset < full_response.len() {
                 &full_response[response_sent_offset..]

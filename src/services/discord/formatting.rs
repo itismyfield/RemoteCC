@@ -859,6 +859,21 @@ pub(super) async fn remove_reaction_raw(
     }
 }
 
+/// Determine the raw tool status string for Discord status display.
+/// Shared by turn_bridge and tmux watcher to avoid duplicating fallback logic.
+pub(super) fn resolve_raw_tool_status<'a>(
+    current_tool_line: Option<&'a str>,
+    full_response: &'a str,
+) -> &'a str {
+    current_tool_line
+        .or_else(|| {
+            full_response.lines().rev()
+                .find(|l| !l.trim().is_empty() && l.trim().len() > 3)
+                .map(|l| l.trim())
+        })
+        .unwrap_or("Processing...")
+}
+
 /// Convert a technical tool status line into a human-friendly label with emoji.
 pub(super) fn humanize_tool_status(tool_line: &str) -> String {
     // Thinking: pass through as-is (already formatted with 💭 prefix)

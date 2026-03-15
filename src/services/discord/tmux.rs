@@ -16,38 +16,9 @@ use super::formatting::{
 use super::settings::{channel_supports_provider, resolve_role_binding};
 use super::{rate_limit_wait, SharedData, TmuxWatcherHandle, DISCORD_MSG_LIMIT};
 
-/// Tail a string to fit within max_chars, prepending "…" if truncated.
-fn watcher_tail(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    if max_chars <= 1 {
-        return "…".to_string();
-    }
-    let keep = max_chars.saturating_sub(1);
-    let tail: String = text
-        .chars()
-        .rev()
-        .take(keep)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("…{}", tail)
-}
+use crate::utils::format::tail_with_ellipsis;
 
-fn current_tmux_owner_marker() -> String {
-    std::env::var("REMOTECC_ROOT_DIR")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .or_else(|| dirs::home_dir().map(|home| home.join(".remotecc").display().to_string()))
-        .unwrap_or_else(|| ".remotecc".to_string())
-}
-
-fn tmux_owner_path(session_name: &str) -> String {
-    format!("/tmp/remotecc-{}.owner", session_name)
-}
+use crate::services::tmux_common::{current_tmux_owner_marker, tmux_owner_path};
 
 fn session_belongs_to_current_runtime(session_name: &str, current_owner_marker: &str) -> bool {
     std::fs::read_to_string(tmux_owner_path(session_name))
@@ -252,16 +223,8 @@ pub(super) async fn tmux_output_watcher(
                     let indicator = SPINNER[spin_idx % SPINNER.len()];
                     spin_idx += 1;
 
-                    let raw_tool_status = tool_state
-                        .current_tool_line
-                        .as_deref()
-                        .or_else(|| {
-                            // Fallback: extract last non-empty line from response as status hint
-                            full_response.lines().rev()
-                                .find(|l| !l.trim().is_empty() && l.trim().len() > 3)
-                                .map(|l| l.trim())
-                        })
-                        .unwrap_or("Processing...");
+                    let raw_tool_status = super::formatting::resolve_raw_tool_status(
+                        tool_state.current_tool_line.as_deref(), &full_response);
                     let tool_status = super::formatting::humanize_tool_status(raw_tool_status);
                     let footer = format!("\n\n{} {}", indicator, tool_status);
                     let body_budget = DISCORD_MSG_LIMIT.saturating_sub(footer.len() + 10);
@@ -269,7 +232,7 @@ pub(super) async fn tmux_output_watcher(
                         format!("{} {}", indicator, tool_status)
                     } else {
                         let normalized = normalize_empty_lines(&full_response);
-                        let body = watcher_tail(&normalized, body_budget.max(1));
+                        let body = tail_with_ellipsis(&normalized, body_budget.max(1));
                         format!("{}{}", body, footer)
                     };
 
