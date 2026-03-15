@@ -301,6 +301,8 @@ pub(super) struct SharedData {
     /// Per-channel model override, independent of session lifecycle.
     /// Takes priority over role-map model. Cleared via `/model default`.
     pub(super) model_overrides: dashmap::DashMap<ChannelId, String>,
+    /// Per-channel last processed message ID — used for startup catch-up polling.
+    pub(super) last_message_ids: dashmap::DashMap<ChannelId, u64>,
 }
 
 /// Poise user data type
@@ -457,6 +459,138 @@ fn load_pending_queues(provider: &ProviderKind) -> HashMap<ChannelId, Vec<Interv
         let _ = fs::remove_file(&path);
     }
     result
+}
+
+/// Startup catch-up polling: fetch messages that arrived during the restart gap.
+/// Uses saved last_message_ids to query Discord REST API for missed messages,
+/// filters out bot messages and duplicates, and inserts into intervention queue.
+async fn catch_up_missed_messages(
+    http: &Arc<serenity::Http>,
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+) {
+    let Some(root) = runtime_store::last_message_root() else { return };
+    let dir = root.join(provider.as_str());
+    if !dir.is_dir() {
+        return;
+    }
+
+    let Ok(entries) = fs::read_dir(&dir) else { return };
+    let mut total_recovered = 0usize;
+    let now = Instant::now();
+    let max_age = std::time::Duration::from_secs(300); // Only catch up messages within 5 minutes
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        let Ok(channel_id_raw) = stem.parse::<u64>() else { continue };
+        let Ok(last_id_str) = fs::read_to_string(&path) else { continue };
+        let Ok(last_id) = last_id_str.trim().parse::<u64>() else { continue };
+
+        let channel_id = ChannelId::new(channel_id_raw);
+        let after_msg = MessageId::new(last_id);
+
+        // Fetch messages after last_id (Discord returns oldest first with after=)
+        let messages = match channel_id
+            .messages(
+                http,
+                serenity::builder::GetMessages::new()
+                    .after(after_msg)
+                    .limit(10),
+            )
+            .await
+        {
+            Ok(msgs) => msgs,
+            Err(e) => {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                eprintln!("  [{ts}] ⚠ catch-up: failed to fetch messages for channel {channel_id}: {e}");
+                continue;
+            }
+        };
+
+        if messages.is_empty() {
+            continue;
+        }
+
+        // Get bot's own user ID to filter out self-messages
+        let bot_user_id = {
+            let settings = shared.settings.read().await;
+            settings.owner_user_id
+        };
+
+        // Collect existing message IDs in queue for dedup
+        let existing_ids: std::collections::HashSet<u64> = {
+            let data = shared.core.lock().await;
+            data.intervention_queue
+                .get(&channel_id)
+                .map(|q| q.iter().map(|i| i.message_id.get()).collect())
+                .unwrap_or_default()
+        };
+
+        let allowed_bot_ids: Vec<u64> = {
+            let settings = shared.settings.read().await;
+            settings.allowed_bot_ids.clone()
+        };
+
+        let mut channel_recovered = 0usize;
+        let mut data = shared.core.lock().await;
+        let queue = data.intervention_queue.entry(channel_id).or_default();
+
+        for msg in &messages {
+            // Skip own messages
+            if Some(msg.author.id.get()) == bot_user_id {
+                continue;
+            }
+            // Skip if already in queue
+            if existing_ids.contains(&msg.id.get()) {
+                continue;
+            }
+            // Skip messages older than max_age (use message snowflake timestamp)
+            let msg_ts = msg.id.created_at();
+            let msg_age = chrono::Utc::now().signed_duration_since(*msg_ts);
+            if msg_age.num_seconds() > max_age.as_secs() as i64 {
+                continue;
+            }
+            let text = msg.content.trim();
+            if text.is_empty() {
+                continue;
+            }
+            // Only process messages from allowed bots or authorized users
+            let is_allowed = !msg.author.bot || allowed_bot_ids.contains(&msg.author.id.get());
+            if !is_allowed {
+                continue;
+            }
+
+            queue.push(Intervention {
+                author_id: msg.author.id,
+                message_id: msg.id,
+                text: text.to_string(),
+                mode: InterventionMode::Soft,
+                created_at: now,
+            });
+            channel_recovered += 1;
+        }
+        drop(data);
+
+        if channel_recovered > 0 {
+            total_recovered += channel_recovered;
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] 🔍 CATCH-UP: recovered {} message(s) for channel {}",
+                channel_recovered, channel_id
+            );
+        }
+
+        // Update last_message_id to the newest message we just processed
+        if let Some(newest) = messages.iter().map(|m| m.id.get()).max() {
+            shared.last_message_ids.insert(channel_id, newest);
+        }
+    }
+
+    if total_recovered > 0 {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        println!("  [{ts}] 🔍 CATCH-UP: total {total_recovered} message(s) recovered across channels");
+    }
 }
 
 /// Execute durable handoff turns saved before a restart.
@@ -981,6 +1115,7 @@ pub async fn run_bot(
         bot_connected: std::sync::atomic::AtomicBool::new(false),
         last_turn_at: std::sync::Mutex::new(None),
         model_overrides: dashmap::DashMap::new(),
+        last_message_ids: dashmap::DashMap::new(),
     });
 
     {
@@ -1170,6 +1305,13 @@ pub async fn run_bot(
                         println!("  [{ts}] 📋 FLUSH: restored {added} pending queue item(s) from disk (skipped {skipped} duplicates)");
                     }
 
+                    // Startup catch-up polling: recover messages lost during restart gap
+                    catch_up_missed_messages(
+                        &http_for_tmux,
+                        &shared_for_tmux2,
+                        &provider_for_restore,
+                    ).await;
+
                     restore_tmux_watchers(&http_for_tmux, &shared_for_tmux2).await;
                     cleanup_orphan_tmux_sessions(&shared_for_tmux2).await;
 
@@ -1349,6 +1491,17 @@ pub async fn run_bot(
                         save_pending_queues(&provider_for_shutdown, &data.intervention_queue);
                         let ts3 = chrono::Local::now().format("%H:%M:%S");
                         println!("  [{ts3}] 📋 saved {queue_count} pending queue item(s) to disk");
+                    }
+                }
+
+                // Persist last_message_ids for catch-up polling after restart
+                {
+                    let ids: std::collections::HashMap<u64, u64> = shared_for_signal
+                        .last_message_ids.iter()
+                        .map(|entry| (entry.key().get(), *entry.value()))
+                        .collect();
+                    if !ids.is_empty() {
+                        runtime_store::save_all_last_message_ids(provider_for_shutdown.as_str(), &ids);
                     }
                 }
 
