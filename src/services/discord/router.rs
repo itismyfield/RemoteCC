@@ -39,9 +39,6 @@ pub(super) async fn handle_event(
             let user_name = &new_message.author.name;
             let channel_id = new_message.channel_id;
             let is_dm = new_message.guild_id.is_none();
-
-            // Track last processed message ID for catch-up polling after restart
-            data.shared.last_message_ids.insert(channel_id, new_message.id.get());
             let (channel_name, _) = resolve_channel_category(ctx, channel_id).await;
             // For threads, inherit role binding from the parent channel
             let (effective_channel_id, effective_channel_name) = if let Some((
@@ -194,6 +191,8 @@ pub(super) async fn handle_event(
                         return Ok(());
                     }
 
+                    // Checkpoint: message successfully queued
+                    data.shared.last_message_ids.insert(channel_id, new_message.id.get());
                     return Ok(());
                 }
             }
@@ -231,6 +230,8 @@ pub(super) async fn handle_event(
                         "⏸ 재시작 대기 중 — 메시지가 큐에 저장되었고, 재시작 후 처리됩니다.",
                     )
                     .await;
+                // Checkpoint: message successfully queued in drain mode
+                data.shared.last_message_ids.insert(channel_id, new_message.id.get());
                 return Ok(());
             }
 
@@ -329,6 +330,9 @@ pub(super) async fn handle_event(
             } else {
                 None
             };
+
+            // Checkpoint: message about to be processed as a turn
+            data.shared.last_message_ids.insert(channel_id, new_message.id.get());
 
             handle_text_message(
                 ctx,

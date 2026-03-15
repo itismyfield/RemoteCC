@@ -536,6 +536,7 @@ async fn catch_up_missed_messages(
         };
 
         let mut channel_recovered = 0usize;
+        let mut max_recovered_id: Option<u64> = None;
         let mut data = shared.core.lock().await;
         let queue = data.intervention_queue.entry(channel_id).or_default();
 
@@ -572,6 +573,11 @@ async fn catch_up_missed_messages(
                 created_at: now,
             });
             channel_recovered += 1;
+            // Track the newest actually-recovered message for checkpoint
+            let mid = msg.id.get();
+            if max_recovered_id.map(|m| mid > m).unwrap_or(true) {
+                max_recovered_id = Some(mid);
+            }
         }
         drop(data);
 
@@ -584,8 +590,8 @@ async fn catch_up_missed_messages(
             );
         }
 
-        // Update last_message_id to the newest message we just processed
-        if let Some(newest) = messages.iter().map(|m| m.id.get()).max() {
+        // Only advance checkpoint if we actually recovered messages
+        if let Some(newest) = max_recovered_id {
             shared.last_message_ids.insert(channel_id, newest);
         }
     }
