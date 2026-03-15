@@ -554,6 +554,95 @@ async fn execute_handoff_turns(
     }
 }
 
+/// Kick off turns for channels that have queued interventions but no active
+/// turn running. This bridges the gap where restored pending queues or
+/// handoff injections sit idle because no turn-completion event triggers
+/// the dequeue chain.
+async fn kickoff_idle_queues(
+    ctx: &serenity::Context,
+    shared: &Arc<SharedData>,
+    token: &str,
+) {
+    // Collect channels with queued items that are idle (no active turn)
+    let channels_to_kick: Vec<(ChannelId, Intervention, bool)> = {
+        let mut data = shared.core.lock().await;
+        let mut result = Vec::new();
+        let channel_ids: Vec<ChannelId> = data.intervention_queue.keys().cloned().collect();
+        for channel_id in channel_ids {
+            // Skip if active turn already running — it will dequeue when done
+            if data.cancel_tokens.contains_key(&channel_id) {
+                continue;
+            }
+            if let Some(queue) = data.intervention_queue.get_mut(&channel_id) {
+                if let Some(intervention) = dequeue_next_soft_intervention(queue) {
+                    let has_more = has_soft_intervention(queue);
+                    if queue.is_empty() {
+                        data.intervention_queue.remove(&channel_id);
+                    }
+                    result.push((channel_id, intervention, has_more));
+                }
+            }
+        }
+        result
+    };
+
+    if channels_to_kick.is_empty() {
+        return;
+    }
+
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    println!(
+        "  [{ts}] 🚀 KICKOFF: starting turns for {} idle channel(s) with queued messages",
+        channels_to_kick.len()
+    );
+
+    for (channel_id, intervention, has_more) in channels_to_kick {
+        let owner_name = if intervention.author_id.get() == 0 {
+            "system".to_string()
+        } else {
+            intervention
+                .author_id
+                .to_user(&ctx.http)
+                .await
+                .map(|u| u.name.clone())
+                .unwrap_or_else(|_| format!("user-{}", intervention.author_id.get()))
+        };
+
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        println!(
+            "  [{ts}] 🚀 KICKOFF: starting queued turn for channel {}",
+            channel_id
+        );
+
+        if let Err(e) = router::handle_text_message(
+            ctx,
+            channel_id,
+            intervention.message_id,
+            intervention.author_id,
+            &owner_name,
+            &intervention.text,
+            shared,
+            token,
+            true,      // reply_to_user_message
+            has_more,  // defer_watcher_resume
+            false,     // wait_for_completion — don't block, let channels run concurrently
+            None,      // reply_context
+        )
+        .await
+        {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}]   ⚠ KICKOFF: failed to start turn for channel {}: {e}",
+                channel_id
+            );
+            // Requeue so the message is not lost
+            let mut data = shared.core.lock().await;
+            let queue = data.intervention_queue.entry(channel_id).or_default();
+            requeue_intervention_front(queue, intervention);
+        }
+    }
+}
+
 /// Scan for provider-specific skills available to this bot.
 fn scan_skills(provider: &ProviderKind, project_path: Option<&str>) -> Vec<(String, String)> {
     let mut skills: Vec<(String, String)> = Vec::new();
@@ -840,6 +929,8 @@ pub async fn run_bot(
                 let http_for_tmux = ctx.http.clone();
                 let shared_for_tmux2 = shared_for_tmux.clone();
                 let http_for_restart_reports = ctx.http.clone();
+                let ctx_for_kickoff = ctx.clone();
+                let token_for_kickoff = token_owned.clone();
                 let shared_for_restart_reports = shared_for_tmux.clone();
                 let provider_for_restore = provider.clone();
                 tokio::spawn(async move {
@@ -877,6 +968,16 @@ pub async fn run_bot(
                         &http_for_restart_reports,
                         &shared_for_restart_reports,
                         &provider_for_restore,
+                    )
+                    .await;
+
+                    // Kick off turns for channels that have queued messages but no
+                    // active turn. Without this, restored pending queues and handoff
+                    // injections sit idle until the next user message arrives.
+                    kickoff_idle_queues(
+                        &ctx_for_kickoff,
+                        &shared_for_restart_reports,
+                        &token_for_kickoff,
                     )
                     .await;
 
