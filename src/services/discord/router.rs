@@ -142,17 +142,25 @@ pub(super) async fn handle_event(
                 // Lazy cleanup: remove expired entries (cheap — runs only on bot messages)
                 data.shared.intake_dedup.retain(|_, v| now.duration_since(*v) < INTAKE_DEDUP_TTL);
 
-                if let Some(first_seen) = data.shared.intake_dedup.get(&dedup_key) {
-                    if now.duration_since(*first_seen) < INTAKE_DEDUP_TTL {
-                        let ts = chrono::Local::now().format("%H:%M:%S");
-                        println!(
-                            "  [{ts}] ⏭ DEDUP: skipping duplicate intake in channel {} (key={})",
-                            channel_id, dedup_key
-                        );
-                        return Ok(());
+                // Atomic check+insert via entry() — holds shard lock so two
+                // simultaneous arrivals cannot both see a miss.
+                let is_duplicate = match data.shared.intake_dedup.entry(dedup_key.clone()) {
+                    dashmap::mapref::entry::Entry::Occupied(e) => {
+                        now.duration_since(*e.get()) < INTAKE_DEDUP_TTL
                     }
+                    dashmap::mapref::entry::Entry::Vacant(e) => {
+                        e.insert(now);
+                        false
+                    }
+                };
+                if is_duplicate {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    println!(
+                        "  [{ts}] ⏭ DEDUP: skipping duplicate intake in channel {} (key={})",
+                        channel_id, dedup_key
+                    );
+                    return Ok(());
                 }
-                data.shared.intake_dedup.insert(dedup_key, now);
             }
 
             // Queue messages while AI is in progress (executed as next turn after current finishes)
