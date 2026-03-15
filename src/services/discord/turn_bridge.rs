@@ -169,6 +169,8 @@ pub(super) fn spawn_turn_bridge(
         let defer_watcher_resume = bridge.defer_watcher_resume;
         let completion_tx = bridge.completion_tx;
         let mut inflight_state = bridge.inflight_state.clone();
+        let mut last_status_edit = tokio::time::Instant::now();
+        let status_interval = super::status_update_interval();
 
         let _ = save_inflight_state(&inflight_state);
 
@@ -408,7 +410,14 @@ pub(super) fn spawn_turn_bridge(
             let indicator = SPINNER[spin_idx % SPINNER.len()];
             spin_idx += 1;
 
-            let raw_tool_status = current_tool_line.as_deref().unwrap_or("Processing...");
+            let raw_tool_status = current_tool_line.as_deref()
+                .or_else(|| {
+                    // Fallback: last non-empty line from response as status hint
+                    full_response.lines().rev()
+                        .find(|l| !l.trim().is_empty() && l.trim().len() > 3)
+                        .map(|l| l.trim())
+                })
+                .unwrap_or("Processing...");
             let tool_status = super::formatting::humanize_tool_status(raw_tool_status);
             let current_portion = if response_sent_offset < full_response.len() {
                 &full_response[response_sent_offset..]
@@ -425,7 +434,9 @@ pub(super) fn spawn_turn_bridge(
                 format!("{}{}", body, footer)
             };
 
-            if stable_display_text != last_edit_text && !done {
+            if stable_display_text != last_edit_text && !done
+                && last_status_edit.elapsed() >= status_interval
+            {
                 rate_limit_wait(&shared_owned, channel_id).await;
                 let _ = channel_id
                     .edit_message(
@@ -435,6 +446,7 @@ pub(super) fn spawn_turn_bridge(
                     )
                     .await;
                 last_edit_text = stable_display_text;
+                last_status_edit = tokio::time::Instant::now();
                 inflight_state.current_msg_id = current_msg_id.get();
                 inflight_state.current_msg_len = last_edit_text.len();
                 inflight_state.response_sent_offset = response_sent_offset;

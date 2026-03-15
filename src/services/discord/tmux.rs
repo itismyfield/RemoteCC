@@ -246,8 +246,8 @@ pub(super) async fn tmux_output_watcher(
                     }
                 }
 
-                // Update Discord placeholder every ~1 second with status
-                if last_status_update.elapsed() >= tokio::time::Duration::from_secs(1) {
+                // Update Discord placeholder at configurable interval
+                if last_status_update.elapsed() >= super::status_update_interval() {
                     last_status_update = tokio::time::Instant::now();
                     let indicator = SPINNER[spin_idx % SPINNER.len()];
                     spin_idx += 1;
@@ -255,6 +255,12 @@ pub(super) async fn tmux_output_watcher(
                     let raw_tool_status = tool_state
                         .current_tool_line
                         .as_deref()
+                        .or_else(|| {
+                            // Fallback: extract last non-empty line from response as status hint
+                            full_response.lines().rev()
+                                .find(|l| !l.trim().is_empty() && l.trim().len() > 3)
+                                .map(|l| l.trim())
+                        })
                         .unwrap_or("Processing...");
                     let tool_status = super::formatting::humanize_tool_status(raw_tool_status);
                     let footer = format!("\n\n{} {}", indicator, tool_status);

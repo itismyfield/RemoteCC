@@ -80,6 +80,19 @@ const SESSION_MAX_IDLE: Duration = Duration::from_secs(24 * 60 * 60); // 1 day
 const RESTART_REPORT_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const DEFERRED_RESTART_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Minimum interval between Discord placeholder edits for progress status.
+/// Configurable via REMOTECC_STATUS_INTERVAL_SECS env var. Default: 5 seconds.
+pub(super) fn status_update_interval() -> Duration {
+    static CACHED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let secs = std::env::var("REMOTECC_STATUS_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(5);
+        Duration::from_secs(secs)
+    })
+}
+
 /// Check if a deferred restart has been requested and no active or finalizing turns remain
 /// **across all providers**.
 ///
