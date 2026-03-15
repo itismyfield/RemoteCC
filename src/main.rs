@@ -716,8 +716,8 @@ fn handle_restart_dcserver(
             return;
         };
         let mut report =
-            RestartCompletionReport::new(context.provider, context.channel_id, status, summary);
-        if let Some(existing) = load_restart_report(context.provider, context.channel_id) {
+            RestartCompletionReport::new(context.provider.clone(), context.channel_id, status, summary);
+        if let Some(existing) = load_restart_report(&context.provider, context.channel_id) {
             report.current_msg_id = existing.current_msg_id;
         }
         if report.current_msg_id.is_none() {
@@ -780,12 +780,12 @@ fn handle_restart_dcserver(
 
     if let Some(context) = report_context.as_ref() {
         let mut pending_report = RestartCompletionReport::new(
-            context.provider,
+            context.provider.clone(),
             context.channel_id,
             "pending",
             "dcserver restart requested; 새 프로세스가 completion follow-up을 이어받는 중입니다.",
         );
-        if let Some(existing) = load_restart_report(context.provider, context.channel_id) {
+        if let Some(existing) = load_restart_report(&context.provider, context.channel_id) {
             pending_report.current_msg_id = existing.current_msg_id;
             pending_report.user_msg_id = existing.user_msg_id;
         }

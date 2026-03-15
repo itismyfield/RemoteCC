@@ -90,7 +90,7 @@ fn save_store_to_path(path: &Path, store: &SharedAgentMemoryStore) -> Result<(),
 
 fn build_context_from_store(
     store: &SharedAgentMemoryStore,
-    provider: ProviderKind,
+    provider: &ProviderKind,
     channel_id: ChannelId,
     has_provider_session: bool,
     last_injected_ts: Option<&str>,
@@ -165,7 +165,7 @@ fn build_context_from_store(
 
 pub(super) fn build_shared_memory_context(
     role_id: &str,
-    provider: ProviderKind,
+    provider: &ProviderKind,
     channel_id: ChannelId,
     has_provider_session: bool,
     last_injected_ts: Option<&str>,
@@ -184,7 +184,7 @@ pub(super) fn build_shared_memory_context(
 fn build_shared_memory_context_at_root(
     root: &Path,
     role_id: &str,
-    provider: ProviderKind,
+    provider: &ProviderKind,
     channel_id: ChannelId,
     has_provider_session: bool,
     last_injected_ts: Option<&str>,
@@ -204,7 +204,7 @@ pub(super) fn latest_shared_memory_ts(role_id: &str) -> Option<String> {
 
 pub(super) fn append_shared_memory_turn(
     role_id: &str,
-    provider: ProviderKind,
+    provider: &ProviderKind,
     channel_id: ChannelId,
     channel_name: Option<&str>,
     current_path: &str,
@@ -231,7 +231,7 @@ pub(super) fn append_shared_memory_turn(
 fn append_shared_memory_turn_at_root(
     root: &Path,
     role_id: &str,
-    provider: ProviderKind,
+    provider: &ProviderKind,
     channel_id: ChannelId,
     channel_name: Option<&str>,
     current_path: &str,
@@ -323,7 +323,7 @@ mod tests {
 
         let loaded = load_store_from_path(&path, "ch-pmd");
         let rendered =
-            build_context_from_store(&loaded, ProviderKind::Claude, ChannelId::new(1), true, None)
+            build_context_from_store(&loaded, &ProviderKind::Claude, ChannelId::new(1), true, None)
                 .expect("context");
 
         assert!(rendered.contains("codex remembered"));
@@ -337,7 +337,7 @@ mod tests {
         let result = append_shared_memory_turn_at_root(
             &root,
             "ch-td",
-            ProviderKind::Claude,
+            &ProviderKind::Claude,
             ChannelId::new(10),
             Some("cookingheart-dev-cc"),
             "/repo",
@@ -358,7 +358,7 @@ mod tests {
         append_shared_memory_turn_at_root(
             &root,
             "ch-qad",
-            ProviderKind::Codex,
+            &ProviderKind::Codex,
             ChannelId::new(30),
             Some("cookingheart-test-cdx"),
             "/repo",
@@ -371,7 +371,7 @@ mod tests {
         let rendered = build_shared_memory_context_at_root(
             &root,
             "ch-qad",
-            ProviderKind::Codex,
+            &ProviderKind::Codex,
             ChannelId::new(30),
             false,
             None,

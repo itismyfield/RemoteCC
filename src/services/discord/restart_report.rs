@@ -85,11 +85,11 @@ fn restart_reports_root() -> Option<PathBuf> {
     discord_restart_reports_root()
 }
 
-fn restart_provider_dir(root: &Path, provider: ProviderKind) -> PathBuf {
+fn restart_provider_dir(root: &Path, provider: &ProviderKind) -> PathBuf {
     root.join(provider.as_str())
 }
 
-fn restart_report_path(root: &Path, provider: ProviderKind, channel_id: u64) -> PathBuf {
+fn restart_report_path(root: &Path, provider: &ProviderKind, channel_id: u64) -> PathBuf {
     restart_provider_dir(root, provider).join(format!("{channel_id}.json"))
 }
 
@@ -113,7 +113,7 @@ fn save_restart_report_in_root(
     let Some(provider) = report.provider_kind() else {
         return Err(format!("Unknown provider '{}'", report.provider));
     };
-    let path = restart_report_path(root, provider, report.channel_id);
+    let path = restart_report_path(root, &provider, report.channel_id);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -121,7 +121,7 @@ fn save_restart_report_in_root(
     atomic_write(&path, &json)
 }
 
-pub(crate) fn clear_restart_report(provider: ProviderKind, channel_id: u64) {
+pub(crate) fn clear_restart_report(provider: &ProviderKind, channel_id: u64) {
     let Some(root) = restart_reports_root() else {
         return;
     };
@@ -129,7 +129,7 @@ pub(crate) fn clear_restart_report(provider: ProviderKind, channel_id: u64) {
     let _ = fs::remove_file(path);
 }
 
-pub(crate) fn load_restart_reports(provider: ProviderKind) -> Vec<RestartCompletionReport> {
+pub(crate) fn load_restart_reports(provider: &ProviderKind) -> Vec<RestartCompletionReport> {
     let Some(root) = restart_reports_root() else {
         return Vec::new();
     };
@@ -137,19 +137,19 @@ pub(crate) fn load_restart_reports(provider: ProviderKind) -> Vec<RestartComplet
 }
 
 pub(crate) fn load_restart_report(
-    provider: ProviderKind,
+    provider: &ProviderKind,
     channel_id: u64,
 ) -> Option<RestartCompletionReport> {
     let root = restart_reports_root()?;
     let path = restart_report_path(&root, provider, channel_id);
     let content = fs::read_to_string(path).ok()?;
     let report = serde_json::from_str::<RestartCompletionReport>(&content).ok()?;
-    (report.provider_kind() == Some(provider)).then_some(report)
+    (report.provider_kind().as_ref() == Some(provider)).then_some(report)
 }
 
 fn load_restart_reports_in_root(
     root: &Path,
-    provider: ProviderKind,
+    provider: &ProviderKind,
 ) -> Vec<RestartCompletionReport> {
     let dir = restart_provider_dir(&root, provider);
     let entries = match fs::read_dir(&dir) {
@@ -189,7 +189,7 @@ fn load_restart_reports_in_root(
             );
             continue;
         };
-        if report.provider_kind() != Some(provider) {
+        if report.provider_kind().as_ref() != Some(provider) {
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!(
                 "  [{ts}] ⚠ restart report provider mismatch in {}: expected {}, found {}",
@@ -215,7 +215,7 @@ fn report_age(report: &RestartCompletionReport) -> Option<Duration> {
 pub(super) async fn flush_restart_reports(
     http: &Arc<serenity::Http>,
     shared: &Arc<SharedData>,
-    provider: ProviderKind,
+    provider: &ProviderKind,
 ) {
     let reports = load_restart_reports(provider);
     if reports.is_empty() {
@@ -411,11 +411,11 @@ mod tests {
         )
         .unwrap();
 
-        let codex_reports = load_restart_reports_in_root(temp.path(), ProviderKind::Codex);
+        let codex_reports = load_restart_reports_in_root(temp.path(), &ProviderKind::Codex);
         assert_eq!(codex_reports.len(), 1);
         assert_eq!(codex_reports[0].channel_id, 123);
 
-        let claude_reports = load_restart_reports_in_root(temp.path(), ProviderKind::Claude);
+        let claude_reports = load_restart_reports_in_root(temp.path(), &ProviderKind::Claude);
         assert_eq!(claude_reports.len(), 1);
         assert_eq!(claude_reports[0].channel_id, 456);
     }

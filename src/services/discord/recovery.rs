@@ -83,7 +83,7 @@ fn output_has_bytes_after_offset(output_path: &str, start_offset: u64) -> bool {
 pub(super) async fn restore_inflight_turns(
     http: &Arc<serenity::Http>,
     shared: &Arc<SharedData>,
-    provider: ProviderKind,
+    provider: &ProviderKind,
 ) {
     let states = load_inflight_states(provider);
     if states.is_empty() {
@@ -534,7 +534,7 @@ pub(super) async fn restore_inflight_turns(
             cancel_token,
             rx,
             TurnBridgeContext {
-                provider,
+                provider: provider.clone(),
                 channel_id,
                 user_msg_id,
                 user_text_owned: state.user_text.clone(),

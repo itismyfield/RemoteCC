@@ -57,20 +57,43 @@ pub struct DiscordBotLaunchConfig {
 }
 
 pub(super) fn channel_supports_provider(
-    provider: ProviderKind,
+    provider: &ProviderKind,
     channel_name: Option<&str>,
     is_dm: bool,
     role_binding: Option<&RoleBinding>,
 ) -> bool {
     if is_dm {
-        return true;
+        return provider.is_supported();
     }
 
-    if let Some(bound_provider) = role_binding.and_then(|binding| binding.provider) {
+    if let Some(bound_provider) = role_binding.and_then(|binding| binding.provider.as_ref()) {
         return bound_provider == provider;
     }
 
+    // Check global suffix_map from bot_settings.json
+    if let Some(ch) = channel_name {
+        if let Some(mapped) = lookup_suffix_provider(ch) {
+            return mapped == *provider;
+        }
+    }
+
     provider.is_channel_supported(channel_name, is_dm)
+}
+
+/// Look up the provider for a channel name using the global suffix_map
+/// from bot_settings.json. Returns None if no suffix_map entry matches.
+fn lookup_suffix_provider(channel_name: &str) -> Option<ProviderKind> {
+    let path = bot_settings_path()?;
+    let content = fs::read_to_string(&path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let map = json.get("suffix_map")?.as_object()?;
+    for (suffix, provider_val) in map {
+        if channel_name.ends_with(suffix.as_str()) {
+            let provider_str = provider_val.as_str()?;
+            return Some(ProviderKind::from_str_or_unsupported(provider_str));
+        }
+    }
+    None
 }
 
 pub(super) fn resolve_role_binding(
@@ -232,7 +255,7 @@ pub(super) fn load_bot_settings(token: &str) -> DiscordBotSettings {
     let provider = entry
         .get("provider")
         .and_then(|v| v.as_str())
-        .and_then(ProviderKind::from_str)
+        .map(ProviderKind::from_str_or_unsupported)
         .unwrap_or(ProviderKind::Claude);
     let last_sessions = entry
         .get("last_sessions")
@@ -348,7 +371,7 @@ pub fn load_discord_bot_launch_configs() -> Vec<DiscordBotLaunchConfig> {
         let provider = entry
             .get("provider")
             .and_then(|v| v.as_str())
-            .and_then(ProviderKind::from_str)
+            .map(ProviderKind::from_str_or_unsupported)
             .unwrap_or(ProviderKind::Claude);
         configs.push(DiscordBotLaunchConfig {
             hash_key: hash_key.clone(),
@@ -545,13 +568,13 @@ mod tests {
             assert_eq!(binding.role_id, "family-routine");
             assert_eq!(binding.provider, Some(ProviderKind::Codex));
             assert!(channel_supports_provider(
-                ProviderKind::Codex,
+                &ProviderKind::Codex,
                 Some("쇼핑도우미"),
                 false,
                 Some(&binding)
             ));
             assert!(!channel_supports_provider(
-                ProviderKind::Claude,
+                &ProviderKind::Claude,
                 Some("쇼핑도우미"),
                 false,
                 Some(&binding)

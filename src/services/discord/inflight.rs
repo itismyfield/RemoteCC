@@ -84,11 +84,11 @@ pub(super) fn inflight_runtime_root() -> Option<PathBuf> {
     discord_inflight_root()
 }
 
-fn inflight_provider_dir(root: &Path, provider: ProviderKind) -> PathBuf {
+fn inflight_provider_dir(root: &Path, provider: &ProviderKind) -> PathBuf {
     root.join(provider.as_str())
 }
 
-fn inflight_state_path(root: &Path, provider: ProviderKind, channel_id: u64) -> PathBuf {
+fn inflight_state_path(root: &Path, provider: &ProviderKind, channel_id: u64) -> PathBuf {
     inflight_provider_dir(root, provider).join(format!("{channel_id}.json"))
 }
 
@@ -107,7 +107,7 @@ fn save_inflight_state_in_root(root: &Path, state: &InflightTurnState) -> Result
     let Some(provider) = state.provider_kind() else {
         return Err(format!("Unknown provider '{}'", state.provider));
     };
-    let path = inflight_state_path(root, provider, state.channel_id);
+    let path = inflight_state_path(root, &provider, state.channel_id);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -117,7 +117,7 @@ fn save_inflight_state_in_root(root: &Path, state: &InflightTurnState) -> Result
     atomic_write(&path, &json)
 }
 
-pub(super) fn clear_inflight_state(provider: ProviderKind, channel_id: u64) {
+pub(super) fn clear_inflight_state(provider: &ProviderKind, channel_id: u64) {
     let Some(root) = inflight_runtime_root() else {
         return;
     };
@@ -126,14 +126,14 @@ pub(super) fn clear_inflight_state(provider: ProviderKind, channel_id: u64) {
 }
 
 /// Load a single inflight state by provider + channel_id (returns None if missing).
-pub(super) fn load_inflight_state(provider: ProviderKind, channel_id: u64) -> Option<InflightTurnState> {
+pub(super) fn load_inflight_state(provider: &ProviderKind, channel_id: u64) -> Option<InflightTurnState> {
     let root = inflight_runtime_root()?;
     let path = inflight_state_path(&root, provider, channel_id);
     let data = fs::read_to_string(path).ok()?;
     serde_json::from_str(&data).ok()
 }
 
-pub(super) fn load_inflight_states(provider: ProviderKind) -> Vec<InflightTurnState> {
+pub(super) fn load_inflight_states(provider: &ProviderKind) -> Vec<InflightTurnState> {
     let Some(root) = inflight_runtime_root() else {
         return Vec::new();
     };
@@ -143,7 +143,7 @@ pub(super) fn load_inflight_states(provider: ProviderKind) -> Vec<InflightTurnSt
 /// Maximum age for inflight state files before they are considered stale and removed.
 const INFLIGHT_MAX_AGE_SECS: u64 = 300; // 5 minutes
 
-fn load_inflight_states_from_root(root: &Path, provider: ProviderKind) -> Vec<InflightTurnState> {
+fn load_inflight_states_from_root(root: &Path, provider: &ProviderKind) -> Vec<InflightTurnState> {
     let dir = inflight_provider_dir(root, provider);
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
@@ -189,7 +189,7 @@ fn load_inflight_states_from_root(root: &Path, provider: ProviderKind) -> Vec<In
             let _ = fs::remove_file(&path);
             continue;
         };
-        if state.provider_kind() != Some(provider) {
+        if state.provider_kind().as_ref() != Some(provider) {
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!(
                 "  [{ts}] ⚠ removing inflight state with provider mismatch: {}",
@@ -229,7 +229,7 @@ mod tests {
         );
         save_inflight_state_in_root(temp.path(), &state).unwrap();
 
-        let loaded = load_inflight_states_from_root(temp.path(), ProviderKind::Codex);
+        let loaded = load_inflight_states_from_root(temp.path(), &ProviderKind::Codex);
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].channel_id, 123);
         assert_eq!(loaded[0].current_msg_id, 999);
