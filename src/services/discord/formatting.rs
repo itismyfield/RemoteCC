@@ -858,3 +858,77 @@ pub(super) async fn remove_reaction_raw(
         eprintln!("  [{ts}] ⚠ Failed to remove reaction '{emoji}' from msg {message_id} in channel {channel_id}: {e}");
     }
 }
+
+/// Convert a technical tool status line into a human-friendly label with emoji.
+pub(super) fn humanize_tool_status(tool_line: &str) -> String {
+    let lower = tool_line.to_lowercase();
+
+    // Build/compile patterns
+    if lower.contains("cargo build") || lower.contains("cargo check") || lower.contains("make")
+        || lower.contains("npm run build") || lower.contains("tsc") || lower.contains("compil")
+    {
+        return format!("🔧 빌드 중... {}", brief_detail(tool_line));
+    }
+    // Test patterns
+    if lower.contains("cargo test") || lower.contains("npm test") || lower.contains("pytest")
+        || lower.contains("jest") || lower.contains("test")
+    {
+        return format!("🧪 테스트 실행 중... {}", brief_detail(tool_line));
+    }
+    // Git patterns
+    if lower.contains("git ") {
+        return format!("📦 Git 작업 중... {}", brief_detail(tool_line));
+    }
+    // File read/search patterns
+    if lower.contains("read(") || lower.contains("grep") || lower.contains("glob")
+        || lower.contains("searching") || lower.contains("찾는")
+    {
+        return format!("🔍 코드 탐색 중... {}", brief_detail(tool_line));
+    }
+    // File write/edit patterns
+    if lower.contains("edit(") || lower.contains("write(") || lower.contains("notebookedit") {
+        return format!("📝 코드 작성 중... {}", brief_detail(tool_line));
+    }
+    // Bash/shell execution
+    if lower.contains("bash") || lower.contains("shell") {
+        return format!("⚡ 명령 실행 중... {}", brief_detail(tool_line));
+    }
+    // Web fetch
+    if lower.contains("webfetch") || lower.contains("websearch") || lower.contains("curl") {
+        return format!("🌐 웹 조회 중... {}", brief_detail(tool_line));
+    }
+    // Agent/subagent
+    if lower.contains("agent") || lower.contains("subagent") {
+        return format!("🤖 서브에이전트 실행 중...");
+    }
+    // LSP
+    if lower.contains("lsp") {
+        return format!("💡 코드 분석 중...");
+    }
+    // Default: just use the original with a spinner prefix
+    if tool_line == "Processing..." {
+        "⏳ 처리 중...".to_string()
+    } else {
+        format!("⚙️ {}", truncate_for_status(tool_line, 60))
+    }
+}
+
+fn brief_detail(line: &str) -> String {
+    // Extract a brief detail from parentheses or after colon
+    if let Some(start) = line.find('(') {
+        if let Some(end) = line.rfind(')') {
+            let detail = &line[start + 1..end];
+            return truncate_for_status(detail, 40);
+        }
+    }
+    String::new()
+}
+
+fn truncate_for_status(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{truncated}…")
+    }
+}

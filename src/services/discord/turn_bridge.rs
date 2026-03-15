@@ -408,7 +408,8 @@ pub(super) fn spawn_turn_bridge(
             let indicator = SPINNER[spin_idx % SPINNER.len()];
             spin_idx += 1;
 
-            let tool_status = current_tool_line.as_deref().unwrap_or("Processing...");
+            let raw_tool_status = current_tool_line.as_deref().unwrap_or("Processing...");
+            let tool_status = super::formatting::humanize_tool_status(raw_tool_status);
             let current_portion = if response_sent_offset < full_response.len() {
                 &full_response[response_sent_offset..]
             } else {

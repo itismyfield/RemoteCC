@@ -252,10 +252,11 @@ pub(super) async fn tmux_output_watcher(
                     let indicator = SPINNER[spin_idx % SPINNER.len()];
                     spin_idx += 1;
 
-                    let tool_status = tool_state
+                    let raw_tool_status = tool_state
                         .current_tool_line
                         .as_deref()
                         .unwrap_or("Processing...");
+                    let tool_status = super::formatting::humanize_tool_status(raw_tool_status);
                     let footer = format!("\n\n{} {}", indicator, tool_status);
                     let body_budget = DISCORD_MSG_LIMIT.saturating_sub(footer.len() + 10);
                     let display_text = if full_response.is_empty() {
