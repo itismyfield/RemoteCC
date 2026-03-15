@@ -3,7 +3,7 @@ use crate::services;
 use crate::services::claude;
 use crate::utils::markdown::{is_line_empty, render_markdown, MarkdownTheme};
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+use super::VERSION;
 
 pub fn print_help() {
     println!("RemoteCC {} - Multi-panel terminal file manager", VERSION);
@@ -329,7 +329,7 @@ pub fn handle_prompt(prompt: &str) {
 }
 
 /// Normalize consecutive empty lines to maximum of one
-pub fn normalize_consecutive_empty_lines(text: &str) -> String {
+fn normalize_consecutive_empty_lines(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let mut result_lines: Vec<&str> = Vec::new();
     let mut prev_was_empty = false;
@@ -378,7 +378,7 @@ pub fn print_goodbye_message() {
     println!("Happy coding!");
 }
 
-pub fn check_for_updates() {
+fn check_for_updates() {
     let current_version = env!("CARGO_PKG_VERSION");
 
     // Fetch latest version from GitHub (with timeout)
@@ -423,7 +423,7 @@ pub fn check_for_updates() {
     }
 }
 
-pub fn parse_version_from_cargo_toml(content: &str) -> Option<String> {
+fn parse_version_from_cargo_toml(content: &str) -> Option<String> {
     for line in content.lines() {
         let line = line.trim();
         if line.starts_with("version") {
@@ -440,7 +440,7 @@ pub fn parse_version_from_cargo_toml(content: &str) -> Option<String> {
     None
 }
 
-pub fn is_newer_version(latest: &str, current: &str) -> bool {
+fn is_newer_version(latest: &str, current: &str) -> bool {
     let parse = |v: &str| -> Vec<u32> { v.split('.').filter_map(|s| s.parse().ok()).collect() };
 
     let latest_parts = parse(latest);

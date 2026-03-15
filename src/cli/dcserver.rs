@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use crate::services;
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+use super::VERSION;
 const REMOTECC_DCSERVER_LAUNCHD_LABEL: &str = "com.itismyfield.remotecc.dcserver";
 const REMOTECC_DCSERVER_LABEL_ENV: &str = "REMOTECC_DCSERVER_LABEL";
 const REMOTECC_ROOT_DIR_ENV: &str = "REMOTECC_ROOT_DIR";
@@ -135,7 +135,6 @@ pub fn previous_release_link_path() -> Option<PathBuf> {
 }
 
 pub fn read_release_link_target(path: &Path) -> Option<PathBuf> {
-    fs::symlink_metadata(path).ok()?;
     fs::read_link(path).ok()
 }
 
@@ -143,8 +142,8 @@ pub fn read_release_link_target(path: &Path) -> Option<PathBuf> {
 pub fn update_release_link(link_path: &Path, target: &Path) -> Result<(), String> {
     use std::os::unix::fs::symlink;
 
-    if fs::symlink_metadata(link_path).is_ok() {
-        fs::remove_file(link_path).map_err(|e| format!("remove old symlink failed: {e}"))?;
+    match fs::remove_file(link_path) {
+        Ok(()) | Err(_) => {} // ignore NotFound or any pre-existing state
     }
     symlink(target, link_path).map_err(|e| format!("create symlink failed: {e}"))
 }

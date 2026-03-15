@@ -169,7 +169,8 @@ pub fn truncate_with_ellipsis(s: &str, max_width: usize) -> String {
 /// 문자열 뒤에서 max_chars 글자 이내로 자르고, 앞에 "…"을 붙인다.
 /// Discord 메시지 상태 표시용.
 pub fn tail_with_ellipsis(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
         return text.to_string();
     }
 
@@ -178,28 +179,24 @@ pub fn tail_with_ellipsis(text: &str, max_chars: usize) -> String {
     }
 
     let keep = max_chars.saturating_sub(1);
-    let tail: String = text
-        .chars()
-        .rev()
-        .take(keep)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("…{}", tail)
+    let skip = char_count - keep;
+    let byte_start = text.char_indices().nth(skip).map(|(i, _)| i).unwrap_or(0);
+    format!("…{}", &text[byte_start..])
 }
 
-/// `~`로 시작하는 경로를 홈 디렉토리로 확장한다.
+/// `~` 또는 `~/...` 경로를 홈 디렉토리로 확장한다.
+/// `~user/...` 형태는 확장하지 않고 그대로 반환한다.
 pub fn expand_tilde_path(path: &str) -> std::path::PathBuf {
-    if path.starts_with('~') {
+    if path == "~" {
         if let Some(home) = dirs::home_dir() {
-            home.join(path.trim_start_matches('~').trim_start_matches('/'))
-        } else {
-            std::path::PathBuf::from(path)
+            return home;
         }
-    } else {
-        std::path::PathBuf::from(path)
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
     }
+    std::path::PathBuf::from(path)
 }
 
 /// 표시 너비 기준으로 뒤에서부터 max_width 칸 이내의 접미사를 반환한다.

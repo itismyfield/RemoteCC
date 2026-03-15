@@ -1,6 +1,8 @@
-pub mod dcserver;
-pub mod discord;
-pub mod utils;
+pub(crate) mod dcserver;
+pub(crate) mod discord;
+pub(crate) mod utils;
+
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // Re-export commonly used items
 pub use dcserver::{
