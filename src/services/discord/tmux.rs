@@ -170,7 +170,7 @@ pub(super) async fn tmux_output_watcher(
         let mut was_paused = false;
         if !found_result {
             let turn_start = tokio::time::Instant::now();
-            let turn_timeout = tokio::time::Duration::from_secs(600); // 10 min max
+            let turn_timeout = super::turn_watchdog_timeout();
             let mut last_status_update = tokio::time::Instant::now();
 
             while !found_result && turn_start.elapsed() < turn_timeout {
