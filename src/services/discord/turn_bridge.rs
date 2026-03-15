@@ -396,14 +396,8 @@ pub(super) fn spawn_turn_bridge(
             let indicator = SPINNER[spin_idx % SPINNER.len()];
             spin_idx += 1;
 
-            let raw_tool_status = current_tool_line.as_deref()
-                .or_else(|| {
-                    // Fallback: last non-empty line from response as status hint
-                    full_response.lines().rev()
-                        .find(|l| !l.trim().is_empty() && l.trim().len() > 3)
-                        .map(|l| l.trim())
-                })
-                .unwrap_or("Processing...");
+            let raw_tool_status = super::formatting::resolve_raw_tool_status(
+                current_tool_line.as_deref(), &full_response);
             let tool_status = super::formatting::humanize_tool_status(raw_tool_status);
             let current_portion = if response_sent_offset < full_response.len() {
                 &full_response[response_sent_offset..]

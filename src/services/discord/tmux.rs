@@ -223,16 +223,8 @@ pub(super) async fn tmux_output_watcher(
                     let indicator = SPINNER[spin_idx % SPINNER.len()];
                     spin_idx += 1;
 
-                    let raw_tool_status = tool_state
-                        .current_tool_line
-                        .as_deref()
-                        .or_else(|| {
-                            // Fallback: extract last non-empty line from response as status hint
-                            full_response.lines().rev()
-                                .find(|l| !l.trim().is_empty() && l.trim().len() > 3)
-                                .map(|l| l.trim())
-                        })
-                        .unwrap_or("Processing...");
+                    let raw_tool_status = super::formatting::resolve_raw_tool_status(
+                        tool_state.current_tool_line.as_deref(), &full_response);
                     let tool_status = super::formatting::humanize_tool_status(raw_tool_status);
                     let footer = format!("\n\n{} {}", indicator, tool_status);
                     let body_budget = DISCORD_MSG_LIMIT.saturating_sub(footer.len() + 10);
