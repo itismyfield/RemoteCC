@@ -1,3 +1,4 @@
+use super::handoff::{save_handoff, HandoffRecord};
 use super::restart_report::{clear_restart_report, save_restart_report, RestartCompletionReport};
 use super::*;
 use crate::services::tmux_diagnostics::record_tmux_exit_reason;
@@ -232,6 +233,26 @@ pub(super) fn spawn_turn_bridge(
                                 report.channel_name = pcd_session_name.clone();
                                 if save_restart_report(&report).is_ok() {
                                     restart_followup_pending = true;
+
+                                    // Save durable handoff for post-restart follow-up
+                                    let handoff = HandoffRecord::new(
+                                        &provider,
+                                        channel_id.get(),
+                                        pcd_session_name.clone(),
+                                        "재시작 후 수정 내용 확인 및 후속 작업 이어서 진행",
+                                        format!(
+                                            "재시작 전 사용자 요청: {}\n\n이전 턴의 응답 요약: {}",
+                                            user_text_owned,
+                                            tail_with_ellipsis(&full_response, 500),
+                                        ),
+                                        pcd_cwd.clone(),
+                                        Some(user_msg_id.get()),
+                                    );
+                                    if let Err(e) = save_handoff(&handoff) {
+                                        let ts = chrono::Local::now().format("%H:%M:%S");
+                                        println!("  [{ts}] ⚠ failed to save handoff: {e}");
+                                    }
+
                                     let handoff_text =
                                         "♻️ dcserver 재시작 중...\n\n새 dcserver가 이 메시지를 이어받는 중입니다.";
                                     rate_limit_wait(&shared_owned, channel_id).await;

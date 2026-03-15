@@ -1,4 +1,5 @@
 mod formatting;
+mod handoff;
 mod inflight;
 mod meeting;
 mod pcd;
@@ -43,6 +44,7 @@ use formatting::{
 use inflight::{
     clear_inflight_state, load_inflight_states, save_inflight_state, InflightTurnState,
 };
+use handoff::{clear_handoff, load_handoffs, update_handoff_state};
 use pcd::{
     build_pcd_session_key, derive_pcd_session_info, parse_dispatch_id, post_pcd_session_status,
 };
@@ -399,6 +401,159 @@ fn load_pending_queues(provider: &ProviderKind) -> HashMap<ChannelId, Vec<Interv
     result
 }
 
+/// Execute durable handoff turns saved before a restart.
+/// Runs after tmux watcher restore and pending queue restore, but before
+/// restart report flush. Skips channels that already have pending queue messages
+/// (user intent takes priority over automatic follow-up).
+async fn execute_handoff_turns(
+    http: &Arc<serenity::Http>,
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+) {
+    let handoffs = load_handoffs(provider);
+    if handoffs.is_empty() {
+        return;
+    }
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    println!(
+        "  [{ts}] 📎 Found {} handoff record(s) to process",
+        handoffs.len()
+    );
+
+    let current_gen = runtime_store::load_generation();
+
+    for record in handoffs {
+        let channel_id = ChannelId::new(record.channel_id);
+        let ts = chrono::Local::now().format("%H:%M:%S");
+
+        // Skip if from a different generation (stale)
+        if record.born_generation > current_gen {
+            println!(
+                "  [{ts}] ⏭ Skipping handoff for channel {} (future generation {})",
+                record.channel_id, record.born_generation
+            );
+            clear_handoff(provider, record.channel_id);
+            continue;
+        }
+
+        // Skip if already executed/skipped/failed
+        if record.state != "created" {
+            println!(
+                "  [{ts}] ⏭ Skipping handoff for channel {} (state={})",
+                record.channel_id, record.state
+            );
+            clear_handoff(provider, record.channel_id);
+            continue;
+        }
+
+        // Skip if pending queue messages exist (user intent takes priority)
+        let has_pending = {
+            let data = shared.core.lock().await;
+            data.intervention_queue
+                .get(&channel_id)
+                .map(|q| !q.is_empty())
+                .unwrap_or(false)
+        };
+        if has_pending {
+            println!(
+                "  [{ts}] ⏭ Skipping handoff for channel {} (pending queue has messages)",
+                record.channel_id
+            );
+            let _ = update_handoff_state(provider, record.channel_id, "skipped");
+            clear_handoff(provider, record.channel_id);
+            continue;
+        }
+
+        // Skip if an active turn is already running
+        let has_active = {
+            let data = shared.core.lock().await;
+            data.cancel_tokens.contains_key(&channel_id)
+        };
+        if has_active {
+            println!(
+                "  [{ts}] ⏭ Skipping handoff for channel {} (active turn running)",
+                record.channel_id
+            );
+            let _ = update_handoff_state(provider, record.channel_id, "skipped");
+            clear_handoff(provider, record.channel_id);
+            continue;
+        }
+
+        // Check session/path readiness
+        let has_session = {
+            let data = shared.core.lock().await;
+            data.sessions
+                .get(&channel_id)
+                .and_then(|s| s.current_path.as_ref())
+                .is_some()
+        };
+        if !has_session {
+            println!(
+                "  [{ts}] ⏭ Skipping handoff for channel {} (no active session)",
+                record.channel_id
+            );
+            let _ = update_handoff_state(provider, record.channel_id, "skipped");
+            clear_handoff(provider, record.channel_id);
+            continue;
+        }
+
+        // Mark as executing
+        let _ = update_handoff_state(provider, record.channel_id, "executing");
+        println!(
+            "  [{ts}] ▶ Executing handoff for channel {} — {}",
+            record.channel_id, record.intent
+        );
+
+        // Send a placeholder message in the channel
+        let handoff_prompt = format!(
+            "dcserver가 재시작되었습니다. 재시작 전 작업의 후속 조치를 이어서 진행해주세요.\n\n\
+             ## 재시작 전 컨텍스트\n{}\n\n\
+             ## 요청 사항\n{}",
+            record.context, record.intent
+        );
+
+        let placeholder = match channel_id
+            .send_message(
+                http,
+                serenity::CreateMessage::new()
+                    .content("📎 **Post-restart handoff** — 재시작 후속 작업을 자동으로 이어받습니다."),
+            )
+            .await
+        {
+            Ok(msg) => msg,
+            Err(e) => {
+                println!(
+                    "  [{ts}] ❌ Failed to send handoff placeholder for channel {}: {}",
+                    record.channel_id, e
+                );
+                let _ = update_handoff_state(provider, record.channel_id, "failed");
+                clear_handoff(provider, record.channel_id);
+                continue;
+            }
+        };
+
+        // Inject as an intervention so the next turn picks it up.
+        {
+            let mut data = shared.core.lock().await;
+            let queue = data.intervention_queue.entry(channel_id).or_default();
+            queue.push(Intervention {
+                author_id: serenity::UserId::new(0), // system-generated
+                message_id: placeholder.id,
+                text: handoff_prompt,
+                mode: InterventionMode::Soft,
+                created_at: Instant::now(),
+            });
+        }
+
+        let _ = update_handoff_state(provider, record.channel_id, "completed");
+        clear_handoff(provider, record.channel_id);
+        println!(
+            "  [{ts}] ✓ Handoff queued for channel {} (injected as intervention)",
+            record.channel_id
+        );
+    }
+}
+
 /// Scan for provider-specific skills available to this bot.
 fn scan_skills(provider: &ProviderKind, project_path: Option<&str>) -> Vec<(String, String)> {
     let mut skills: Vec<(String, String)> = Vec::new();
@@ -716,6 +871,14 @@ pub async fn run_bot(
 
                     restore_tmux_watchers(&http_for_tmux, &shared_for_tmux2).await;
                     cleanup_orphan_tmux_sessions(&shared_for_tmux2).await;
+
+                    // Execute durable handoffs (post-restart follow-up work)
+                    execute_handoff_turns(
+                        &http_for_restart_reports,
+                        &shared_for_restart_reports,
+                        &provider_for_restore,
+                    )
+                    .await;
 
                     // NOW flush restart reports (recovery is done, safe to delete them)
                     flush_restart_reports(
